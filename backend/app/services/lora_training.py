@@ -36,6 +36,7 @@ from .. import config as cfg
 from ..models import FaceDataset, FaceDatasetImage
 from ..job_queue import queue_manager
 from . import face_dataset_service as fds, trash
+from . import musubi_tuner
 from .person_mask import generate_person_masks
 
 logger = logging.getLogger(__name__)
@@ -272,6 +273,25 @@ def _train_type(ds, family=None) -> str:
     c'est ce qui permet au sélecteur de famille de l'UI de piloter la lecture des
     runs/checkpoints/déploiements SANS écraser le train_type persisté du dataset."""
     return ((family or None) or getattr(ds, 'train_type', None) or 'zimage').lower()
+
+
+# Second local training engine (Wave 2) — mirrors _train_type's override-or-
+# persisted-or-default shape exactly, so the same "UI selector drives reads
+# without overwriting the persisted value" contract applies to engine too.
+_VALID_ENGINES = ('aitoolkit', 'musubi')
+
+
+def _train_engine(ds, engine=None) -> str:
+    """'aitoolkit' (default/every other family) or 'musubi' (qwen_image only,
+    opt-in). `engine` override wins over the persisted value when given."""
+    e = ((engine or None) or getattr(ds, 'train_engine', None) or 'aitoolkit').lower()
+    return e if e in _VALID_ENGINES else 'aitoolkit'
+
+
+def _valid_engines_for(family) -> tuple:
+    """musubi-tuner is scoped to qwen_image ONLY this wave — every other
+    family stays ai-toolkit-only, same as before Wave 2 existed."""
+    return _VALID_ENGINES if family == 'qwen_image' else ('aitoolkit',)
 
 
 def _lora_dest_dir(ds, family=None) -> str:
@@ -4225,6 +4245,7 @@ def archive_previous_run(ds) -> str | None:
 
 def launch_training(user_id, dataset_id, steps: int | None = None, check_captions: bool = True,
                     base_model=None, variant: str | None = None, train_type: str | None = None,
+                    engine: str | None = None,
                     allow_caption_mismatch: bool = False, masked: bool = True,
                     fresh: bool = False, allow_uncaptioned: bool = False,
                     allow_caption_quality: bool = False,
@@ -4335,12 +4356,33 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         raise ValueError(
             "ai-toolkit doesn't support FLUX.2 Klein yet (flux2_klein arch missing) - "
             "update it (git pull) before training a FLUX.2 Klein LoRA.")
-    # Qwen-Image : même garde (arch possiblement d'EXTENSION selon la version
-    # ai-toolkit installée, cf. _aitoolkit_supports_qwen_image).
-    if _train_type(ds) == 'qwen_image' and not _aitoolkit_supports_qwen_image():
+    # Qwen-Image via ai-toolkit : même garde (arch possiblement d'EXTENSION
+    # selon la version ai-toolkit installée, cf. _aitoolkit_supports_qwen_image).
+    # Only applies to the ai-toolkit engine — musubi-tuner doesn't touch
+    # ai-toolkit's arch registry at all, so this guard is meaningless for it.
+    launch_engine = _train_engine(ds, engine)
+    if (_train_type(ds) == 'qwen_image' and launch_engine == 'aitoolkit'
+            and not _aitoolkit_supports_qwen_image()):
         raise ValueError(
             "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
             "update it (git pull) before training a Qwen-Image LoRA.")
+    # Engine axis (Wave 2): musubi-tuner is scoped to qwen_image only. ai-toolkit
+    # stays a blanket requirement regardless (checked unconditionally above) —
+    # musubi only replaces the actual subprocess-launch step below.
+    if launch_engine not in _valid_engines_for(launch_fam):
+        raise ValueError(f"the '{launch_engine}' engine isn't available for the "
+                         f"{launch_fam} family")
+    if launch_engine == 'musubi':
+        if not musubi_tuner.is_installed():
+            raise ValueError(
+                "musubi-tuner is not configured (folder/venv missing or its "
+                "Qwen-Image scripts aren't found) - set it up in Settings → "
+                "Local tools before training with it.")
+        _missing_weights = musubi_tuner.missing_qwen_image_weights()
+        if _missing_weights:
+            raise ValueError(
+                "musubi-tuner is missing Qwen-Image weight path(s): "
+                f"{', '.join(_missing_weights)} - set them in Settings → Local tools.")
     # Slider mode (Beta) : the modern `concept_slider` trainer is an ai-toolkit
     # EXTENSION — an older install would crash at job boot on the unknown process
     # type. Refuse early with the fix, like the krea2/flux2klein arch guards.
@@ -4360,6 +4402,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
             f"to the same folder. Change the trigger_word of one of the two before training.")
     ds.train_base_model = base_model
     ds.train_variant = variant
+    ds.train_engine = launch_engine
     # Persist the resolved SDXL VAE/TE overrides (None on every other family) so the
     # run-dir tag, the config, and continue/queue replays all read the same triplet.
     ds.train_vae_path = eff_vae
@@ -4373,8 +4416,10 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
              if steps is None else max(500, int(steps)))
     # masked (défaut ON) : masques personne exportés à côté du dataset → la
     # job-config passe en masked training (fond 10 %). OFF ou indispo = historique.
-    dataset_folder = export_dataset_to_aitoolkit(user_id, dataset_id, masked=masked)
-    config_path = write_job_config(ds, dataset_folder, steps=steps)
+    # musubi-tuner: mask support is unverified for its dataset TOML, so masked
+    # training is forced off on that engine rather than risk a wrong shape.
+    dataset_folder = export_dataset_to_aitoolkit(
+        user_id, dataset_id, masked=(masked and launch_engine != 'musubi'))
     # HF_HOME route les poids base/adapter sur le disque configuré. PYTHONIOENCODING
     # évite les crashs cp1252 sur les logs unicode. Jamais shell=True ; args en liste.
     env = dict(os.environ, HF_HOME=str(_hf_home()), PYTHONIOENCODING='utf-8')
@@ -4383,6 +4428,18 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = str(run_dir / 'training.log')
     run_token = secrets.token_hex(16)
+    _model_version = musubi_tuner.MODEL_VERSION['edit' if variant == 'edit' else 'image']
+    if launch_engine == 'musubi':
+        # musubi-tuner's own "config" is a dataset TOML, not ai-toolkit's YAML —
+        # write it, then run BOTH pre-caching scripts to completion (blocking,
+        # BEFORE any training_in_progress/PID bookkeeping below: a precache
+        # failure must never register a run as in progress).
+        config_path = musubi_tuner.write_dataset_toml(
+            dataset_folder, f'{dataset_folder}_musubi_cache',
+            resolution=max(_train_res(ds)))
+        musubi_tuner.run_precache(config_path, _model_version, log_path)
+    else:
+        config_path = write_job_config(ds, dataset_folder, steps=steps)
     # The authoritative live-run check, identity state and PID publication are
     # one transition under the SAME lock used by Stop and queue advancement.
     # This closes both races: two launches spawning together, and a stale Stop
@@ -4429,12 +4486,29 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
                 key, value, ttl_seconds=_TRAIN_STATE_TTL)
         logf = None
         try:
-            logf = open(log_path, 'w', encoding='utf-8')
-            proc = subprocess.Popen(
-                [str(_venv_python()), 'run.py', config_path],
-                cwd=str(_aitoolkit_dir()), env=env, shell=False,
-                stdout=logf, stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if launch_engine == 'musubi':
+                kept_n = FaceDatasetImage.query.filter_by(
+                    dataset_id=dataset_id, status='keep').count()
+                # musubi-tuner trains by EPOCH, not step count — approximate the
+                # family's step target as epochs over the kept-image count
+                # (batch_size 1), same spirit as ai-toolkit's step target.
+                epochs = max(1, math.ceil(steps / max(1, kept_n)))
+                argv = musubi_tuner.build_train_argv(
+                    toml_path=config_path, model_version=_model_version,
+                    rank=_lora_rank(ds, 'qwen_image'),
+                    learning_rate=_lr_eff(ds), optimizer=_optimizer_eff(ds),
+                    timestep_type=_timestep_type_eff(ds, 'sigmoid'),
+                    max_train_epochs=epochs, output_dir=str(run_dir),
+                    output_name=f'lora_{_safe_trigger(ds)}')
+                proc = musubi_tuner.spawn_training(
+                    argv, cwd=str(musubi_tuner.musubi_dir()), env=env, log_path=log_path)
+            else:
+                logf = open(log_path, 'w', encoding='utf-8')
+                proc = subprocess.Popen(
+                    [str(_venv_python()), 'run.py', config_path],
+                    cwd=str(_aitoolkit_dir()), env=env, shell=False,
+                    stdout=logf, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             queue_manager._set_system_state(
                 'training_pid', proc.pid, ttl_seconds=_TRAIN_STATE_TTL)
         except (FileNotFoundError, OSError) as e:
@@ -4457,7 +4531,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     return {'started': True, 'pid': proc.pid, 'config_path': config_path, 'steps': steps,
             'dataset_folder': dataset_folder, 'log_path': log_path,
             'fresh': bool(fresh), 'archived_run': archived,
-            'run_token': run_token}
+            'run_token': run_token, 'engine': launch_engine}
 
 
 def _seed_continuation_from(user_id, dataset_id, base, family, variant,
@@ -5146,6 +5220,7 @@ def _save_queue(q: list) -> None:
 
 def enqueue_training(user_id, dataset_id, extra_steps=None,
                      base_model=_PERSISTED, variant=None, train_type=None,
+                     engine=None,
                      allow_caption_mismatch=False, not_before=None, masked=True,
                      steps=None, allow_uncaptioned=False,
                      allow_caption_quality=False,
@@ -5233,11 +5308,35 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
         raise ValueError(
             "ai-toolkit doesn't support FLUX.2 Klein yet (flux2_klein arch missing) - "
             "update it (git pull) before queuing a FLUX.2 Klein LoRA.")
-    # Qwen-Image : même garde qu'au lancement.
-    if ttype == 'qwen_image' and not _aitoolkit_supports_qwen_image():
+    # Qwen-Image via ai-toolkit : même garde qu'au lancement (n'applique que si
+    # l'engine choisi est ai-toolkit — musubi-tuner n'a rien à voir avec le
+    # registre d'archs ai-toolkit).
+    eng = _train_engine(ds, engine)
+    if (ttype == 'qwen_image' and eng == 'aitoolkit'
+            and not _aitoolkit_supports_qwen_image()):
         raise ValueError(
             "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
             "update it (git pull) before queuing a Qwen-Image LoRA.")
+    # Engine axis (Wave 2) : même garde qu'au lancement.
+    if eng not in _valid_engines_for(ttype):
+        raise ValueError(f"the '{eng}' engine isn't available for the {ttype} family")
+    if eng == 'musubi':
+        if extra_steps:
+            raise ValueError(
+                "continuing/resuming a run isn't available on the musubi-tuner "
+                "engine yet - queue a fresh launch instead.")
+        if not musubi_tuner.is_installed():
+            raise ValueError(
+                "musubi-tuner is not configured (folder/venv missing or its "
+                "Qwen-Image scripts aren't found) - set it up in Settings → "
+                "Local tools before queuing a run with it.")
+        _q_missing_weights = musubi_tuner.missing_qwen_image_weights()
+        if _q_missing_weights:
+            raise ValueError(
+                "musubi-tuner is missing Qwen-Image weight path(s): "
+                f"{', '.join(_q_missing_weights)} - set them in Settings → Local tools.")
+    ds.train_engine = eng
+    fds.db.session.commit()
     # Même garde-fou de collision qu'au lancement : pas de mise en file d'un job
     # qui partagerait le dossier de run d'un autre dataset (même trigger + base + recette).
     clash = find_run_collision(user_id, dataset_id, base_model=base, variant=var)
@@ -5256,7 +5355,7 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
     except (TypeError, ValueError):
         steps_target = None
     item = {'dataset_id': int(dataset_id), 'user_id': str(user_id), 'extra_steps': extra_steps,
-            'base_model': base, 'variant': var, 'train_type': ttype,
+            'base_model': base, 'variant': var, 'train_type': ttype, 'engine': eng,
             'not_before': not_before, 'masked': bool(masked), 'steps': steps_target,
             # SDXL custom overrides ride along so the deferred launch reproduces
             # the exact triplet (they're also persisted on ds above).
@@ -5349,6 +5448,7 @@ def _launch_queued_item(item) -> None:
                         # None → launch_training applique le défaut family-aware (Krea → Raw).
                         variant=item.get('variant'),
                         train_type=item.get('train_type'),
+                        engine=item.get('engine'),
                         masked=item.get('masked', True),
                         allow_caption_mismatch=bool(item.get('allow_caption_mismatch')),
                         allow_uncaptioned=bool(item.get('allow_uncaptioned')),

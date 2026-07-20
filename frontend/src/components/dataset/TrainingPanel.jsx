@@ -158,6 +158,10 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const [variant, setVariant] = useState('turbo');
   // Type de LoRA : 'zimage' (défaut, encodeur Qwen3-4B) ou 'sdxl' (checkpoints ComfyUI).
   const [trainType, setTrainType] = useState('zimage');
+  // Second local training engine (Wave 2) — 'aitoolkit' (every family) or
+  // 'musubi' (qwen_image only, opt-in). Selector only rendered when relevant
+  // (baseInfo.valid_engines has more than one entry for this family).
+  const [engine, setEngine] = useState('aitoolkit');
   // Navigateur de résultats indépendant : changer la configuration du PROCHAIN
   // entraînement ne doit jamais faire disparaître les checkpoints que l'utilisateur
   // est en train de consulter dans la section dédiée.
@@ -257,6 +261,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
         const safeVariant = normalizeCheckpointVariant(fam, v);
         setVariant(safeVariant);
         setTrainType(info.train_type || 'zimage');
+        setEngine(info.engine || 'aitoolkit');
         // Initialiser le navigateur une seule fois par dataset. Les refreshs de
         // base-info (conversion, réglages) ne doivent pas écraser son filtre.
         if (checkpointSelectionDataset.current !== ds.currentId) {
@@ -341,6 +346,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     // Z-Image → Turbo est le chemin sûr : base Turbo + adaptateur d'entraînement v2.
     // Cela empêche une variante Krea/Klein persistée de survivre en silence au switch.
     setVariant(nextVariant);
+    // musubi-tuner is qwen_image-only — leaving that family drops back to
+    // ai-toolkit rather than carry an engine choice that's invalid elsewhere.
+    if (t !== 'qwen_image') setEngine('aitoolkit');
     let saved;
     try {
       saved = await ds.setDatasetTrainType?.(t);
@@ -364,6 +372,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
       if (info) {
         setBaseInfo(info);
         setAdv(info.train_settings || null);
+        setEngine(info.engine || 'aitoolkit');
       }
       const checkpointData = await ds.listCheckpoints?.(nextBase, t, nextVariant);
       setStepsInfo(checkpointData?.recommended_steps_info || null);
@@ -765,7 +774,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const enqueue = async () => {
     if (!(await preflightOk())) return;
     // Mise en file AVEC la base/variante choisie (sinon le job reprend la base persistée).
-    let body = { base_model: base, variant, train_type: trainType, masked, steps: stepsN,
+    let body = { base_model: base, variant, train_type: trainType, engine, masked, steps: stepsN,
                  ...(allowNotReady ? { allow_not_ready: true } : {}),
                  ...(trainType === 'sdxl' ? { vae_path: vaePath, te_path: tePath } : {}) };
     let d = await postTrain(`/api/dataset/${ds.currentId}/train/enqueue`, body);
@@ -803,7 +812,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const schedule = async () => {
     if (!schedAt) return;
     if (!(await preflightOk())) return;
-    let body = { at: schedAt, base_model: base, variant, train_type: trainType, masked, steps: stepsN,
+    let body = { at: schedAt, base_model: base, variant, train_type: trainType, engine, masked, steps: stepsN,
                  ...(allowNotReady ? { allow_not_ready: true } : {}),
                  ...(trainType === 'sdxl' ? { vae_path: vaePath, te_path: tePath } : {}) };
     let d = await postTrain(`/api/dataset/${ds.currentId}/train/schedule`, body);
@@ -1187,6 +1196,19 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
           <option value="flux2klein">FLUX.2 Klein (~20 img)</option>
           <option value="qwen_image">Qwen-Image (~20 img)</option>
         </select>
+        {trainType === 'qwen_image' && (baseInfo?.valid_engines?.length ?? 0) > 1 && (
+          <>
+            <span className="text-content-muted text-[0.625rem] uppercase">Engine</span>
+            <select value={engine} onChange={(e) => setEngine(e.target.value)}
+              disabled={trainTypeBusy || presetBusy || status.in_progress}
+              aria-label="Training engine"
+              title="Which local training tool runs this Qwen-Image LoRA"
+              className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50">
+              <option value="aitoolkit">Local — ai-toolkit</option>
+              <option value="musubi">Local — musubi-tuner</option>
+            </select>
+          </>
+        )}
         <button type="button" disabled={!status.installed || belowFloor || status.in_progress || baseBlocksTrain || sdxlNeedsBase || customWeightsEmpty || sliderPromptsMissing}
           title={baseBlocksTrain ? 'Convert the custom base first'
             : customWeightsEmpty ? 'Enter the path to your custom weights .safetensors'
@@ -1210,7 +1232,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                                    allow_uncaptioned: 'allowUncaptioned',
                                    allow_caption_quality: 'allowCaptionQuality',
                                    allow_unverified_weights: 'allowUnverifiedWeights' };
-            let opts = { baseModel: base, variant, trainType, masked, steps: stepsN, fresh,
+            let opts = { baseModel: base, variant, trainType, engine, masked, steps: stepsN, fresh,
                          vaePath, tePath, allowNotReady };
             let d = await ds.train(opts);
             for (let flag; d && d.ok === false && (flag = confirmableRetryFlag(d.error, 'Train anyway (force)')); ) {

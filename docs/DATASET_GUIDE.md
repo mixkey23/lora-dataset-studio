@@ -58,6 +58,14 @@ the built-in **Qwen-Image · Concept** preset documents this convention.
 > engines). It uses Qwen-Image-Edit-2511 plus a pre-trained community LoRA, not
 > anything trained in this app.
 
+**Training engine.** Qwen-Image is also the one family with a choice of local
+training engine, picked per run next to the LoRA-type selector: **ai-toolkit**
+(default, same engine every other family uses) or, once configured under
+Settings ▸ Local tools, **musubi-tuner**. Both produce a Qwen-Image LoRA from
+the same dataset — pick whichever install you already have. musubi-tuner
+launches are **fresh-start only**: continuing/resuming a stopped run isn't
+available on that engine yet, so use ai-toolkit if you need to resume.
+
 ---
 
 ## 2. How many images, and which ones

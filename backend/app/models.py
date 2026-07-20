@@ -28,6 +28,10 @@ class FaceDataset(db.Model):
     # l'adapter de de-distillation. Isole aussi le run d'entraînement par base.
     train_base_model = db.Column(Text, nullable=True)
     train_variant = db.Column(String(20), nullable=True)
+    # Second local training engine (Wave 2) — 'aitoolkit' (default/every family)
+    # or 'musubi' (qwen_image only). NULL = 'aitoolkit' (see
+    # lora_training._train_engine / face_dataset_service.normalize_train_engine).
+    train_engine = db.Column(String(16), nullable=True)
     # « Custom weights… » (V1, local-only) : quand train_base_model est un chemin
     # ABSOLU vers un .safetensors, c'est un poids custom de la MÊME architecture
     # (krea/flux/flux2klein/sdxl). Overrides SDXL UNIQUEMENT (ai-toolkit ne les

@@ -564,6 +564,19 @@ def normalize_train_type(t) -> str:
     return t if t in TRAIN_TYPES else 'zimage'
 
 
+# Second local training engine (Wave 2) — 'musubi' (musubi-tuner) is scoped
+# to the 'qwen_image' family only; every other family stays 'aitoolkit'-only
+# regardless of what's persisted (lora_training._valid_engines_for enforces
+# that at launch/enqueue time — this normalizer only validates the enum).
+TRAIN_ENGINES = ('aitoolkit', 'musubi')
+
+
+def normalize_train_engine(e) -> str:
+    """Valid engine key in lowercase, default 'aitoolkit' (unknown/None)."""
+    e = (e or '').strip().lower()
+    return e if e in TRAIN_ENGINES else 'aitoolkit'
+
+
 # --- Prompt suffixes (creative direction, community feature request) ----------
 # Free user text that rides on every generated variation: a GLOBAL suffix plus an
 # optional per-framing map (same buckets as the composition). Persisted on the

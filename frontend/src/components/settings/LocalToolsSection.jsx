@@ -194,6 +194,56 @@ export default function LocalToolsSection(props) {
           </div>
         </details>
       </Card>
+
+      <Card
+        id="musubi-tuner"
+        title="musubi-tuner (Qwen-Image only)"
+        help="A second, optional training engine for the Qwen-Image family — point at your kohya-ss/musubi-tuner clone (its .venv/venv is detected automatically), then set the three Qwen-Image model paths below. None of these are downloaded by this app; ai-toolkit above stays required regardless of which engine you pick per run."
+      >
+        <div className="flex items-end gap-3">
+          <div className="flex-1">
+            <TextField
+              id="musubi-tuner-dir"
+              label="musubi-tuner directory"
+              value={config.musubi_tuner.dir}
+              onChange={(v) => setField('musubi_tuner', 'dir', v)}
+              placeholder="/AI/musubi-tuner"
+            />
+            <TestResult result={testResults.musubi_tuner} />
+          </div>
+          <TestButton target="musubi_tuner" beforeTest={() => saveConfigSection('musubi_tuner')}
+            onResult={(r) => recordTestResult('musubi_tuner', r)} />
+        </div>
+        <TextField
+          id="musubi-tuner-python"
+          label="Python interpreter (optional)"
+          value={config.musubi_tuner.python}
+          onChange={(v) => setField('musubi_tuner', 'python', v)}
+          placeholder="Auto — only needed when musubi-tuner has no .venv/venv (conda, uv, system Python)"
+          help="Full path to the python executable musubi-tuner should run with."
+        />
+        <TextField
+          id="musubi-tuner-qwen-image-dit"
+          label="Qwen-Image DiT (UNET)"
+          value={config.musubi_tuner.qwen_image_dit}
+          onChange={(v) => setField('musubi_tuner', 'qwen_image_dit', v)}
+          placeholder="…/ComfyUI/models/diffusion_models/QwenImage/qwen_image_fp8_e4m3fn.safetensors"
+        />
+        <TextField
+          id="musubi-tuner-qwen-image-vae"
+          label="Qwen-Image VAE"
+          value={config.musubi_tuner.qwen_image_vae}
+          onChange={(v) => setField('musubi_tuner', 'qwen_image_vae', v)}
+          placeholder="…/ComfyUI/models/vae/QwenImage/qwen_image_vae.safetensors"
+        />
+        <TextField
+          id="musubi-tuner-qwen-image-text-encoder"
+          label="Qwen-Image text encoder"
+          value={config.musubi_tuner.qwen_image_text_encoder}
+          onChange={(v) => setField('musubi_tuner', 'qwen_image_text_encoder', v)}
+          placeholder="…/ComfyUI/models/text_encoders/qwen_2.5_vl_7b.safetensors"
+        />
+      </Card>
     </div>
   )
 }

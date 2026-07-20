@@ -336,6 +336,26 @@ def probe_aitoolkit() -> dict:
     return {'ok': False, 'detail': f'invalid aitoolkit dir: {d}'}
 
 
+def probe_musubi_tuner() -> dict:
+    """musubi-tuner (Wave 2, Qwen-Image-only second training engine): dir +
+    venv + its 3 Qwen-Image scripts must all be present. Mirrors
+    probe_aitoolkit()'s shape (has_run -> has_scripts) and detail wording."""
+    d = cfg.musubi_tuner_path('dir')
+    if not d:
+        return {'ok': False, 'detail': 'musubi_tuner.dir not configured'}
+    venv_python = cfg.musubi_tuner_path('venv_python')
+    from .services import musubi_tuner as mt
+    has_scripts = all((d / rel).is_file() for rel in mt.QWEN_IMAGE_SCRIPTS.values())
+    ok = has_scripts and bool(venv_python) and venv_python.exists()
+    if ok:
+        return {'ok': True, 'detail': str(d)}
+    if has_scripts:
+        return {'ok': False,
+                'detail': (f'musubi-tuner found at {d} but no .venv/venv inside — '
+                           'set its Python interpreter in Settings → Local tools')}
+    return {'ok': False, 'detail': f'invalid musubi-tuner dir (Qwen-Image scripts not found): {d}'}
+
+
 # JoyCaption's runtime deps that ai-toolkit does NOT ship: the training venv has
 # torch/torchvision, but joycaption_infer.py also needs transformers (AutoTokenizer
 # / LlavaForConditionalGeneration), bitsandbytes (the NF4 4-bit load) and accelerate
@@ -754,6 +774,7 @@ def probe(force=False) -> dict:
     ollama = probe_ollama()
     ollama_installed = probe_ollama_installed()
     aitoolkit = probe_aitoolkit()
+    musubi_tuner_probe = probe_musubi_tuner()
     gemini = probe_gemini()
     openai_ = probe_openai()
     face_scoring = probe_face_scoring()
@@ -878,6 +899,22 @@ def probe(force=False) -> dict:
         'aitoolkit': {
             'configured': bool(cfg.get('aitoolkit.dir')),
             'valid': aitoolkit['ok'],
+        },
+        # Second local training engine (Wave 2), Qwen-Image only. ai-toolkit
+        # stays required regardless (see 'aitoolkit' above) — this only gates
+        # whether the musubi-tuner LAUNCH path itself is usable.
+        'musubi_tuner': {
+            'configured': bool(cfg.get('musubi_tuner.dir')),
+            'valid': musubi_tuner_probe['ok'],
+            'detail': musubi_tuner_probe['detail'],
+        },
+        'musubi_tuner_qwen_image_weights': {
+            k: bool(v and os.path.isfile(v))
+            for k, v in {
+                'dit': cfg.get('musubi_tuner.qwen_image_dit'),
+                'vae': cfg.get('musubi_tuner.qwen_image_vae'),
+                'text_encoder': cfg.get('musubi_tuner.qwen_image_text_encoder'),
+            }.items()
         },
         'cloud_training': bool(cfg.secret('VAST_API_KEY')),
         # Publish-to-HF is gated purely on the HF_TOKEN secret being present (the

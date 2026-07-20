@@ -112,7 +112,7 @@ None of these has a Test button; you find out they work on your next scan.
 
 ## Local tools
 
-Where you point the app at the local programs that unlock the full pipeline: **ComfyUI** (Klein generation and Test Studio), **Ollama** (the vision model behind captioning and framing) and **ai-toolkit** (training and JoyCaption). Each card has a **Test** button that tells you immediately whether the app can see the tool.
+Where you point the app at the local programs that unlock the full pipeline: **ComfyUI** (Klein generation and Test Studio), **Ollama** (the vision model behind captioning and framing), **ai-toolkit** (training and JoyCaption) and, optionally, **musubi-tuner** (a second training engine, Qwen-Image only). Each card has a **Test** button that tells you immediately whether the app can see the tool.
 
 ### ComfyUI
 
@@ -143,6 +143,18 @@ Under **Advanced: ai-toolkit overrides**, three optional path overrides (all def
 - **Datasets directory override** → `aitoolkit.datasets_dir` (defaults to `<dir>/datasets`).
 - **Output directory override** → `aitoolkit.output_dir` (defaults to `<dir>/output`).
 - **Hugging Face cache override** → `aitoolkit.hf_home` (defaults to a cache under the ai-toolkit folder). Point this at an existing HF cache to avoid re-downloading base models.
+
+### musubi-tuner (Qwen-Image only)
+
+A second, optional local training engine — [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner), scoped in this app to the **Qwen-Image** family only. It's never required: ai-toolkit above stays the one mandatory training install, and every other family (Z-Image, SDXL, Krea 2, FLUX.1, FLUX.2 Klein) always trains through ai-toolkit regardless of whether musubi-tuner is configured. When both are set up, the **Training** panel shows an **Engine** picker for Qwen-Image datasets only.
+
+- **musubi-tuner directory** → `musubi_tuner.dir`. The folder containing musubi-tuner's `src/musubi_tuner/` scripts. Default **empty**. **Test** validates that the three Qwen-Image scripts are present and that a Python interpreter can be found.
+- **Python interpreter (optional)** → `musubi_tuner.python`. Default **empty = auto-detect** a `.venv/` or `venv/` next to the musubi-tuner directory. Fill this in only if you installed musubi-tuner without a venv folder for the app to find (conda, uv, system Python).
+- **Qwen-Image DiT (UNET)** → `musubi_tuner.qwen_image_dit`. Full path to the Qwen-Image (or Qwen-Image-Edit-2511) diffusion model weights, e.g. `qwen_image_fp8_e4m3fn.safetensors`.
+- **Qwen-Image VAE** → `musubi_tuner.qwen_image_vae`. Full path to `qwen_image_vae.safetensors`.
+- **Qwen-Image text encoder** → `musubi_tuner.qwen_image_text_encoder`. Full path to the Qwen2.5-VL text encoder, e.g. `qwen_2.5_vl_7b.safetensors`.
+
+None of these four weight files are downloaded by this app — point them at files you already have (a shared ComfyUI `models/` folder works fine). **Continuing/resuming a stopped run isn't available on the musubi-tuner engine yet** — every musubi launch starts fresh; use ai-toolkit if you need to resume a run.
 
 ## Captioning & quality
 
@@ -202,7 +214,7 @@ Defaults for new runs, plus everything about the optional cloud training lane.
 ### Defaults
 
 - **Default training family** → `training.default_family`. The model family preselected when you start a new run. One of `zimage`, `sdxl`, `krea`, `flux`, `flux2klein`, `qwen_image`. Default **`zimage`**. Purely a starting point — you can switch family per run.
-- **`qwen_image`** trains either base **Qwen-Image** (text-to-image, the default) or **Qwen-Image-Edit-2511** (instruction-based editing) — pick the target via the variant selector next to the base picker. Local-only for now (no cloud lane yet). This is a plain training family: for *using* an already-trained multi-angle LoRA to rotate an existing render's camera angle, see **Qwen Multi-angle** under Image engines above instead — that's a separate, unrelated feature.
+- **`qwen_image`** trains either base **Qwen-Image** (text-to-image, the default) or **Qwen-Image-Edit-2511** (instruction-based editing) — pick the target via the variant selector next to the base picker. Local-only for now (no cloud lane yet). This is a plain training family: for *using* an already-trained multi-angle LoRA to rotate an existing render's camera angle, see **Qwen Multi-angle** under Image engines above instead — that's a separate, unrelated feature. `qwen_image` is also the only family with a choice of **training engine** — ai-toolkit (default) or, if configured under Local tools, **musubi-tuner** — picked per run next to the LoRA-type selector.
 
 ### Cloud GPU (vast.ai)
 

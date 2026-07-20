@@ -56,6 +56,20 @@ DEFAULTS = {
                   # Explicit interpreter for installs without venv/.venv
                   # (conda, uv, system python). Empty = auto-detect.
                   'python': ''},
+    # Second local training engine (Wave 2) — Qwen-Image ONLY, alongside
+    # ai-toolkit (which stays required for every other family AND for the
+    # rest of the training UI's plumbing; musubi-tuner only replaces the
+    # subprocess-launch step for a qwen_image dataset whose engine is set to
+    # 'musubi'). Unlike ai-toolkit's HF-repo-id bases, musubi-tuner's Qwen-
+    # Image scripts take explicit local weight paths (--dit/--vae/
+    # --text_encoder) — no auto-download, so these three are plain paths the
+    # user points at whatever they already have.
+    'musubi_tuner': {'dir': '',
+                     # Explicit interpreter for installs without .venv/venv.
+                     # Empty = auto-detect (same convention as aitoolkit.python).
+                     'python': '',
+                     'qwen_image_dit': '', 'qwen_image_vae': '',
+                     'qwen_image_text_encoder': ''},
     'engines': {'default': 'chatgpt', 'enabled': ['nanobanana', 'chatgpt', 'klein'],
                 # chatgpt_auth: 'auto' = subscription when connected, else API key.
                 'chatgpt_auth': 'auto',            # auto|api|subscription
@@ -366,6 +380,28 @@ def aitoolkit_path(kind: str):
         return win if os.name == 'nt' else root / 'venv' / 'bin' / 'python'
     if kind == 'jobs':
         return root / 'config' / 'generated'
+    raise KeyError(kind)
+
+def musubi_tuner_path(kind: str):
+    """Mirrors aitoolkit_path()'s contract exactly: None when unconfigured
+    (never raises), venv/.venv-then-explicit-python interpreter resolution."""
+    root = get('musubi_tuner.dir') or ''
+    if not root:
+        return None
+    root = Path(root)
+    if kind == 'dir':
+        return root
+    if kind == 'venv_python':
+        explicit = (get('musubi_tuner.python') or '').strip()
+        if explicit:
+            return Path(explicit)
+        for env_dir in ('.venv', 'venv'):
+            p = (root / env_dir / 'Scripts' / 'python.exe' if os.name == 'nt'
+                 else root / env_dir / 'bin' / 'python')
+            if p.exists():
+                return p
+        win = root / '.venv' / 'Scripts' / 'python.exe'
+        return win if os.name == 'nt' else root / '.venv' / 'bin' / 'python'
     raise KeyError(kind)
 
 def dataset_images_root() -> Path:

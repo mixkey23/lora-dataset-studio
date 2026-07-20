@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-20-musubi-tuner-engine',
+    date: '2026-07-20',
+    title: '⚙️ musubi-tuner joins as a second Qwen-Image training engine',
+    blurb:
+      "Already have kohya-ss/musubi-tuner installed? Point at it under Settings ▸ Local tools and set the three Qwen-Image weight paths (DiT, VAE, text encoder), and a new Engine picker appears next to the LoRA-type selector whenever you train Qwen-Image — pick ai-toolkit (default) or musubi-tuner per run. Fresh launches only for now; resuming a stopped musubi-tuner run isn't available yet, so use ai-toolkit if you need Continue.",
+    to: '/settings/local-tools',
+  },
+  {
     id: '2026-07-20-qwen-multiangle-engine',
     date: '2026-07-20',
     title: '🎥 Rotate any render\'s camera angle with one click',

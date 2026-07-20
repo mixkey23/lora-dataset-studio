@@ -61,6 +61,8 @@ def dataset_train(dataset_id):
             kw['vae_path'] = d.get('vae_path')
         if 'te_path' in d:
             kw['te_path'] = d.get('te_path')
+        if d.get('engine'):
+            kw['engine'] = d.get('engine')
         res = lt.launch_training(LOCAL_USER, dataset_id, steps=d.get('steps'),
                                  base_model=d.get('base_model'),
                                  variant=d.get('variant', 'turbo'),
@@ -147,6 +149,8 @@ def dataset_train_enqueue(dataset_id):
         kw['variant'] = d.get('variant')
     if d.get('train_type'):
         kw['train_type'] = d.get('train_type')
+    if d.get('engine'):
+        kw['engine'] = d.get('engine')
     if d.get('allow_caption_mismatch'):
         kw['allow_caption_mismatch'] = True
     if d.get('allow_uncaptioned'):
@@ -202,6 +206,8 @@ def dataset_train_schedule(dataset_id):
         kw['variant'] = d.get('variant')
     if d.get('train_type'):
         kw['train_type'] = d.get('train_type')
+    if d.get('engine'):
+        kw['engine'] = d.get('engine')
     if d.get('allow_caption_mismatch'):
         kw['allow_caption_mismatch'] = True
     if d.get('allow_uncaptioned'):
@@ -492,6 +498,11 @@ def dataset_train_base_info(dataset_id):
                     # → 4B, sinon Turbo. Déféré au service (_default_variant_for) pour
                     # que l'UI et le lancement (_krea_is_raw/_flux2klein_is_9b) s'accordent.
                     'variant': ds.train_variant or lt._default_variant_for(ds.train_type or 'zimage'),
+                    # Second local training engine (Wave 2) — 'aitoolkit' (every
+                    # family) or 'musubi' (qwen_image only). valid_engines lets the
+                    # UI show the selector only where it means something.
+                    'engine': ds.train_engine or 'aitoolkit',
+                    'valid_engines': list(lt._valid_engines_for(ds.train_type or 'zimage')),
                     'converted': converted,
                     'convert': zc.convert_status(),
                     'train_type': ds.train_type or 'zimage',

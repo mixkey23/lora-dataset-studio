@@ -22,6 +22,7 @@ _TEST_TARGETS = {
     # source of truth.
     'ollama': capabilities.probe_ollama_connection,
     'aitoolkit': capabilities.probe_aitoolkit,
+    'musubi_tuner': capabilities.probe_musubi_tuner,
     'face_scoring': capabilities.probe_face_scoring,
     'masks': capabilities.probe_masks,
     'vast': capabilities.probe_vast,

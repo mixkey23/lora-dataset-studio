@@ -264,6 +264,8 @@ const TOPICS = [
     ['ai-toolkit', 'aitoolkit', 'output', 'directory', 'override', 'path']),
   setting('aitoolkit.hf_home', 'local-tools', 'aitoolkit-hf-home', 'ai-toolkit Hugging Face cache',
     ['ai-toolkit', 'aitoolkit', 'hugging face', 'hf home', 'cache', 'override', 'path']),
+  setting('musubi_tuner.dir', 'local-tools', 'musubi-tuner', 'musubi-tuner (Qwen-Image only)',
+    ['musubi-tuner', 'musubi', 'kohya', 'qwen', 'qwen-image', 'engine', 'second training engine', 'directory', 'path']),
   // captioning
   setting('captioning.backend', 'captioning', 'captioning-backend', 'Captioning backend',
     ['caption', 'captioning', 'backend', 'joycaption', 'ollama', 'auto']),

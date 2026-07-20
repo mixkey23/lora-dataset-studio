@@ -99,6 +99,7 @@ _SCHEMA_ADDITIONS = (
     ('bank_image', 'semantic_dup_group', 'INTEGER'),
     ('bank_image', 'framing', 'VARCHAR(8)'),
     ('image_bank', 'pipeline_report', 'TEXT'),
+    ('face_dataset', 'train_engine', 'VARCHAR(16)'),
 )
 
 def _apply_additive_migrations():
