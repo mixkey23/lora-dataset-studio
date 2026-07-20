@@ -457,6 +457,27 @@ export function useDataset() {
     return d;
   }, [refresh, toast]);
 
+  // Rotate an existing dataset image's camera angle with Qwen Multi-angle
+  // (Qwen-Image-Edit-2511 + the community multi-angle LoRA). Same shape as
+  // improveImage: the source stays untouched, a new derived candidate is
+  // created and reviewed like any other generated tile.
+  const multiangleImage = useCallback(async (imageId, { azimuth, elevation, distance,
+      multiangleStrength, consistencyStrength, lightningEnabled, silent = false, refreshAfter = true } = {}) => {
+    const d = await postJson(`/api/dataset/image/${imageId}/multiangle`, {
+      azimuth, elevation, distance,
+      ...(multiangleStrength != null ? { multiangle_strength: multiangleStrength } : {}),
+      ...(consistencyStrength != null ? { consistency_strength: consistencyStrength } : {}),
+      ...(lightningEnabled != null ? { lightning_enabled: lightningEnabled } : {}),
+    });
+    if (!d.ok) {
+      if (!silent) toast.error(d.error || 'Could not start the angle change');
+      return d;
+    }
+    if (!silent) toast.success('Rotating camera angle — a new candidate is being generated for review.');
+    if (refreshAfter) await refresh();
+    return d;
+  }, [refresh, toast]);
+
   const classify = useCallback(() => wrap(async () => {
     const d = await postJson(`/api/dataset/${currentId}/classify`);
     if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
@@ -1101,7 +1122,7 @@ export function useDataset() {
            analyzing: analyzingLive, watermarking: watermarkingLive, activity,
            nonces, mirroringIds, refNonce, recaptioningIds, create, open,
            deleteDataset, updateSettings, setCurrentId, setRef, addExtraRef, removeExtraRef,
-           generate, importFiles, scrapeImport, resolveSmallImageRescue, improveImage, classify, caption, recaption, recaptionImages,
+           generate, importFiles, scrapeImport, resolveSmallImageRescue, improveImage, multiangleImage, classify, caption, recaption, recaptionImages,
            setStatus, setCaption, mirrorImage, crop, cropRef, recropRefAuto, setDatasetTrainType, setDatasetFidelity, deleteImage, batchImages, replaceCaptions, writeCaptionFiles, openDatasetFolder, cancelPending, cancelCaption, regenerate, analyzeFaces,
            findWatermarks, cleanWatermarks, cleanWatermarkImages, restoreWatermarkImage, dismissWatermarks, saveWatermarkRegions,
            purgeUnused, exportZip, exportBackup, exportZipFor, exportBackupFor, importBackup, importDatasetZip, importDatasetFolder,

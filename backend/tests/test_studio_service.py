@@ -1160,6 +1160,18 @@ def test_embedded_workflow_model_refs_are_all_layout_independent():
             ('qwen3vl_4b_fp8_scaled.safetensors', 'DORMANT'),
         ('krea2_turbo_img2img.json', '22', 'vae_name'):
             ('qwen_image_vae.safetensors', 'DORMANT'),
+        ('qwen_multiangle.json', '108', 'unet_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors', 'RESOLVED'),
+        ('qwen_multiangle.json', '95', 'vae_name'):
+            ('QwenImage/qwen_image_vae.safetensors', 'RESOLVED'),
+        ('qwen_multiangle.json', '93', 'clip_name'):
+            ('qwen_2.5_vl_7b_fp8_scaled.safetensors', 'RESOLVED'),
+        ('qwen_multiangle.json', '109', 'lora_name'):
+            ('QwenImage/qwen-image-edit-2511-multiple-angles-lora.safetensors', 'RESOLVED'),
+        ('qwen_multiangle.json', '114', 'lora_name'):
+            ('QwenImage/consistence_edit_v2.safetensors', 'RESOLVED'),   # or BYPASSED when absent
+        ('qwen_multiangle.json', '102', 'lora_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors', 'RESOLVED'),   # or BYPASSED when absent/disabled
     }
     assert all(cat in ALLOWED for _ref, cat in EXPECTED.values())
     actual = {}

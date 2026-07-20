@@ -491,7 +491,7 @@ def _scan_models() -> dict:
     # ComfyUI would load. With no yaml the roots are the historical [unet,
     # diffusion_models] / [checkpoints], so the output is byte-for-byte unchanged.
     from .services import comfy_model_paths
-    result = {'zimage': [], 'sdxl': [], 'krea': [], 'klein': []}
+    result = {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': []}
     try:
         models_dir = cfg.comfyui_dir('models')
     except Exception:
@@ -517,6 +517,8 @@ def _scan_models() -> dict:
             # user already owns.
             elif 'klein' in name.lower():
                 result['klein'].extend(_model_files(sub))
+            elif 'qwen' in name.lower() and 'edit' in name.lower():
+                result['qwen_multiangle'].extend(_model_files(sub))
             elif krea_eligible and name.lower().startswith('krea'):
                 result['krea'].extend(_model_files(sub))
         # Flat / Stability-Matrix layouts drop the model straight INTO
@@ -528,8 +530,11 @@ def _scan_models() -> dict:
         for name in _model_files(root_path):
             if 'klein' in name.lower():
                 result['klein'].append(name)
+            elif 'qwen' in name.lower() and 'edit' in name.lower():
+                result['qwen_multiangle'].append(name)
 
     result['klein'] = sorted(set(result['klein']))
+    result['qwen_multiangle'] = sorted(set(result['qwen_multiangle']))
     sdxl = []
     for root in comfy_model_paths.search_roots('checkpoints'):
         sdxl.extend(_model_files(Path(root)))
@@ -789,6 +794,20 @@ def probe(force=False) -> dict:
                    and bool(_keh.resolve_klein_vae())
                    and bool(_keh.resolve_klein_text_encoder())
                    and not klein_blocking_invalid)
+    # Qwen Multi-angle engine — same honest, resolver-driven readiness pattern
+    # as Klein above, but FOUR components instead of three: the multi-angle
+    # LoRA is REQUIRED (not optional like Klein's consistency LoRA), since
+    # without it this engine has no purpose.
+    from .services import qwen_multiangle_helper as _qmh
+    qwen_ma_missing = _qmh.qwen_ma_missing_assets()
+    qwen_ma_invalid = _qmh.qwen_ma_invalid_assets()
+    qwen_ma_blocking_invalid = any(
+        i['blocking'] and i['asset'] in _qmh.QWEN_MA_REQUIRED for i in qwen_ma_invalid)
+    qwen_ma_ready = (comfy['ok'] and bool(_qmh.resolve_qwen_ma_unet())
+                     and bool(_qmh.resolve_qwen_ma_vae())
+                     and bool(_qmh.resolve_qwen_ma_text_encoder())
+                     and bool(_qmh.resolve_qwen_ma_multiangle_lora()[1])
+                     and not qwen_ma_blocking_invalid)
     base_dir = cfg.get('comfyui.base_dir') or ''
     comfy_dir = resolve_comfyui_base(base_dir)
     # Conscious "continue without ComfyUI" skip (Setup wizard). DERIVED, not just the
@@ -808,6 +827,7 @@ def probe(force=False) -> dict:
             'nanobanana': gemini['ok'],
             'chatgpt': openai_['ok'],
             'klein': klein_ready,
+            'qwen_multiangle': qwen_ma_ready,
         },
         'chatgpt_subscription': {
             'connected': sub_status['connected'],
@@ -838,6 +858,11 @@ def probe(force=False) -> dict:
             # "present but INVALID: <asset> (<reason>)" line and the diagnostic, and
             # a blocking-invalid required asset also keeps engines.klein dark above.
             'klein_invalid': klein_invalid,
+            # Same shape as klein_missing/klein_invalid, for the Qwen Multi-angle
+            # engine's four assets (unet/text-encoder/vae/multi-angle LoRA, plus
+            # the optional consistency/Lightning LoRAs).
+            'qwen_ma_missing': qwen_ma_missing,
+            'qwen_ma_invalid': qwen_ma_invalid,
         },
         'ollama': {
             'reachable': ollama['ok'],

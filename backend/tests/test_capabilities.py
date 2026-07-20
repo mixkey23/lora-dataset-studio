@@ -34,7 +34,7 @@ def test_probe_all_off_when_unconfigured(app):
         from app import capabilities
         with patch('app.capabilities._http_ok', return_value=False):
             caps = capabilities.probe(force=True)
-    assert caps['engines'] == {'nanobanana': False, 'chatgpt': False, 'klein': False}
+    assert caps['engines'] == {'nanobanana': False, 'chatgpt': False, 'klein': False, 'qwen_multiangle': False}
     assert caps['training_visible'] is False and caps['studio_visible'] is False
 
 def test_python_ml_status_reports_version_and_range(app):
@@ -411,7 +411,7 @@ def test_scan_models_empty_when_comfyui_unset(app):
     with app.app_context():
         from app import capabilities
         models = capabilities._scan_models()
-    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': []}
+    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': []}
 
 def test_scan_models_matches_rules(app, tmp_path):
     with app.app_context():
@@ -438,7 +438,7 @@ def test_scan_models_never_raises_on_absent_dir(app, tmp_path):
         from app import capabilities, config
         config.save_config({'comfyui': {'base_dir': str(tmp_path / 'does_not_exist')}})
         models = capabilities._scan_models()
-    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': []}
+    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': []}
 
 
 # --- resolve_comfyui_base: portable-wrapper nesting ----------------------

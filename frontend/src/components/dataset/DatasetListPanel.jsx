@@ -102,6 +102,8 @@ const FAMILY_BADGE = {
   // rose: libre (fuchsia/cyan sont pris par les badges kind Concept/Style au-dessus
   // de la vignette — une couleur distincte évite de les confondre avec une famille).
   flux2klein: ['FLUX.2 Klein', 'border-rose-400/40 bg-rose-500/10 text-rose-300'],
+  // indigo: also free (not used by the kind badges above the thumbnail either).
+  qwen_image: ['Qwen-Image', 'border-indigo-400/40 bg-indigo-500/10 text-indigo-300'],
 };
 
 // Display preferences — persisted globally (display settings, not dataset
@@ -396,6 +398,7 @@ function NewDatasetForm({ onCreate, onClose }) {
           <option value="krea">Krea 2 (prose captions)</option>
           <option value="flux">FLUX.1 (prose captions)</option>
           <option value="flux2klein">FLUX.2 Klein (prose captions)</option>
+          <option value="qwen_image">Qwen-Image (prose captions)</option>
         </select>
       </label>
       {/* Fidélité (personnage) : visage seul (défaut) vs visage + corps. En mode corps,

@@ -7,8 +7,10 @@ import { useEffect, useRef, useState } from 'react';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
 import { displayLabel } from '../../utils/labels';
 import PexelsAttribution from './PexelsAttribution';
+import QwenAnglePopover from './QwenAnglePopover';
 
 const IMPROVE_HELP = 'Klein creates a new 2 MP version to validate and leaves the original intact.';
+const MULTIANGLE_HELP = 'Qwen Multi-angle creates a new candidate at the picked angle and leaves the original intact.';
 
 export default function DatasetLightbox({
   img,
@@ -18,14 +20,18 @@ export default function DatasetLightbox({
   onCrop,
   onMirror,
   onImprove,
+  onMultiangle,
   busy = false,
   mirrorBusy = false,
   improvePending = false,
   improveReady = false,
   kleinAvailable = false,
+  qwenMultiangleAvailable = false,
 }) {
   const [full, setFull] = useState(false); // false = fit screen, true = 100 %
   const [improving, setImproving] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const [angleOpen, setAngleOpen] = useState(false);
   const dialogRef = useRef(null);
   const closeRef = useRef(null);
 
@@ -68,6 +74,16 @@ export default function DatasetLightbox({
     event.stopPropagation();
     if (!onMirror || busy || mirrorBusy) return;
     await onMirror(img.id);
+  };
+
+  const rotateAngle = async ({ azimuth, elevation, distance }) => {
+    if (!onMultiangle || busy || rotating) return;
+    setRotating(true);
+    try {
+      await onMultiangle(img.id, { azimuth, elevation, distance });
+    } finally {
+      setRotating(false);
+    }
   };
 
   return (
@@ -128,7 +144,21 @@ export default function DatasetLightbox({
               : improvementActive ? '✨ Improving…' : '✨ Upscale & improve'}
           </button>
         )}
+        {onMultiangle && (
+          <button type="button" onClick={(e) => { e.stopPropagation(); if (!busy && !rotating) setAngleOpen(true); }}
+            disabled={busy || rotating || !qwenMultiangleAvailable}
+            aria-busy={rotating}
+            title={!qwenMultiangleAvailable
+              ? `Qwen Multi-angle is not available in this setup. ${MULTIANGLE_HELP}`
+              : MULTIANGLE_HELP}
+            className="min-h-9 w-full sm:w-auto px-3 py-1.5 rounded-lg border border-indigo-400/50 bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-100 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-45">
+            {rotating ? '🎥 Rotating…' : '🎥 Rotate camera angle'}
+          </button>
+        )}
       </div>
+      {angleOpen && (
+        <QwenAnglePopover onSubmit={rotateAngle} onClose={() => setAngleOpen(false)} />
+      )}
     </div>
   );
 }

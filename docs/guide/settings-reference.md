@@ -33,7 +33,7 @@ The Overview section has **no settings of its own** — it's the at-a-glance das
 
 ## Image engines
 
-This is where you connect the services that *generate* dataset images. The app has three engines: **Nano Banana** (Google Gemini), **ChatGPT** (`gpt-image-2`), and **Klein** (local, via ComfyUI). Klein is configured under **Local tools**; the two API engines are configured here.
+This is where you connect the services that *generate* dataset images. The app has three generator engines: **Nano Banana** (Google Gemini), **ChatGPT** (`gpt-image-2`), and **Klein** (local, via ComfyUI); Klein is configured under **Local tools**, the two API engines are configured here. A separate, fourth local engine, **Qwen Multi-angle**, doesn't generate new dataset images from a reference — it rotates the camera angle of an image you already have, and is configured below.
 
 ### API keys
 
@@ -81,6 +81,18 @@ How presets are used matters:
 - Resolution happens **by name** on the server, and it's **fail-closed**: if a run references a preset name that no longer exists, it runs **with no extra LoRAs** rather than erroring.
 - **Trap:** *renaming* a preset does **not** follow a run that referenced it by the old name — that run silently falls back to no extra LoRAs. Rename before you queue, or re-pick the preset on the run.
 - There is deliberately **no automatic NSFW gating** on individual LoRAs — the preset you pick carries the intent. If you want an "NSFW full" stack, make it a preset.
+
+### Qwen Multi-angle (optional tuning)
+
+Rotates the camera angle of an *existing* dataset image (front / three-quarter / profile / back, at a chosen elevation and distance) using Qwen-Image-Edit-2511 plus the community [`fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA`](https://huggingface.co/fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA). Open it from a tile's inspect view (**🎥 Rotate camera angle**), pick an azimuth/elevation/distance combo (or a quick preset), and a new, non-destructive candidate is generated for review — the source image is never touched.
+
+Unlike Klein's assets, **none of the three model files below are downloaded by this app** — point ComfyUI's model folders (`models/unet` or `models/diffusion_models`, `models/vae`, `models/text_encoders`, `models/loras`) at whatever you already have, and the app resolves the right file by name. Stored in `qwen_multiangle.*`:
+
+- **Multi-angle LoRA strength** → `qwen_multiangle.multiangle_strength`, `0`–`1.5`, default **`1.0`** (the model card recommends starting around `0.9`).
+- **Consistency LoRA strength** → `qwen_multiangle.consistency_strength`, `0`–`1.5`, default **`1.0`** — an optional identity/structure anchor; `0` disables it.
+- **Lightning speed LoRA** → `qwen_multiangle.lightning_enabled` (default **on**) + `qwen_multiangle.lightning_strength` (`0`–`1.5`, default **`1.0`**). When on, sampling runs the LoRA's fast 4-step/cfg-1 envelope; when off (or the file is missing), sampling falls back to a slower, non-distilled envelope — both step counts are extrapolated, not yet measured against a real run.
+
+The engine only lights up (`caps.engines.qwen_multiangle`) once the UNET, VAE, text-encoder **and** the multi-angle LoRA are all found on disk — the two extra LoRAs above are quality-only and degrade gracefully when absent.
 
 ## Scraping & sources
 
@@ -189,7 +201,8 @@ Defaults for new runs, plus everything about the optional cloud training lane.
 
 ### Defaults
 
-- **Default training family** → `training.default_family`. The model family preselected when you start a new run. One of `zimage`, `sdxl`, `krea`, `flux`, `flux2klein`. Default **`zimage`**. Purely a starting point — you can switch family per run.
+- **Default training family** → `training.default_family`. The model family preselected when you start a new run. One of `zimage`, `sdxl`, `krea`, `flux`, `flux2klein`, `qwen_image`. Default **`zimage`**. Purely a starting point — you can switch family per run.
+- **`qwen_image`** trains either base **Qwen-Image** (text-to-image, the default) or **Qwen-Image-Edit-2511** (instruction-based editing) — pick the target via the variant selector next to the base picker. Local-only for now (no cloud lane yet). This is a plain training family: for *using* an already-trained multi-angle LoRA to rotate an existing render's camera angle, see **Qwen Multi-angle** under Image engines above instead — that's a separate, unrelated feature.
 
 ### Cloud GPU (vast.ai)
 
@@ -291,7 +304,7 @@ These have no UI control — they're for advanced users editing `config.json` by
 | `cloud.ready_timeout_minutes` | `25` | Boot budget: image pull + services up. |
 | `cloud.max_runtime_minutes` | `480` | Hard stop past this (the stall watchdog is the first line of defence). |
 | `cloud.disk_gb` | `60` | Instance disk (base model + dataset + checkpoints). |
-| `cloud.min_vram_gb` | `{zimage:24, sdxl:16, krea:24, flux2klein:32}` | Minimum VRAM **per family**. flux2klein uses 32 (the 9B is the cloud-first lane; a 32 GB pod also trains the 4B). |
+| `cloud.min_vram_gb` | `{zimage:24, sdxl:16, krea:24, flux2klein:32, qwen_image:32}` | Minimum VRAM **per family**. flux2klein uses 32 (the 9B is the cloud-first lane; a 32 GB pod also trains the 4B). `qwen_image`'s entry is forward-compat only — cloud training currently refuses this family (local-only). |
 | `cloud.onstart` | `''` | Optional startup command for the raw-image fallback. |
 
 **Quality-tool interpreters and models:**

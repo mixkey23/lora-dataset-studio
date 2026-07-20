@@ -835,6 +835,67 @@ def dataset_image_delete(image_id):
     return (jsonify({'ok': True}), 200) if ok else (jsonify({'error': 'not found'}), 404)
 
 
+_QWEN_MA_ASSET_LABELS = {
+    'qwen_ma_unet': 'Qwen-Image-Edit-2511 model', 'qwen_ma_text_encoder': 'text encoder',
+    'qwen_ma_vae': 'VAE', 'qwen_ma_multiangle_lora': 'multi-angle LoRA',
+    'qwen_ma_consistency_lora': 'consistency LoRA', 'qwen_ma_lightning_lora': 'Lightning LoRA',
+}
+
+
+def _qwen_ma_missing_response(missing, missing_nodes=None):
+    """Turn a Qwen Multi-angle preflight miss into a (body, 409) — mirrors
+    _klein_missing_response, minus the auto-download (none of these files are
+    fetched by this app; the user points ComfyUI at what they already have)."""
+    from .. import capabilities, config as cfg
+    from ..services import qwen_multiangle_helper as qmh
+    missing = missing or []
+    missing_nodes = missing_nodes or []
+    if missing and not capabilities.resolve_comfyui_base(cfg.get('comfyui.base_dir') or '')['valid']:
+        return jsonify({'ok': False,
+                        'error': 'Point the app at your ComfyUI install folder in '
+                                 'Setup ▸ ComfyUI first, so Qwen Multi-angle can find its models.'}), 409
+    parts = []
+    if missing:
+        names = ', '.join(_QWEN_MA_ASSET_LABELS.get(m, m) for m in missing)
+        it = 'them' if len(missing) > 1 else 'it'
+        parts.append(f"Qwen Multi-angle needs {names}. Place {it} in your ComfyUI models "
+                     "folder (see Settings ▸ Engines), then retry.")
+    if missing_nodes:
+        parts.append(qmh.format_missing_nodes_message(missing_nodes))
+    return jsonify({'ok': False, 'error': ' '.join(parts),
+                    'qwen_ma_missing': missing,
+                    'qwen_ma_nodes_missing': missing_nodes}), 409
+
+
+@bp.post('/dataset/image/<int:image_id>/multiangle')
+def dataset_image_multiangle(image_id):
+    """Rotate the camera angle of an existing dataset image using Qwen-Image-
+    Edit-2511 + the multi-angle LoRA. Creates a regular derived candidate
+    without touching the source (mirrors /improve's shape)."""
+    data = request.get_json(silent=True) or {}
+    azimuth = data.get('azimuth')
+    elevation = data.get('elevation')
+    distance = data.get('distance')
+    try:
+        from ..services import qwen_multiangle_helper as qmh
+        missing_nodes = qmh.qwen_ma_missing_nodes()
+        if missing_nodes:
+            return _qwen_ma_missing_response(qmh.qwen_ma_missing_assets(), missing_nodes)
+        result = svc.create_qwen_multiangle_variation(
+            LOCAL_USER, image_id, azimuth, elevation, distance,
+            multiangle_strength=data.get('multiangle_strength'),
+            consistency_strength=data.get('consistency_strength'),
+            lightning_enabled=data.get('lightning_enabled', True))
+    except Exception as e:
+        from ..services.qwen_multiangle_helper import QwenMultiangleModelsMissing
+        if isinstance(e, QwenMultiangleModelsMissing):
+            return _qwen_ma_missing_response(e.missing)
+        return _map_error(e)
+    if result is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'ok': True, **result})
+
+
 @bp.post('/dataset/image/<int:image_id>/improve')
 def dataset_image_improve(image_id):
     """Create a regular Klein-upscaled candidate without touching the source."""

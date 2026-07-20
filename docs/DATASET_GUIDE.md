@@ -15,13 +15,13 @@ enforces or defaults to — when in doubt, the app's warnings are this guide app
 The family changes the caption style, the image count, and the settings — so decide
 before you caption anything.
 
-| | Z-Image | SDXL | Krea 2 | FLUX.1 | FLUX.2 Klein |
-|---|---|---|---|---|---|
-| **Caption style** | Prose sentences | Booru tags | Prose sentences | Prose sentences | Prose sentences |
-| **Images (min → good)** | 12 → 20+ | 20 → 30+ | 15 → 20+ | 15 → 20+ | 15 → 20+ |
-| **Training base** | Z-Image-Turbo (or a converted custom merge) | Your ComfyUI checkpoint (e.g. bigLove) | Krea-2-Raw (default) or Turbo | FLUX.1-dev (gated HF) | FLUX.2-klein-base 4B (default) or 9B (gated HF) |
-| **Preview quality** | Fast, distilled | Depends on checkpoint | Raw: slow but faithful | High, ~20 steps | Non-distilled, real CFG (~25 steps) |
-| **Best for** | Fast iteration, prose-driven prompting | Booru-native checkpoints, NSFW ecosystems | Highest realism ceiling | The largest LoRA ecosystem, strong prompt fidelity | Modern FLUX.2 stack; 4B trains on mid-range GPUs |
+| | Z-Image | SDXL | Krea 2 | FLUX.1 | FLUX.2 Klein | Qwen-Image |
+|---|---|---|---|---|---|---|
+| **Caption style** | Prose sentences | Booru tags | Prose sentences | Prose sentences | Prose sentences | Prose sentences |
+| **Images (min → good)** | 12 → 20+ | 20 → 30+ | 15 → 20+ | 15 → 20+ | 15 → 20+ | 15 → 20+ |
+| **Training base** | Z-Image-Turbo (or a converted custom merge) | Your ComfyUI checkpoint (e.g. bigLove) | Krea-2-Raw (default) or Turbo | FLUX.1-dev (gated HF) | FLUX.2-klein-base 4B (default) or 9B (gated HF) | Qwen-Image (default) or Qwen-Image-Edit-2511 |
+| **Preview quality** | Fast, distilled | Depends on checkpoint | Raw: slow but faithful | High, ~20 steps | Non-distilled, real CFG (~25 steps) | Non-distilled, real CFG (~25 steps) |
+| **Best for** | Fast iteration, prose-driven prompting | Booru-native checkpoints, NSFW ecosystems | Highest realism ceiling | The largest LoRA ecosystem, strong prompt fidelity | Modern FLUX.2 stack; 4B trains on mid-range GPUs | A 20B DiT with an instruction-edit variant |
 
 **Krea note:** the default trains on **Krea-2-Raw** — the official recommendation is
 *"train on Raw, validate on Turbo"*. Raw runs are long (hours); that's normal, not stuck.
@@ -39,6 +39,24 @@ this family). Both bases are *gated* on Hugging Face: accept the license of
 `FLUX.2-klein-base-4B` / `-9B` and set a HF token before the first run. In-app
 testing (Test Studio) is coming — until then, test your Klein LoRA in your own
 ComfyUI.
+
+**Qwen-Image note:** two training targets, picked next to the base selector —
+base **Qwen-Image** (default, text-to-image) or **Qwen-Image-Edit-2511**
+(instruction-based editing). No research vault entry exists for this family yet,
+so its defaults (rank 32, sigmoid timesteps, ~24 GB+ VRAM comfort zone) are
+extrapolated from the largest comparable families — expect to tune. **Local
+training only for now.** A common use case is a *multi-angle camera* concept
+LoRA: shoot/curate the same subject from several angles and caption each shot
+with its angle (*"front view"*, *"three-quarter left"*, *"side profile"*, *"from
+above"*, *"from below"*) so the trained LoRA can reproduce a requested angle —
+the built-in **Qwen-Image · Concept** preset documents this convention.
+
+> **Not the same as Qwen Multi-angle.** If you just want to rotate the camera
+> angle of a render you *already generated* — no training involved — that's a
+> different, separate feature: open the image's inspect view and use **🎥
+> Rotate camera angle** (Qwen Multi-angle, configured under Settings ▸ Image
+> engines). It uses Qwen-Image-Edit-2511 plus a pre-trained community LoRA, not
+> anything trained in this app.
 
 ---
 

@@ -153,23 +153,26 @@ _QUICK_PRESET_MATRIX = {
     ('krea', 'character'): 'builtin-krea-character',
     ('flux', 'character'): 'builtin-character-flux1',
     ('flux2klein', 'character'): 'builtin-character-klein',
+    ('qwen_image', 'character'): 'builtin-character-qwen_image',
     ('zimage', 'style'): 'builtin-style-zimage-base',
     ('sdxl', 'style'): 'builtin-style-sdxl',
     ('krea', 'style'): 'builtin-style-krea-raw',
     ('flux', 'style'): 'builtin-style-flux1',
     ('flux2klein', 'style'): 'builtin-style-klein-base',
+    ('qwen_image', 'style'): 'builtin-style-qwen_image-base',
     ('zimage', 'concept'): 'builtin-concept',
     ('sdxl', 'concept'): 'builtin-concept-sdxl',
     ('krea', 'concept'): 'builtin-concept-krea',
     ('flux', 'concept'): 'builtin-concept-flux1',
     ('flux2klein', 'concept'): 'builtin-concept-klein',
+    ('qwen_image', 'concept'): 'builtin-concept-qwen_image',
 }
 
 
 def test_quick_preset_catalogue_covers_every_family_and_kind(client):
     listed = client.get('/api/train/presets').get_json()['presets']
     builtins = [p for p in listed if p.get('builtin')]
-    assert len(builtins) == 15
+    assert len(builtins) == 18
     coverage = {(p['train_type'], p['dataset_kind']): p['id'] for p in builtins}
     assert coverage == _QUICK_PRESET_MATRIX
     for p in builtins:

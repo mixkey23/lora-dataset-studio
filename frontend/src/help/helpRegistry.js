@@ -227,6 +227,9 @@ const TOPICS = [
     ['lora', 'preset', 'presets', 'klein', 'generation', 'texture', 'anatomy', 'style', 'chain', 'nsfw'],
     { trigger: 'klein-tuning-open',
       text: 'Build named generation-LoRA presets in Settings → Image engines, then pick one per run.' }),
+  setting('qwen_multiangle', 'engines', 'qwen-multiangle', 'Qwen Multi-angle tuning',
+    ['qwen', 'multiangle', 'multi-angle', 'camera angle', 'rotate', 'lora', 'lightning',
+     'consistency', 'qwen-image-edit', '2511']),
   setting('GEMINI_API_KEY', 'engines', 'GEMINI_API_KEY', 'Gemini API key',
     ['gemini', 'api key', 'nano banana', 'nanobanana', 'google', 'key']),
   setting('OPENAI_API_KEY', 'engines', 'OPENAI_API_KEY', 'OpenAI API key',
@@ -295,7 +298,7 @@ const TOPICS = [
      'same shot', 'embedding', 'clip', 'cosine', 'threshold']),
   // training
   setting('training.default_family', 'training', 'training-default-family', 'Default training family',
-    ['training', 'family', 'default', 'zimage', 'sdxl', 'krea', 'flux']),
+    ['training', 'family', 'default', 'zimage', 'sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image', 'qwen-image']),
   setting('VAST_API_KEY', 'training', 'VAST_API_KEY', 'vast.ai API key',
     ['vast', 'api key', 'cloud', 'gpu', 'rent', 'budget', 'key']),
   setting('cloud.max_concurrent_runs', 'training', 'cloud-max-concurrent-runs', 'Max simultaneous cloud runs',

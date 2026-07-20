@@ -553,6 +553,9 @@ def launch_cloud_training(user_id, dataset_id, steps=None, base_model=_UNSET,
     if fam == 'flux':
         raise ValueError('FLUX.1 training is local-only for now — '
                          'cloud training supports Z-Image, Krea and FLUX.2 Klein')
+    if fam == 'qwen_image':
+        raise ValueError('Qwen-Image training is local-only for now — '
+                         'cloud training supports Z-Image, Krea and FLUX.2 Klein')
     variant = (variant or '').strip().lower()
     confirmations = {
         'allow_caption_mismatch': bool(allow_caption_mismatch),
@@ -2459,6 +2462,9 @@ def gpu_tiers(user_id, dataset_id, train_type=None, steps=None,
     # flux2klein passe (cf. launch_cloud_training) — seul flux reste local-only.
     if fam == 'flux':
         raise ValueError('FLUX.1 training is local-only for now — '
+                         'cloud training supports Z-Image, Krea and FLUX.2 Klein')
+    if fam == 'qwen_image':
+        raise ValueError('Qwen-Image training is local-only for now — '
                          'cloud training supports Z-Image, Krea and FLUX.2 Klein')
     selected_variant = str(
         variant or getattr(ds, 'train_variant', None)

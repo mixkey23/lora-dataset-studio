@@ -1,0 +1,223 @@
+"""Qwen-Image ('qwen_image') — the 6th training family (ai-toolkit engine).
+
+What matters here: the family is accepted end-to-end, the two model targets
+(base T2I default / Edit-2511 opt-in) drive arch + name_or_path + distinct run
+tags (their weights are incompatible — shared folders would corrupt a
+resume), the possibly-extension arch guard refuses a launch on an ai-toolkit
+that lacks the qwen_image arch (silent SD-loader fallback otherwise), and the
+cloud path stays CLOSED for this family (local-only this wave, unlike
+flux2klein)."""
+import pytest
+
+
+def _configure_aitoolkit(tmp_path, app, supports_qwen=True):
+    """Fake ai-toolkit install (venv python + run.py), with or without the
+    qwen_image arch under extensions_built_in — what the support guard
+    actually scans."""
+    from app import config as cfg
+    root = tmp_path / 'aitoolkit'
+    (root / 'venv' / 'Scripts').mkdir(parents=True)
+    (root / 'venv' / 'Scripts' / 'python.exe').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    ext = root / 'extensions_built_in' / 'diffusion_models' / 'qwen_image'
+    ext.mkdir(parents=True)
+    if supports_qwen:
+        (ext / 'qwen_image_model.py').write_text(
+            'class QwenImageModel:\n    arch = "qwen_image"\n', encoding='utf-8')
+    else:
+        # a sibling extension only — an incidental 'qwen' mention must NOT count.
+        (ext / 'other_model.py').write_text(
+            '# qwen support not merged yet\n'
+            'class OtherModel:\n    arch = "other"\n', encoding='utf-8')
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(root)}})
+    return root
+
+
+# --- 1) train_type accepted / normalized ---------------------------------------
+
+def test_normalize_train_type_accepts_qwen_image_unknown_stays_zimage():
+    from app.services import face_dataset_service as svc
+    assert svc.normalize_train_type('qwen_image') == 'qwen_image'
+    assert svc.normalize_train_type('QWEN_IMAGE') == 'qwen_image'   # case-fold
+    assert svc.normalize_train_type('bogus') == 'zimage'            # unknown -> default
+    assert svc.normalize_train_type(None) == 'zimage'
+
+
+# --- 2) extension-arch guard + actionable launch refusal ------------------------
+
+def test_aitoolkit_supports_qwen_image_scans_extension_archs(app, tmp_path):
+    from app.services import lora_training as lt
+    _configure_aitoolkit(tmp_path, app, supports_qwen=True)
+    with app.app_context():
+        assert lt._aitoolkit_supports_qwen_image() is True
+
+
+def test_aitoolkit_supports_qwen_image_false_without_arch(app, tmp_path):
+    """No qwen_image arch on disk -> False, even with 'qwen' mentioned in a
+    comment (exact-arch match, no substring false positive). Unconfigured
+    ai-toolkit -> False too."""
+    from app.services import lora_training as lt
+    with app.app_context():
+        assert lt._aitoolkit_supports_qwen_image() is False   # not configured
+    _configure_aitoolkit(tmp_path, app, supports_qwen=False)
+    with app.app_context():
+        assert lt._aitoolkit_supports_qwen_image() is False
+
+
+def test_launch_refuses_qwen_image_when_arch_missing(app, tmp_path, monkeypatch):
+    """Without the guard, get_model_class would silently fall back to the SD
+    legacy loader -> corrupted LoRA. The refusal must be actionable (git pull)."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app, supports_qwen=False)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QI', 'zchar_qi', train_type='qwen_image')
+        with pytest.raises(ValueError, match=r'update it \(git pull\)'):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False)
+        # Same guard on the queue path — no deferred job doomed to the fallback.
+        monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+        with pytest.raises(ValueError, match=r'update it \(git pull\)'):
+            lt.enqueue_training(LOCAL_USER, ds.id, extra_steps=100)
+
+
+# --- 3) job config: base default / Edit-2511 opt-in -----------------------------
+
+def test_build_job_config_qwen_image_base_default_and_edit_optin(app, tmp_path):
+    """'image' (base T2I) is the default; 'edit' swaps arch model target AND
+    name_or_path. Non-distilled base -> real CFG previews."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    from app import config as cfg
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(tmp_path / 'aitoolkit')}})
+        ds = svc.create_dataset(LOCAL_USER, 'Qee', 'zchar_qee', train_type='qwen_image')
+        folder = tmp_path / 'ds'; folder.mkdir()
+
+        assert lt._qwen_image_is_edit(ds) is False          # no variant -> base
+        p = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
+        m = p['model']
+        assert m['arch'] == 'qwen_image'
+        assert m['name_or_path'] == 'Qwen/Qwen-Image'
+        assert m['quantize'] is True and m['quantize_te'] is True
+        assert m['low_vram'] is True and m['qtype'] == 'qfloat8'
+        assert p['train']['timestep_type'] == 'sigmoid'
+        assert p['train']['noise_scheduler'] == 'flowmatch'
+        assert p['sample']['sampler'] == 'flowmatch'
+        assert p['sample']['guidance_scale'] == 4 and p['sample']['sample_steps'] == 25
+        assert p['datasets'][0]['caption_ext'] == 'txt'
+        assert p['network'] == {'type': 'lora', 'linear': 32, 'linear_alpha': 32}
+
+        ds.train_variant = 'edit'
+        svc.db.session.commit()
+        assert lt._qwen_image_is_edit(ds) is True
+        pe = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
+        assert pe['model']['arch'] == 'qwen_image'
+        assert pe['model']['name_or_path'] == 'Qwen/Qwen-Image-Edit-2511'
+
+
+def test_qwen_image_expects_prose_captions(app):
+    """Everything != sdxl expects prose: booru-tag captions on a qwen_image
+    dataset trip the MISMATCH_CAPTION guard (forceable, like the others)."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.models import FaceDatasetImage
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QB', 'zchar_qb', train_type='qwen_image')
+        booru = '1girl, solo, cafe, sitting, window, jeans, smile, looking_at_viewer'
+        # 15 kept = the qwen_image family floor, so the caption-mismatch guard is
+        # tested without tripping the readiness image-floor guard (below 15).
+        for _ in range(15):
+            svc.db.session.add(FaceDatasetImage(dataset_id=ds.id, status='keep',
+                                                filename='x.webp', caption=booru))
+        svc.db.session.commit()
+        with pytest.raises(ValueError, match='MISMATCH_CAPTION'):
+            lt.assert_trainable(ds.id, train_type='qwen_image')
+        lt.assert_trainable(ds.id, train_type='qwen_image', allow_caption_mismatch=True)
+
+
+# --- 4) distinct run tags per target (no image/edit telescoping) ---------------
+
+def test_dest_base_tag_distinct_for_image_and_edit(app):
+    """Base and Edit-2511 are incompatible checkpoints: same trigger, two
+    targets -> two run folders / deployed names. A shared tag would make
+    ai-toolkit auto-resume across targets (corrupted LoRA)."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QT', 'zchar_qt', train_type='qwen_image')
+        tag_image = lt._dest_base_tag(ds)                      # default variant -> base
+        assert tag_image == '_Qwen-Image'
+        assert lt._run_name(ds).endswith('_Qwen-Image')
+        ds.train_variant = 'edit'
+        svc.db.session.commit()
+        tag_edit = lt._dest_base_tag(ds)
+        assert tag_edit == '_Qwen-Image-Edit-2511'
+        assert tag_image != tag_edit
+        # ... and both are distinct from a zimage official run (empty tag).
+        ds.train_type = 'zimage'
+        svc.db.session.commit()
+        assert lt._dest_base_tag(ds) == ''
+
+
+def test_default_and_valid_variants_for_qwen_image():
+    """'image' is the family default everywhere no variant is given; the
+    accepted enum is per-family ('image'/'edit' only — a leftover
+    'turbo'/'base' from another family must fall back to base, not leak into
+    the config)."""
+    from app.services import lora_training as lt
+    assert lt._default_variant_for('qwen_image') == 'image'
+    assert lt._valid_variants_for('qwen_image') == ('image', 'edit')
+    # historical families keep their enum untouched
+    assert lt._valid_variants_for('krea') == ('turbo', 'base', 'deturbo')
+    assert lt._valid_variants_for(None) == ('turbo', 'base', 'deturbo')
+    assert lt._default_variant_for('krea') == 'base'
+    assert lt._default_variant_for('zimage') == 'turbo'
+
+
+# --- 5) deploy routing ----------------------------------------------------------
+
+def test_lora_dest_dir_routes_qwen_image(app, tmp_path):
+    import os
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    from app import config as cfg
+    with app.app_context():
+        cfg.save_config({'comfyui': {'base_dir': str(tmp_path / 'comfy')}})
+        ds = svc.create_dataset(LOCAL_USER, 'QD', 'zchar_qd', train_type='qwen_image')
+        dest = lt._lora_dest_dir(ds)
+        assert dest.replace('/', os.sep).endswith(
+            os.sep.join(('models', 'loras', 'qwen_image')))
+        # family override (UI selector) wins over the persisted type
+        assert lt._lora_dest_dir(ds, family='krea').endswith('krea')
+
+
+# --- 6) cloud training stays closed this wave ------------------------------------
+
+def test_cloud_training_refuses_qwen_image(app, tmp_path, monkeypatch):
+    from app.services import face_dataset_service as svc
+    from app.services import cloud_training as ct
+    from app.config import LOCAL_USER
+    monkeypatch.setenv('VAST_API_KEY', 'k-test')
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QC', 'zchar_qc', train_type='qwen_image')
+        with pytest.raises(ValueError, match='local-only'):
+            ct.launch_cloud_training(LOCAL_USER, ds.id)
+
+
+# --- 7) family badge/label classification ---------------------------------------
+
+def test_family_of_lora_classifies_qwen_image_folder():
+    from app.utils.comfyui import family_of_lora, FAMILY_LABELS
+    assert family_of_lora(r'qwen_image\x.safetensors') == 'qwen_image'
+    assert family_of_lora('qwen_image/x.safetensors') == 'qwen_image'
+    # the 'flux' prefix match must not misclassify a qwen_image folder.
+    assert family_of_lora(r'flux\x.safetensors') == 'flux'
+    assert FAMILY_LABELS['qwen_image'] == 'Qwen-Image'

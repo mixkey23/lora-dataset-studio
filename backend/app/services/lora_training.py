@@ -145,6 +145,13 @@ def _lora_dest_dir_flux2klein():
     return d / 'flux2klein'
 
 
+def _lora_dest_dir_qwen_image():
+    d = cfg.comfyui_dir('loras')
+    if not d:
+        raise RuntimeError('ComfyUI is not configured')
+    return d / 'qwen_image'
+
+
 def _sdxl_checkpoints_dir():
     d = cfg.comfyui_dir('models')
     if not d:
@@ -222,6 +229,37 @@ def _aitoolkit_supports_flux2klein() -> bool:
     return False
 
 
+def _aitoolkit_supports_qwen_image() -> bool:
+    """L'ai-toolkit installé connaît-il l'arch Qwen-Image ? Même enjeu CRITIQUE
+    que _aitoolkit_supports_flux2klein (lire son commentaire) : si 'qwen_image'
+    est une arch d'EXTENSION (extensions_built_in) sur l'ai-toolkit installé, un
+    install pas à jour ne la connaît pas et get_model_class retomberait
+    SILENCIEUSEMENT sur le loader SD legacy → LoRA corrompu. On scanne D'ABORD
+    extensions_built_in (comme flux2klein) puis, si absent, tout le dossier
+    toolkit/ (au cas où une version plus récente ait promu qwen_image en arch
+    CŒUR, comme 'flux') — les deux emplacements valident la même chaîne EXACTE
+    `arch = "qwen_image"`, jamais la simple sous-chaîne « qwen »."""
+    root = cfg.aitoolkit_path('dir')
+    if not root:
+        return False
+    pat = re.compile(r'arch\s*=\s*[\'"]qwen_image[\'"]')
+    for subdir in ('extensions_built_in', 'toolkit'):
+        scan_root = root / subdir
+        if not scan_root.is_dir():
+            continue
+        for dp, _dn, files in os.walk(str(scan_root)):
+            for fn in files:
+                if not fn.endswith('.py'):
+                    continue
+                try:
+                    with open(os.path.join(dp, fn), encoding='utf-8', errors='ignore') as fh:
+                        if pat.search(fh.read()):
+                            return True
+                except OSError:
+                    continue
+    return False
+
+
 def _safe_trigger(ds) -> str:
     t = (ds.trigger_word or f'dataset{ds.id}').strip()
     return ''.join(c if (c.isalnum() or c in '_-') else '_' for c in t) or f'dataset{ds.id}'
@@ -250,6 +288,8 @@ def _lora_dest_dir(ds, family=None) -> str:
         return str(_lora_dest_dir_flux())
     if fam == 'flux2klein':
         return str(_lora_dest_dir_flux2klein())
+    if fam == 'qwen_image':
+        return str(_lora_dest_dir_qwen_image())
     return str(_lora_dest_dir_zimage())
 
 
@@ -291,7 +331,7 @@ def _sdxl_base_path(base_model: str) -> str:
 # distinguished from a ComfyUI-relative base name (SDXL whitelist basename,
 # Z-Image merge value) purely by being ABSOLUTE — those are never absolute. Only
 # the families below expose it; Z-Image keeps its own conversion path untouched.
-CUSTOM_WEIGHTS_FAMILIES = ('sdxl', 'krea', 'flux', 'flux2klein')
+CUSTOM_WEIGHTS_FAMILIES = ('sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image')
 # SDXL is the ONLY family where ai-toolkit honours a top-level vae_path /
 # te_name_or_path override (stable_diffusion_model.py). Every other family
 # bundles its TE/VAE (Z-Image extras_name_or_path, Klein's hardcoded MISTRAL_PATH
@@ -379,14 +419,17 @@ def _detect_safetensors_arch(keys) -> str | None:
 # Verdict = FAMILY key ('zimage'|'sdxl'|'krea'|'flux'|'flux2klein') or None
 # (undetectable → callers MUST NOT block; the guarantee is simply absent).
 _LORA_ARCH_LABEL = {'zimage': 'Z-Image', 'sdxl': 'SDXL', 'krea': 'Krea 2',
-                    'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein'}
+                    'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein',
+                    'qwen_image': 'Qwen-Image'}
 # Key-namespace GROUP: two families in the SAME group share the tensor namespace,
 # so a wrong file loads its keys (a version mismatch then fails LOUDLY on a shape
 # error, not silently). Different groups = disjoint names = SILENT drop = the
 # danger we block. FLUX.1 and FLUX.2 Klein share the double/single-stream layout,
-# so they're one group (a name-only sniff can't tell them apart anyway).
+# so they're one group (a name-only sniff can't tell them apart anyway). Qwen-Image
+# (its own DiT layout, base + Edit-2511 variant) is its own group.
 _LORA_ARCH_NAMESPACE = {'zimage': 'zimage', 'sdxl': 'sdxl', 'krea': 'krea',
-                        'flux': 'flux', 'flux2klein': 'flux'}
+                        'flux': 'flux', 'flux2klein': 'flux',
+                        'qwen_image': 'qwen_image'}
 
 
 def _family_from_base_model_version(value) -> str | None:
@@ -402,6 +445,8 @@ def _family_from_base_model_version(value) -> str | None:
         return 'flux2klein'
     if v.startswith('flux'):
         return 'flux'
+    if 'qwen_image' in v or 'qwen-image' in v:
+        return 'qwen_image'
     if 'zimage' in v or 'z_image' in v or 'z-image' in v:
         return 'zimage'
     if 'krea' in v:                      # 'krea2'
@@ -489,7 +534,8 @@ _FAMILY_EXPECTED_ARCH = {'sdxl': 'sdxl', 'krea': 'krea2',
 _ARCH_LABEL = {'sdxl': 'an SDXL', 'sd15': 'a Stable Diffusion 1.5',
                'flux': 'a FLUX', 'krea2': 'a Krea 2'}
 _FAMILY_LABEL = {'sdxl': 'SDXL', 'krea': 'Krea 2',
-                 'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein'}
+                 'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein',
+                 'qwen_image': 'Qwen-Image'}
 # Confirmable-refusal marker (mirrors UNCAPTIONED:/MISMATCH_CAPTION:): the UI
 # strips it, asks window.confirm, and retries with allow_unverified_weights.
 _UNVERIFIED_MARKER = 'CUSTOM_WEIGHTS_UNVERIFIED: '
@@ -574,6 +620,11 @@ FLUX_BASE_LABEL = 'FLUX-1-dev'
 # corrompu) et le même nom de LoRA déployé. Sans point dans les labels (même piège
 # d'extension que FLUX_BASE_LABEL : _base_tag_for tronque après un '.').
 FLUX2KLEIN_BASE_LABELS = {'4b': 'FLUX2-Klein-4B', '9b': 'FLUX2-Klein-9B'}
+# Qwen-Image has TWO official checkpoints too — the base T2I model and the
+# Edit-2511 instruction-edit model. Same anti-collision reasoning as
+# FLUX2KLEIN_BASE_LABELS: distinct tags so the two never share a run folder or
+# a deployed LoRA name for the same trigger.
+QWEN_IMAGE_BASE_LABELS = {'image': 'Qwen-Image', 'edit': 'Qwen-Image-Edit-2511'}
 
 # Z-Image recipes are intentionally centralized here.  Before this guardrail,
 # ``train_variant='base'`` / ``'deturbo'`` only removed the Turbo training
@@ -724,10 +775,22 @@ def _flux2klein_is_9b(ds, variant=_PERSISTED) -> bool:
     return str(selected or '4b').lower() == '9b'
 
 
+def _qwen_image_is_edit(ds, variant=_PERSISTED) -> bool:
+    """Qwen-Image model target. `train_variant` 'edit' → Qwen-Image-Edit-2511
+    (instruction-based editing); anything else → base Qwen-Image (T2I). Default
+    'image' when unset — the chosen product default (mirrors _default_variant_for),
+    so the run tag and the job-config never disagree even if train_variant was
+    never persisted."""
+    selected = (getattr(ds, 'train_variant', None)
+                if variant is _PERSISTED else variant)
+    return str(selected or 'image').lower() == 'edit'
+
+
 def _default_variant_for(family) -> str:
     """Variante par défaut d'une famille quand aucune n'est fournie NI persistée :
     Krea → 'base' (Raw, reco officielle), FLUX.2 Klein → '4b' (la voie locale
-    16-24 Go ; le 9B est la voie cloud), sinon 'turbo'. Utilisé par tous les
+    16-24 Go ; le 9B est la voie cloud), Qwen-Image → 'image' (base T2I ; 'edit'
+    est l'opt-in Qwen-Image-Edit-2511), sinon 'turbo'. Utilisé par tous les
     chemins de lancement (direct / file / reprise / cloud) pour que le défaut
     tienne de bout en bout, pas seulement quand l'UI envoie explicitement la variante."""
     fam = family or 'zimage'
@@ -735,25 +798,33 @@ def _default_variant_for(family) -> str:
         return 'base'
     if fam == 'flux2klein':
         return '4b'
+    if fam == 'qwen_image':
+        return 'image'
     return 'turbo'
 
 
 def _valid_variants_for(family) -> tuple:
     """Variantes acceptées au lancement, PAR FAMILLE : flux2klein n'a que ses deux
-    tailles de modèle ('4b'/'9b') ; les familles historiques gardent l'enum
-    turbo/base/deturbo (comportement inchangé). Une variante hors liste retombe
-    sur le défaut de la famille (jamais d'erreur) : c'est ce qui neutralise une
-    variante PERSISTÉE d'une autre famille quand l'utilisateur change de type
-    (ex. un dataset ex-Krea avec train_variant='base' lancé en flux2klein)."""
-    return ('4b', '9b') if (family or 'zimage') == 'flux2klein' \
-        else ('turbo', 'base', 'deturbo')
+    tailles de modèle ('4b'/'9b'), Qwen-Image n'a que 'image'/'edit' ; les
+    familles historiques gardent l'enum turbo/base/deturbo (comportement
+    inchangé). Une variante hors liste retombe sur le défaut de la famille
+    (jamais d'erreur) : c'est ce qui neutralise une variante PERSISTÉE d'une
+    autre famille quand l'utilisateur change de type (ex. un dataset ex-Krea
+    avec train_variant='base' lancé en flux2klein)."""
+    fam = family or 'zimage'
+    if fam == 'flux2klein':
+        return ('4b', '9b')
+    if fam == 'qwen_image':
+        return ('image', 'edit')
+    return ('turbo', 'base', 'deturbo')
 
 
 # --- Réglages ai-toolkit avancés, éditables par dataset (persistés en JSON dans
 #     `train_settings`). Absent/NULL → défaut family-aware issu de la recherche
 #     (cf. Research vault 2026-07-10). Toute valeur hors des listes autorisées
 #     retombe sur le défaut : on ne pousse JAMAIS une config invalide à ai-toolkit. ---
-_DEFAULT_RANK = {'zimage': 16, 'krea': 32, 'sdxl': 32, 'flux': 16, 'flux2klein': 16}   # Z-Image reste 16 (choix user) ; Krea/SDXL 32 ; Flux/FLUX.2 Klein 16 (défaut des exemples officiels)
+_DEFAULT_RANK = {'zimage': 16, 'krea': 32, 'sdxl': 32, 'flux': 16, 'flux2klein': 16,
+                 'qwen_image': 32}   # Z-Image reste 16 (choix user) ; Krea/SDXL 32 ; Flux/FLUX.2 Klein 16 (défaut des exemples officiels) ; Qwen-Image 32 — EXTRAPOLÉ (DiT 20B, pas de recherche dédiée encore), à réviser si sous/sur-entraînement observé
 # FLUX.2 Klein STYLE only : linear 128 (+ Conv2d 64) — la recette dominante du sweep
 # Calvin Herbst (64 runs, fév. 2026) ET l'exemple de training officiel BFL, tous deux
 # sur les dims 128/64/64/32 (ratio 4:2:2:1). Les AUTRES kinds Klein gardent 16.
@@ -769,7 +840,7 @@ _DROPOUT_CHOICES = (0.05, 0.1, 0.15, 0.2, 0.3)          # LoRA network dropout ;
 _ALPHA_CHOICES = (1, 2, 4, 8, 16, 24, 32, 48, 64)       # alpha découplé du rank ; absent = dérivé
 _TIMESTEP_TYPE_CHOICES = ('sigmoid', 'linear', 'weighted', 'shift')  # pondération flowmatch ; SDXL le désactive
 _DEFAULT_TIMESTEP = {'zimage': 'sigmoid', 'krea': 'linear', 'flux': 'sigmoid',
-                     'flux2klein': 'weighted'}   # ce que « Auto » résout (sdxl : aucun) ; flux subject → sigmoid (reco ai-toolkit) ; flux2klein → weighted (défaut canonique options.ts, PAS sigmoid)
+                     'flux2klein': 'weighted', 'qwen_image': 'sigmoid'}   # ce que « Auto » résout (sdxl : aucun) ; flux subject → sigmoid (reco ai-toolkit) ; flux2klein → weighted (défaut canonique options.ts, PAS sigmoid) ; qwen_image → sigmoid, EXTRAPOLÉ par analogie flux/zimage (pas de recette Qwen-Image dédiée encore)
 # Batch 2 — optimiseur / planning du LR / batch effectif (valeurs VÉRIFIÉES dans
 # ai-toolkit : get_optimizer + toolkit/scheduler.py). CAME n'est PAS supporté.
 _OPTIMIZER_CHOICES = ('adamw8bit', 'adafactor', 'automagic', 'prodigy')
@@ -1861,6 +1932,23 @@ BUILTIN_TRAIN_PRESETS = [
                        'no Klein-specific study yet), 250-step probes.',
         'settings': _character_preset_settings(16, 16, timestep_type='sigmoid'),
     },
+    # No research vault coverage for Qwen-Image training yet (family just added
+    # to this app) — EXTRAPOLATED: rank 32 (bigger 20B DiT vs. the 12B-class
+    # flux/zimage default of 16) and sigmoid timesteps by analogy with
+    # flux/zimage's subject-character recipe. Both variants (base T2I /
+    # Edit-2511) share hyper-parameters here.
+    {
+        'id': 'builtin-character-qwen_image',
+        'name': 'Qwen-Image · Character',
+        'train_type': 'qwen_image',
+        'dataset_kind': 'character',
+        'variants': ['image', 'edit'],
+        'builtin': True,
+        'description': 'No Qwen-Image-specific research yet — extrapolated: '
+                       'rank 32/32 (bigger DiT than flux/zimage) with sigmoid '
+                       'timesteps, probing every 250 steps.',
+        'settings': _character_preset_settings(32, 32, timestep_type='sigmoid'),
+    },
     # --- Concept / composition (one per family) --------------------------
     # Historical ID kept stable. rank 16 / alpha 8: concept research (vault
     # 2026-06-22) — object/concept rank 16-32 with alpha dim/2. weighted
@@ -1943,6 +2031,27 @@ BUILTIN_TRAIN_PRESETS = [
                        'from Klein style: rank 32, half alpha 16, weighted '
                        'timesteps, 500-step probes.',
         'settings': _concept_preset_settings(32, 16, timestep_type='weighted'),
+    },
+    # No Qwen-Image concept source exists anywhere yet — extrapolated from the
+    # family's rank-32 character canon with the generic concept alpha dim/2
+    # rule and the family's sigmoid default. Also the landing spot for the
+    # "multi-angle camera" use case: a multi-angle LoRA is still a plain
+    # Concept recipe — the idea lives entirely in HOW you caption the dataset
+    # (each shot tagged with its camera angle), not in a different training
+    # config, so it rides this same preset rather than a separate one.
+    {
+        'id': 'builtin-concept-qwen_image',
+        'name': 'Qwen-Image · Concept',
+        'train_type': 'qwen_image',
+        'dataset_kind': 'concept',
+        'variants': ['image', 'edit'],
+        'builtin': True,
+        'description': 'No Qwen-Image concept research yet — extrapolated: '
+                       'rank 32 with half alpha 16 and sigmoid timesteps, '
+                       'probing every 500 steps. For a multi-angle camera LoRA, '
+                       'caption each shot with its angle — front view / '
+                       'three-quarter / side profile / from above / from below.',
+        'settings': _concept_preset_settings(32, 16, timestep_type='sigmoid'),
     },
     # Legacy generic Style alias. The API hides it from GET and resolves its ID
     # to a family-specific built-in at apply time. Keep the raw entry only for
@@ -2049,6 +2158,12 @@ def _dest_base_tag(ds, base_model=_PERSISTED, family=None,
         tag = _base_tag_for(
             FLUX2KLEIN_BASE_LABELS[
                 '9b' if _flux2klein_is_9b(ds, variant) else '4b'])
+    # Qwen-Image : même garde, le tag encode aussi la cible (base T2I vs
+    # Edit-2511 sont deux checkpoints incompatibles).
+    if not tag and fam == 'qwen_image':
+        tag = _base_tag_for(
+            QWEN_IMAGE_BASE_LABELS[
+                'edit' if _qwen_image_is_edit(ds, variant) else 'image'])
     return tag + _custom_combo_hash(ds, base_model, family)
 
 
@@ -2463,6 +2578,12 @@ def build_job_config(ds, dataset_folder: str, steps: int = 3000, training_folder
         _apply_slider_overrides(ds, cfg_['config']['process'][0], 'flux2klein')
         _apply_dual_captions(ds, cfg_['config']['process'][0], dataset_folder)
         return cfg_
+    if _train_type(ds) == 'qwen_image':
+        cfg_ = _build_job_config_qwen_image(ds, dataset_folder, steps, training_folder=training_folder)
+        _apply_style_overrides(ds, cfg_['config']['process'][0], 'qwen_image')
+        _apply_slider_overrides(ds, cfg_['config']['process'][0], 'qwen_image')
+        _apply_dual_captions(ds, cfg_['config']['process'][0], dataset_folder)
+        return cfg_
     trigger = _safe_trigger(ds)
     base_model = getattr(ds, 'train_base_model', None)
     recipe = zimage_training_recipe(getattr(ds, 'train_variant', None), base_model)
@@ -2787,6 +2908,84 @@ def _build_job_config_flux2klein(ds, dataset_folder: str, steps: int, training_f
                     'neg': '',
                     'sample_every': _sample_every(ds),
                     # Base non distillée → vrai CFG (cf. docstring) : 4 / 25 steps.
+                    'guidance_scale': 4,
+                    'sample_steps': 25,
+                    'prompts': _sample_prompts(ds, trigger),
+                },
+            }],
+        },
+    }
+
+
+def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_folder=None) -> dict:
+    """Job-config ai-toolkit pour Qwen-Image (arch='qwen_image'). Deux cibles selon
+    `train_variant` (cf. _qwen_image_is_edit) : base Qwen-Image (T2I, défaut) ou
+    Qwen-Image-Edit-2511 (instruction-edit). Modelé sur _build_job_config_flux2klein
+    (même stratégie basse-VRAM quantize+low_vram+qfloat8, même CFG réel non distillé)
+    faute de recette Qwen-Image dédiée dans ce repo — TOUTES les valeurs ci-dessous
+    sont EXTRAPOLÉES (jamais mesurées sur un run réel) : rank/timestep (cf.
+    _DEFAULT_RANK/_DEFAULT_TIMESTEP), guidance_scale/sample_steps. À réviser dès
+    qu'un run réel révèle un sous/sur-entraînement ou un déséquilibre VRAM.
+
+    ⚠️ Comme flux2_klein_*, `qwen_image` peut être une arch d'EXTENSION selon la
+    version d'ai-toolkit installée → garde de version obligatoire
+    (_aitoolkit_supports_qwen_image) sinon get_model_class retombe en silence sur
+    le loader SD legacy (LoRA corrompu)."""
+    trigger = _safe_trigger(ds)
+    is_edit = _qwen_image_is_edit(ds)
+    _qirank = _lora_rank(ds, 'qwen_image')   # défaut 32 (extrapolé) ; éditable via train_settings
+    # Custom weights (local-only, same qwen_image arch) override name_or_path; the
+    # TE (Qwen2.5-VL) and VAE stay official.
+    _qibase = getattr(ds, 'train_base_model', None)
+    model = {
+        'arch': 'qwen_image',
+        'name_or_path': (_qibase if _is_custom_weights(_qibase)
+                         else ('Qwen/Qwen-Image-Edit-2511' if is_edit
+                               else 'Qwen/Qwen-Image')),
+        'quantize': True, 'quantize_te': True, 'low_vram': True, 'qtype': 'qfloat8',
+    }
+    return {
+        'job': 'extension',
+        'config': {
+            'name': f'lora_{trigger}',
+            'process': [{
+                'type': 'sd_trainer',
+                'training_folder': (training_folder if training_folder
+                                    else str(_output_dir() / _run_name(ds))),
+                'device': 'cuda:0',
+                'trigger_word': trigger,
+                'network': _network_block(ds, _qirank, 'qwen_image'),
+                'save': {'dtype': 'float16', 'save_every': _save_every(ds),
+                         'max_step_saves_to_keep': _max_step_saves(ds)},
+                'datasets': [{
+                    'folder_path': dataset_folder,
+                    'caption_ext': 'txt',
+                    'caption_dropout_rate': 0.05,
+                    'cache_latents_to_disk': True,
+                    'resolution': _train_res(ds),
+                    **_mask_fields(dataset_folder),
+                }],
+                'train': {
+                    'batch_size': 1,
+                    'steps': steps,
+                    'gradient_accumulation': _grad_accum(ds),
+                    'train_unet': True,
+                    'train_text_encoder': False,
+                    'gradient_checkpointing': True,
+                    'noise_scheduler': 'flowmatch',
+                    'timestep_type': _timestep_type_eff(ds, 'sigmoid'),
+                    'optimizer': _optimizer_eff(ds),
+                    'lr': _lr_eff(ds),
+                    'dtype': 'bf16',
+                    **_lr_sched_fields(ds),
+                    **_ema_fields(ds),
+                },
+                'model': model,
+                'sample': {
+                    'sampler': 'flowmatch',
+                    'neg': '',
+                    'sample_every': _sample_every(ds),
+                    # Base non distillée → vrai CFG (extrapolé par analogie flux2klein) : 4 / 25 steps.
                     'guidance_scale': 4,
                     'sample_steps': 25,
                     'prompts': _sample_prompts(ds, trigger),
@@ -3403,10 +3602,10 @@ def purge_training_artifacts(user_id, trigger_safe) -> list[str]:
     removed: list[str] = []
     run_prefix = f'u{user_id}_{trigger_safe}'    # ex. u1_Lola69382
     lora_prefix = f'lora_{trigger_safe}'         # ex. lora_Lola69382
-    # 1) LoRA déployés dans ComfyUI (z image + sdxl + krea + flux + flux2klein séparés)
+    # 1) LoRA déployés dans ComfyUI (z image + sdxl + krea + flux + flux2klein + qwen_image séparés)
     lora_roots = []
     for accessor in (_lora_dest_dir_zimage, _lora_dest_dir_sdxl, _lora_dest_dir_krea,
-                     _lora_dest_dir_flux, _lora_dest_dir_flux2klein):
+                     _lora_dest_dir_flux, _lora_dest_dir_flux2klein, _lora_dest_dir_qwen_image):
         try:
             lora_roots.append(str(accessor()))
         except RuntimeError:
@@ -3638,9 +3837,9 @@ def style_caption_quality(dataset_id) -> dict:
 # SDXL (booru, plus gourmand en variété) et laissait passer des runs voués au
 # surapprentissage.
 TRAIN_MIN_IMAGES = {'zimage': (12, 20), 'sdxl': (20, 30), 'krea': (15, 20), 'flux': (15, 20),
-                    'flux2klein': (15, 20)}
+                    'flux2klein': (15, 20), 'qwen_image': (15, 20)}
 _FAMILY_LABEL = {'zimage': 'Z-Image', 'sdxl': 'SDXL', 'krea': 'Krea 2', 'flux': 'FLUX.1',
-                 'flux2klein': 'FLUX.2 Klein'}
+                 'flux2klein': 'FLUX.2 Klein', 'qwen_image': 'Qwen-Image'}
 # VRAM mesurée : Krea 2 (12B) sature un 24 GB à 1024 (cf. KREA_TRAIN_RESOLUTION). Flux
 # est un DiT de même classe (12B) → même seuil recommandé.
 _KREA_MIN_VRAM_GB = 24
@@ -3648,7 +3847,9 @@ _KREA_MIN_VRAM_GB = 24
 # se choisit au lancement, après ce preflight) et le défaut 4B tient en 16-24 Go —
 # un warning « il faut ~24 GB » serait un faux positif sur la voie locale normale.
 # Le 9B (32-48 Go) est la voie cloud ; un seuil 24 le sous-estimerait de toute façon.
-_VRAM24_FAMILIES = ('krea', 'flux')   # familles 12B qui recommandent ~24 GB à 1024
+# qwen_image (DiT 20B, plus gros que Krea/Flux 12B) : 24 GB posé comme PLANCHER par
+# analogie, EXTRAPOLÉ (pas de mesure réelle encore) — peut-être insuffisant, à réviser.
+_VRAM24_FAMILIES = ('krea', 'flux', 'qwen_image')   # familles 12B+ qui recommandent ~24 GB à 1024
 
 
 def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> dict:
@@ -4134,6 +4335,12 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         raise ValueError(
             "ai-toolkit doesn't support FLUX.2 Klein yet (flux2_klein arch missing) - "
             "update it (git pull) before training a FLUX.2 Klein LoRA.")
+    # Qwen-Image : même garde (arch possiblement d'EXTENSION selon la version
+    # ai-toolkit installée, cf. _aitoolkit_supports_qwen_image).
+    if _train_type(ds) == 'qwen_image' and not _aitoolkit_supports_qwen_image():
+        raise ValueError(
+            "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
+            "update it (git pull) before training a Qwen-Image LoRA.")
     # Slider mode (Beta) : the modern `concept_slider` trainer is an ai-toolkit
     # EXTENSION — an older install would crash at job boot on the unknown process
     # type. Refuse early with the fix, like the krea2/flux2klein arch guards.
@@ -5026,6 +5233,11 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
         raise ValueError(
             "ai-toolkit doesn't support FLUX.2 Klein yet (flux2_klein arch missing) - "
             "update it (git pull) before queuing a FLUX.2 Klein LoRA.")
+    # Qwen-Image : même garde qu'au lancement.
+    if ttype == 'qwen_image' and not _aitoolkit_supports_qwen_image():
+        raise ValueError(
+            "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
+            "update it (git pull) before queuing a Qwen-Image LoRA.")
     # Même garde-fou de collision qu'au lancement : pas de mise en file d'un job
     # qui partagerait le dossier de run d'un autre dataset (même trigger + base + recette).
     clash = find_run_collision(user_id, dataset_id, base_model=base, variant=var)

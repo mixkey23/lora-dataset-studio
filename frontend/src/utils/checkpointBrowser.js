@@ -18,6 +18,10 @@ const CHECKPOINT_VARIANTS = Object.freeze({
     Object.freeze({ value: '4b', label: '4B' }),
     Object.freeze({ value: '9b', label: '9B' }),
   ]),
+  qwen_image: Object.freeze([
+    Object.freeze({ value: 'image', label: 'Base (text-to-image)' }),
+    Object.freeze({ value: 'edit', label: 'Edit-2511' }),
+  ]),
 });
 
 export function checkpointVariantOptions(trainType) {
@@ -80,6 +84,7 @@ export function trainFamilyLabel(type) {
   if (type === 'krea') return 'Krea 2';
   if (type === 'flux') return 'FLUX.1';
   if (type === 'flux2klein') return 'FLUX.2 Klein';
+  if (type === 'qwen_image') return 'Qwen-Image';
   return 'Z-Image';
 }
 
@@ -88,5 +93,6 @@ export function loraFolderLabel(type) {
   if (type === 'krea') return 'loras/krea';
   if (type === 'flux') return 'loras/flux';
   if (type === 'flux2klein') return 'loras/flux2klein';
+  if (type === 'qwen_image') return 'loras/qwen_image';
   return 'loras/z image';
 }

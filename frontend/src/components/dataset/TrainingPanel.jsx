@@ -44,7 +44,7 @@ import {
 
 // Plancher dur / recommandé par famille — miroir de TRAIN_MIN_IMAGES côté serveur
 // (le preflight reste l'autorité ; ceci ne sert qu'à désactiver le bouton tôt).
-const TRAIN_MIN = { zimage: [12, 20], sdxl: [20, 30], krea: [15, 20], flux: [15, 20], flux2klein: [15, 20] };
+const TRAIN_MIN = { zimage: [12, 20], sdxl: [20, 30], krea: [15, 20], flux: [15, 20], flux2klein: [15, 20], qwen_image: [15, 20] };
 // Slider mode: images are only a denoising substrate → mirror of
 // TRAIN_MIN_IMAGES_SLIDER server-side (the preflight stays authoritative).
 const TRAIN_MIN_SLIDER = [4, 12];
@@ -65,9 +65,12 @@ const SLIDER_FAMILY_NOTES = {
 // (miroir de CUSTOM_WEIGHTS_FAMILIES / VAE_TE_OVERRIDE_FAMILIES côté serveur ;
 // base-info les renvoie, ces défauts ne servent qu'avant son chargement).
 const CUSTOM_BASE_SENTINEL = '__custom_weights__';
-const DEFAULT_CUSTOM_FAMILIES = ['sdxl', 'krea', 'flux', 'flux2klein'];
+const DEFAULT_CUSTOM_FAMILIES = ['sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image'];
 const defaultTrainingVariant = (family) => (
-  family === 'krea' ? 'base' : family === 'flux2klein' ? '4b' : 'turbo'
+  family === 'krea' ? 'base'
+    : family === 'flux2klein' ? '4b'
+    : family === 'qwen_image' ? 'image'
+    : 'turbo'
 );
 // Absolute path = the persisted custom-weights path (never a ComfyUI-relative
 // base name): Windows drive (C:\), UNC (\\), or POSIX (/…).
@@ -98,7 +101,7 @@ function timeAgo(iso) {
 }
 
 // Family label for a checkpoint group header — mirrors CloudRunsPage's FAMILY_LABEL.
-const GROUP_FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein' };
+const GROUP_FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image' };
 const groupFamLabel = (f) => GROUP_FAMILY_LABEL[f] || f || 'LoRA';
 
 /** Panneau d'entraînement LoRA : lance l'UI ai-toolkit (pause ComfyUI),
@@ -250,8 +253,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
         // dataset ex-Krea porte 'base', qui n'est pas une taille Klein valide) ;
         // les autres familles → Turbo.
         const fam = info.train_type || 'zimage';
-        const v = info.variant
-          || (fam === 'krea' ? 'base' : fam === 'flux2klein' ? '4b' : 'turbo');
+        const v = info.variant || defaultTrainingVariant(fam);
         const safeVariant = normalizeCheckpointVariant(fam, v);
         setVariant(safeVariant);
         setTrainType(info.train_type || 'zimage');
@@ -388,7 +390,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const advDropout = adv?.dropout ?? 0;
   const advDropoutChoices = adv?.dropout_choices ?? [0.05, 0.1, 0.15, 0.2, 0.3];
   const advTimestep = adv?.timestep_type ?? 'auto';
-  const advTimestepDefault = adv?.default_timestep_type ?? (trainType === 'krea' ? 'linear' : trainType === 'flux2klein' ? 'weighted' : (trainType === 'zimage' || trainType === 'flux') ? 'sigmoid' : null);   // miroir de _DEFAULT_TIMESTEP
+  const advTimestepDefault = adv?.default_timestep_type ?? (trainType === 'krea' ? 'linear' : trainType === 'flux2klein' ? 'weighted' : (trainType === 'zimage' || trainType === 'flux' || trainType === 'qwen_image') ? 'sigmoid' : null);   // miroir de _DEFAULT_TIMESTEP
   const advTimestepSupported = adv ? adv.timestep_type_supported !== false : trainType !== 'sdxl';
   const advTimestepChoices = adv?.timestep_type_choices ?? ['sigmoid', 'linear', 'weighted', 'shift'];
   const advOptimizer = adv?.optimizer ?? 'adamw8bit';
@@ -1013,6 +1015,8 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
       ? 'SDXL trains locally only — the cloud lane covers Z-Image, Krea 2 and FLUX.2 Klein'
     : trainType === 'flux'
       ? 'FLUX.1 trains locally only — the cloud lane covers Z-Image, Krea 2 and FLUX.2 Klein'
+    : trainType === 'qwen_image'
+      ? 'Qwen-Image trains locally only — the cloud lane covers Z-Image, Krea 2 and FLUX.2 Klein'
     : (vaePath || tePath)
       ? 'Custom VAE/text-encoder overrides are local-only — clear them in Advanced options to train in the cloud'
     : customWeightsEmpty
@@ -1174,13 +1178,14 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
         <select value={trainType} onChange={(e) => onTypeChange(e.target.value)}
           disabled={trainTypeBusy || presetBusy}
           aria-label="Type of LoRA to train"
-          title="Z-Image (prose, Qwen3 encoder) ~20 img · SDXL (ComfyUI checkpoints) ~30 img · Krea 2 (prose, base fixe Turbo) ~20 img · FLUX.1-dev (prose, gated HF, local-only) ~20 img · FLUX.2 Klein (prose, gated HF, 4B local / 9B cloud) ~20 img"
+          title="Z-Image (prose, Qwen3 encoder) ~20 img · SDXL (ComfyUI checkpoints) ~30 img · Krea 2 (prose, base fixe Turbo) ~20 img · FLUX.1-dev (prose, gated HF, local-only) ~20 img · FLUX.2 Klein (prose, gated HF, 4B local / 9B cloud) ~20 img · Qwen-Image (prose, base or Edit-2511, local-only) ~20 img"
           className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50">
           <option value="zimage">Z-Image (~20 img)</option>
           <option value="sdxl">SDXL (~30 img)</option>
           <option value="krea">Krea 2 (~20 img)</option>
           <option value="flux">FLUX.1 (~20 img)</option>
           <option value="flux2klein">FLUX.2 Klein (~20 img)</option>
+          <option value="qwen_image">Qwen-Image (~20 img)</option>
         </select>
         <button type="button" disabled={!status.installed || belowFloor || status.in_progress || baseBlocksTrain || sdxlNeedsBase || customWeightsEmpty || sliderPromptsMissing}
           title={baseBlocksTrain ? 'Convert the custom base first'
@@ -1489,7 +1494,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                 aria-label="Base model"
                 className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] max-w-[230px]">
                 {(currentBases.length ? currentBases
-                  : [{ value: '', label: trainType === 'sdxl' ? (comfyConfigured ? 'No SDXL checkpoint found' : 'ComfyUI not configured') : trainType === 'krea' ? 'Official — Krea 2' : trainType === 'flux' ? 'Official — FLUX.1-dev' : trainType === 'flux2klein' ? 'Official — FLUX.2 Klein' : 'Official — Z-Image-Turbo' }]).map((b) => (
+                  : [{ value: '', label: trainType === 'sdxl' ? (comfyConfigured ? 'No SDXL checkpoint found' : 'ComfyUI not configured') : trainType === 'krea' ? 'Official — Krea 2' : trainType === 'flux' ? 'Official — FLUX.1-dev' : trainType === 'flux2klein' ? 'Official — FLUX.2 Klein' : trainType === 'qwen_image' ? 'Official — Qwen-Image' : 'Official — Z-Image-Turbo' }]).map((b) => (
                   <option key={b.value} value={b.value}>
                     {trainType === 'zimage' && !b.value ? 'Official recipe — selected by variant' : b.label}{b.value && baseInfo?.converted?.[b.value] ? ' ✓' : ''}
                   </option>
@@ -1534,6 +1539,18 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
                   <option value="4b">4B (local, 16-24 GB)</option>
                   <option value="9b">9B (cloud, 32-48 GB)</option>
+                </select>
+              )}
+              {/* Qwen-Image : deux CIBLES (pas une taille comme FLUX.2 Klein) — base
+                  T2I (défaut) ou Edit-2511 (édition par instruction). Local-only
+                  cette vague, les deux bases sont officielles Hugging Face. */}
+              {trainType === 'qwen_image' && (
+                <select value={variant} onChange={(e) => setVariant(e.target.value)}
+                  aria-label="Qwen-Image training target"
+                  title="Qwen-Image training target — base is the text-to-image model (recommended for most LoRAs); Edit-2511 is the instruction-based image-edit model. Local-only for now."
+                  className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                  <option value="image">Base (text-to-image)</option>
+                  <option value="edit">Edit-2511 (instruction edit)</option>
                 </select>
               )}
             </div>
@@ -1583,10 +1600,10 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                 </span>
               </div>
             )}
-            {/* krea et flux2klein n'ont QUE des bases officielles fixes (rien à
-                lister depuis ComfyUI) → le warning « bases can't be listed » n'y
-                apporte que du bruit. */}
-            {!comfyConfigured && trainType !== 'krea' && trainType !== 'flux2klein' && (
+            {/* krea, flux2klein et qwen_image n'ont QUE des bases officielles fixes
+                (rien à lister depuis ComfyUI) → le warning « bases can't be listed »
+                n'y apporte que du bruit. */}
+            {!comfyConfigured && trainType !== 'krea' && trainType !== 'flux2klein' && trainType !== 'qwen_image' && (
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-amber-300 text-[0.625rem]">
                   ⚠️ ComfyUI folder not set — training bases can't be listed{trainType === 'sdxl' ? '' : ' (the official Z-Image base still works)'}.
@@ -2139,6 +2156,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
               <option value="krea">Krea 2</option>
               <option value="flux">FLUX.1</option>
               <option value="flux2klein">FLUX.2 Klein</option>
+              <option value="qwen_image">Qwen-Image</option>
             </select>
             {checkpointBaseOptions.length > 0 ? (
               <select value={checkpointBase} onChange={(event) => setCheckpointBase(event.target.value)}
@@ -2582,7 +2600,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   );
 }
 
-const _FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein' };
+const _FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image' };
 
 function _fmtDuration(min) {
   if (min == null) return '—';

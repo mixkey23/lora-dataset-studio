@@ -389,7 +389,7 @@ def test_base_info_returns_bases_by_type(client, monkeypatch):
     resp = client.get(f'/api/dataset/{ds_id}/train/base-info')
     assert resp.status_code == 200
     body = resp.get_json()
-    assert set(body['bases_by_type']) == {'zimage', 'sdxl', 'krea', 'flux', 'flux2klein'}
+    assert set(body['bases_by_type']) == {'zimage', 'sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image'}
     assert body['train_type'] == 'zimage'
 
 

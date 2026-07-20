@@ -494,6 +494,12 @@ export default function DatasetWorkspace({ ds, onBack }) {
     && !viewImgLive._rescueReviewPreview
     && !isSmallImageRescueRow(viewImgLive)
     && viewImgLive.derivation_kind !== 'klein_image_improve';
+  // Same gating as canImproveViewImg — a multi-angle candidate itself can be
+  // rotated again (unlike a Klein-improve candidate, which is a terminal step).
+  const canMultiangleViewImg = !!viewImgLive
+    && !viewImgLive._rescueReviewPreview
+    && !isSmallImageRescueRow(viewImgLive)
+    && viewImgLive.derivation_kind !== 'klein_image_improve';
 
   // Export ZIP — shared by the header CTA and the Import & export row.
   // Guard-rails: untriaged images are silently EXCLUDED from the zip. Style
@@ -1536,8 +1542,12 @@ export default function DatasetWorkspace({ ds, onBack }) {
           onImprove={canImproveViewImg ? ds.improveImage : undefined}
           improvePending={viewImgImproving}
           improveReady={viewImgImprovementReady}
+          onMultiangle={canMultiangleViewImg
+            ? (imageId, angle) => ds.multiangleImage(imageId, angle)
+            : undefined}
           busy={ds.busy}
           kleinAvailable={Boolean(caps.engines?.klein)}
+          qwenMultiangleAvailable={Boolean(caps.engines?.qwen_multiangle)}
           onCrop={viewImgLive._rescueReviewPreview
             ? undefined
             : (img) => { setViewImg(null); setCropImg(img); }} />

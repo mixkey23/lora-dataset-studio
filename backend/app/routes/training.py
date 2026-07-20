@@ -467,6 +467,9 @@ def dataset_train_base_info(dataset_id):
     # FLUX.2 Klein : bases officielles fixes (gated HF) — le choix 4B/9B se fait via
     # le sélecteur `variant` (comme Raw/Turbo pour Krea), pas ici → label neutre.
     flux2klein_bases = [{'value': '', 'label': 'Official - FLUX.2 Klein'}]
+    # Qwen-Image : mêmes deux bases officielles fixes (base T2I / Edit-2511) — le
+    # choix se fait via le sélecteur `variant` (comme 4B/9B pour FLUX.2 Klein).
+    qwen_image_bases = [{'value': '', 'label': 'Official - Qwen-Image'}]
     # Les listers de bases (get_checkpoint_models / get_zimage_models) résolvent le
     # dossier des modèles depuis comfyui.base_dir → vides tant qu'il n'est pas
     # configuré. On expose ce fait pour que l'UI dise « configure ComfyUI dans Setup »
@@ -503,7 +506,8 @@ def dataset_train_base_info(dataset_id):
                     'slider': lt.effective_slider_settings(ds),
                     'bases_by_type': {'zimage': bases, 'sdxl': sdxl_bases,
                                       'krea': krea_bases, 'flux': flux_bases,
-                                      'flux2klein': flux2klein_bases}})
+                                      'flux2klein': flux2klein_bases,
+                                      'qwen_image': qwen_image_bases}})
 
 
 @bp.post('/dataset/<int:dataset_id>/train/settings')
@@ -662,6 +666,22 @@ _STYLE_BUILTIN_PRESETS = [
                        'character trick).',
         'settings': _style_preset_settings(32, 32, resolution='1024'),
     },
+    # No Qwen-Image-specific style research exists yet — extrapolated from the
+    # family's rank-32 character canon, following the same "style wants more
+    # capacity" pattern as the other families' style presets. Both variants
+    # (base T2I / Edit-2511) share this recipe.
+    {
+        'id': 'builtin-style-qwen_image-base',
+        'name': 'Qwen-Image · Style',
+        'train_type': 'qwen_image',
+        'dataset_kind': 'style',
+        'variants': ['image', 'edit'],
+        'builtin': True,
+        'description': 'No Qwen-Image style research yet — extrapolated: rank '
+                       '32/32 with sigmoid timesteps, content-only probes '
+                       'every 250 steps.',
+        'settings': _style_preset_settings(32, 32, timestep_type='sigmoid'),
+    },
 ]
 
 
@@ -694,6 +714,7 @@ _STYLE_PRESET_ID_BY_FAMILY = {
     'zimage': 'builtin-style-zimage-base',
     'flux': 'builtin-style-flux1',
     'sdxl': 'builtin-style-sdxl',
+    'qwen_image': 'builtin-style-qwen_image-base',
 }
 
 

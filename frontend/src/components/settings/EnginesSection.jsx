@@ -154,6 +154,51 @@ function KleinLorasCard({ config, setField }) {
   )
 }
 
+function QwenMultiangleCard({ config, setField }) {
+  const qm = config.qwen_multiangle || {}
+  const ma = Number.isFinite(Number(qm.multiangle_strength)) ? Number(qm.multiangle_strength) : 1.0
+  const cons = Number.isFinite(Number(qm.consistency_strength)) ? Number(qm.consistency_strength) : 1.0
+  const light = Number.isFinite(Number(qm.lightning_strength)) ? Number(qm.lightning_strength) : 1.0
+  const lightningOn = qm.lightning_enabled !== false
+  return (
+    <Card
+      id="qwen-multiangle"
+      title="Qwen Multi-angle (optional tuning)"
+      help="Rotates an existing render's camera angle using Qwen-Image-Edit-2511 and the community multi-angle LoRA (fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA). None of these three model files are downloaded by this app — point ComfyUI at whatever you already have (Settings ▸ Local tools ▸ ComfyUI), then tune the strengths below. The model card recommends starting the multi-angle LoRA around 0.9."
+    >
+      <label className="flex items-center gap-1.5 text-sm text-content">
+        <span className="whitespace-nowrap">Multi-angle LoRA strength: {ma.toFixed(2)}</span>
+        <input type="range" min={0} max={1.5} step={0.05} value={ma}
+          aria-label="Multi-angle LoRA strength"
+          onChange={(e) => setField('qwen_multiangle', 'multiangle_strength', Number(e.target.value))}
+          className="w-40 accent-indigo-500" />
+      </label>
+      <label className="flex items-center gap-1.5 text-sm text-content">
+        <span className="whitespace-nowrap">Consistency LoRA strength: {cons.toFixed(2)}</span>
+        <input type="range" min={0} max={1.5} step={0.05} value={cons}
+          aria-label="Consistency LoRA strength"
+          onChange={(e) => setField('qwen_multiangle', 'consistency_strength', Number(e.target.value))}
+          className="w-40 accent-indigo-500" />
+      </label>
+      <label className="flex items-center gap-2 text-sm text-content">
+        <input type="checkbox" checked={lightningOn}
+          onChange={(e) => setField('qwen_multiangle', 'lightning_enabled', e.target.checked)}
+          className="h-4 w-4 rounded border-border-strong" />
+        Use the Lightning speed LoRA (4 steps) when available
+      </label>
+      {lightningOn && (
+        <label className="flex items-center gap-1.5 text-sm text-content">
+          <span className="whitespace-nowrap">Lightning LoRA strength: {light.toFixed(2)}</span>
+          <input type="range" min={0} max={1.5} step={0.05} value={light}
+            aria-label="Lightning LoRA strength"
+            onChange={(e) => setField('qwen_multiangle', 'lightning_strength', Number(e.target.value))}
+            className="w-40 accent-indigo-500" />
+        </label>
+      )}
+    </Card>
+  )
+}
+
 const CHATGPT_AUTH_OPTIONS = [
   { id: 'auto', label: 'Auto — subscription when connected, otherwise API key' },
   { id: 'api', label: 'API key only' },
@@ -326,6 +371,8 @@ export default function EnginesSection(props) {
       </Card>
 
       <KleinLorasCard config={config} setField={setField} />
+
+      <QwenMultiangleCard config={config} setField={setField} />
     </div>
   )
 }

@@ -33,7 +33,7 @@ test('dataset hook starts improvement, reports the preserved original, then refr
   assert.match(hook, /`\/api\/dataset\/image\/\$\{imageId\}\/improve`, \{\}/);
   assert.match(hook, /original stays intact while a separate 2 MP candidate is generated for validation/);
   assert.match(hook, /Could not start image improvement/);
-  assert.match(hook, /resolveSmallImageRescue, improveImage, classify/);
+  assert.match(hook, /resolveSmallImageRescue, improveImage, multiangleImage, classify/);
 });
 
 test('settings separates scraper rescue instructions from manual lightbox improvement', () => {
@@ -47,6 +47,24 @@ test('manual improvement candidates cannot use the unrelated generic regenerate 
   assert.match(gridItem, /const isImageImproveCandidate = img\.derivation_kind === 'klein_image_improve'/);
   assert.match(gridItem, /!isRescueDerived && !isImageImproveCandidate && img\.source === 'generated'/);
   assert.match(gridItem, /if \(!isImageImproveCandidate && img\.status !== 'reject'/);
+});
+
+test('lightbox exposes an accessible camera-angle rotation action', () => {
+  assert.match(lightbox, /🎥 Rotate camera angle/);
+  assert.match(lightbox, /🎥 Rotating…/);
+  assert.match(lightbox, /Qwen Multi-angle is not available in this setup/);
+  assert.match(lightbox, /disabled=\{busy \|\| rotating \|\| !qwenMultiangleAvailable\}/);
+  assert.match(lightbox, /import QwenAnglePopover from '\.\/QwenAnglePopover'/);
+});
+
+test('workspace wires the multiangle action with the same rescue/derivation gating as improve', () => {
+  assert.match(workspace, /canMultiangleViewImg/);
+  assert.match(workspace, /qwenMultiangleAvailable=\{Boolean\(caps\.engines\?\.qwen_multiangle\)\}/);
+});
+
+test('dataset hook exposes multiangleImage against the multiangle route', () => {
+  assert.match(hook, /`\/api\/dataset\/image\/\$\{imageId\}\/multiangle`/);
+  assert.match(hook, /Could not start the angle change/);
 });
 
 test('curation grid and lightbox render the persisted safe Pexels attribution', () => {

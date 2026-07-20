@@ -95,7 +95,11 @@ DEFAULTS = {
         # min_vram_gb est PAR FAMILLE (pas par variante) : pour flux2klein on prend
         # 32 — le 9B (32-48 GB) est la voie cloud principale de cette famille, et un
         # pod 32 GB entraîne aussi le 4B sans problème (l'inverse serait faux).
-        'min_vram_gb': {'zimage': 24, 'sdxl': 16, 'krea': 24, 'flux2klein': 32},
+        # 'qwen_image' is listed for forward-compat only — cloud training itself
+        # currently refuses this family (see cloud_training.py); local-only until
+        # a cloud launch path is wired up.
+        'min_vram_gb': {'zimage': 24, 'sdxl': 16, 'krea': 24, 'flux2klein': 32,
+                        'qwen_image': 32},
         'onstart': '',                 # raw-image fallback: optional startup command
     },
     'face_scoring': {'python': '', 'models_root': '', 'green': 0.50, 'orange': 0.45},
@@ -162,6 +166,18 @@ DEFAULTS = {
               # Manual "Upscale & improve" uses its own fixed quality profile.
               # Empty is intentional: never invent a restoration prompt for the user.
               'small_image_prompt': ''},
+    # Qwen Multi-angle: rotate the camera angle of an existing render using
+    # Qwen-Image-Edit-2511 + the community multi-angle LoRA. Unlike Klein's
+    # consistency_lora, none of these three files are auto-downloaded by this
+    # app — they're resolved from whatever the user already has on disk
+    # (canonical filename first, narrow token fallback; see
+    # qwen_multiangle_helper.py), so the strengths/toggle below are the only
+    # true "settings"; the *_lora keys are read-only diagnostics of what was
+    # resolved, kept here only for a stable settings-UI shape.
+    'qwen_multiangle': {'multiangle_strength': 1.0,
+                        'consistency_strength': 1.0,
+                        'lightning_strength': 1.0,
+                        'lightning_enabled': True},
     'updates': {'repo': 'perfectgf/lora-dataset-studio'},      # GitHub repo for the release feed
 }
 

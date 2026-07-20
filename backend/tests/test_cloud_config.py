@@ -25,8 +25,10 @@ def test_cloud_defaults_present(app):
     assert cfg.get('cloud.disk_gb') == 60
     # flux2klein: 32 — the key is per FAMILY (not per variant) and the 9B size
     # (32-48 GB) is that family's cloud lane; a 32 GB pod also trains the 4B.
+    # qwen_image: 32, forward-compat only — cloud_training.py currently refuses
+    # this family (local-only), so the key is unused until a cloud path lands.
     assert cfg.get('cloud.min_vram_gb') == {'zimage': 24, 'sdxl': 16, 'krea': 24,
-                                            'flux2klein': 32}
+                                            'flux2klein': 32, 'qwen_image': 32}
 
 
 def test_vast_api_key_is_a_secret(app):

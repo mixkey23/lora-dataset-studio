@@ -47,6 +47,22 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-20-qwen-multiangle-engine',
+    date: '2026-07-20',
+    title: '🎥 Rotate any render\'s camera angle with one click',
+    blurb:
+      "Got a generated shot you love but need it from another angle? Open its inspect view and hit 🎥 Rotate camera angle — pick front / three-quarter / profile / back, an elevation, and a distance, and a new candidate is generated at that angle using Qwen-Image-Edit-2511 plus a community multi-angle LoRA. The original stays untouched; review the result like any other generated tile. Configure the model/LoRA strengths under Settings ▸ Image engines.",
+    to: '/settings/engines',
+  },
+  {
+    id: '2026-07-20-qwen-image-training-family',
+    date: '2026-07-20',
+    title: '🆕 Train Qwen-Image LoRAs, base or Edit-2511',
+    blurb:
+      "Qwen-Image joins Z-Image, SDXL, Krea 2, FLUX.1 and FLUX.2 Klein as a training family — pick it as the LoRA type and choose base Qwen-Image (text-to-image) or Qwen-Image-Edit-2511 (instruction editing) next to the base selector. Local training only for now. Building a multi-angle camera LoRA? The new Qwen-Image · Concept preset documents the per-shot angle captioning convention.",
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-20-lineage-inspect-notes',
     date: '2026-07-20',
     title: '🔬 Inspect any run’s settings and take notes, right on the graph',

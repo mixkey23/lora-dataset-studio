@@ -152,6 +152,9 @@ KLEIN_IMAGE_IMPROVE = 'klein_image_improve'
 KLEIN_IMAGE_IMPROVE_PROMPT = (
     'add detailed texture, add sharp details, add candid shot, add soft focus effect')
 _SMALL_IMAGE_DERIVATIONS = (SMALL_IMAGE_SOURCE, KLEIN_SMALL_IMAGE)
+# A Qwen Multi-angle regeneration — a NEW derived row (never in-place), same
+# non-destructive/provenance-linked shape as KLEIN_IMAGE_IMPROVE.
+QWEN_MULTIANGLE = 'qwen_multiangle'
 # A striped in-process lock is sufficient for LDS's single local server process
 # and makes the active-candidate check + row creation + enqueue one critical
 # section.  In particular, a second simultaneous lightbox click waits until the
@@ -552,7 +555,7 @@ def set_fidelity(user_id, dataset_id, fidelity) -> bool:
 # NB : 'flux2klein' (FLUX.2 Klein) — PAS 'klein' : ce namespace est déjà pris par
 # le moteur de GÉNÉRATION (engines.klein, unet/klein/) ; un train_type 'klein'
 # télescoperait les résolveurs de modèles et les chemins loras du Studio.
-TRAIN_TYPES = ('zimage', 'sdxl', 'krea', 'flux', 'flux2klein')
+TRAIN_TYPES = ('zimage', 'sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image')
 
 
 def normalize_train_type(t) -> str:
@@ -4449,6 +4452,85 @@ def _improve_existing_image_locked(user_id, image_id):
     except Exception:
         # No broken tile: the original is still untouched and the user can retry
         # as soon as the queue/ComfyUI issue is fixed.
+        db.session.delete(candidate)
+        db.session.commit()
+        raise
+
+    candidate.job_id = job_id
+    db.session.commit()
+    _sync_generate_activity(img.dataset_id)
+    return {'candidate_id': candidate.id, 'job_id': job_id}
+
+
+def create_qwen_multiangle_variation(user_id, image_id, azimuth, elevation, distance,
+                                     multiangle_strength=None, consistency_strength=None,
+                                     lightning_enabled=True):
+    """Queue a Qwen Multi-angle regeneration of an existing dataset image at the
+    requested camera angle — a GENERATION feature (rotate a render's camera
+    angle with a pre-trained community LoRA), not the training-family code path.
+    Non-destructive: the source row/file is untouched, the result lands as a
+    NEW derived row (mirrors _improve_existing_image_locked's shape, minus its
+    single-active-candidate dedup — a source image can have many angle
+    variants at once, unlike 'improve' which is a single derived slot).
+    Returns {'candidate_id', 'job_id'}, or None for an image not owned by
+    `user_id`. Raises ValueError on a missing/unreadable source image or an
+    unknown angle token, QwenMultiangleModelsMissing when a graph-critical
+    asset is absent."""
+    img = _owned_image(user_id, image_id)
+    if not img:
+        return None
+    if not img.filename:
+        raise ValueError('image file required')
+    source_path = _img_path(img)
+    if not os.path.isfile(source_path):
+        raise ValueError('image file missing')
+
+    from . import qwen_multiangle_helper as qmh
+    prompt = qmh.build_angle_prompt(azimuth, elevation, distance)   # raises on unknown tokens
+    missing = qmh.qwen_ma_missing_assets()
+    if any(asset in missing for asset in qmh.QWEN_MA_REQUIRED):
+        raise qmh.QwenMultiangleModelsMissing(missing)
+
+    in_flight = (FaceDatasetImage.query
+                 .filter_by(dataset_id=img.dataset_id, status='pending')
+                 .filter(FaceDatasetImage.filename.is_(None)).count())
+    if in_flight + 1 > MAX_FANOUT:
+        raise ValueError(
+            f'too many generations in flight ({in_flight}), wait or cancel')
+
+    source_label = (img.variation_label or '').strip()
+    label = (f'Qwen Multi-angle · {source_label}' if source_label
+            else 'Qwen Multi-angle')[:120]
+    candidate = FaceDatasetImage(
+        dataset_id=img.dataset_id, source='generated', status='pending',
+        parent_image_id=img.id, derivation_kind=QWEN_MULTIANGLE,
+        framing=img.framing, caption=img.caption,
+        variation_label=label, variation_prompt=prompt[:500],
+        source_metadata=_source_metadata_storage(img.source_metadata),
+    )
+    db.session.add(candidate)
+    db.session.commit()
+
+    try:
+        job_id = qmh.enqueue_qwen_multiangle(
+            user_id=str(user_id), source_filename=img.filename,
+            azimuth=azimuth, elevation=elevation, distance=distance,
+            source_path=source_path,
+            multiangle_strength=multiangle_strength,
+            consistency_strength=consistency_strength,
+            lightning_enabled=lightning_enabled,
+            extra_metadata={
+                'is_dataset': True,
+                'dataset_id': img.dataset_id,
+                'variation_label': label,
+                'derivation_kind': QWEN_MULTIANGLE,
+                'parent_image_id': img.id,
+                'source_image_id': img.id,
+                'action': 'qwen_multiangle',
+            },
+        )
+    except Exception:
+        # No broken tile: the original is still untouched and the user can retry.
         db.session.delete(candidate)
         db.session.commit()
         raise

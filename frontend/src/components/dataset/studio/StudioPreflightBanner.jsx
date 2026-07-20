@@ -17,7 +17,7 @@
  * off. A distinct, higher-priority stop than a missing asset.
  */
 const FAMILY_LABELS = { zimage: 'Z-Image', sdxl: 'SDXL', krea: 'Krea 2 Turbo',
-  flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein' };
+  flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image' };
 
 export default function StudioPreflightBanner({ missing, archMismatch, onDismiss }) {
   if (archMismatch) {

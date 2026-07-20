@@ -1,5 +1,5 @@
 const DATASET_KINDS = new Set(['character', 'concept', 'style'])
-const VARIANT_SCOPED_FAMILIES = new Set(['zimage', 'krea', 'flux2klein'])
+const VARIANT_SCOPED_FAMILIES = new Set(['zimage', 'krea', 'flux2klein', 'qwen_image'])
 
 /** Return the optional dataset scope carried by a preset.
  *
