@@ -1,9 +1,14 @@
 """Qwen Edit — the general-purpose "Generate variations" GENERATION engine
-(Wave 4), a local peer of Klein running Qwen-Image-Edit-2511. Shares its
-UNET/VAE/text-encoder/consistency-LoRA resolution with Qwen Multi-angle via
-the extracted qwen_edit_assets module — the first half of this file is a
-REGRESSION check that the extraction left Qwen Multi-angle's own behaviour
-unchanged, mirroring test_qwen_multiangle.py's own fixtures."""
+(Wave 4, redesigned after real-world debugging with the repo owner), a local
+peer of Klein running Qwen-Image-Edit-2511 via a VLM-driven edit workflow
+(TextEncodeQwenImageEditPlusCustom_lrzjason + QwenEditConfigPreparer +
+QwenEditAdaptiveLongestEdge) instead of the Kontext-lineage nodes the first
+cut used. No consistency LoRA (that LoRA fights drift across SEVERAL
+reference images; this engine always starts from ONE). Shares its
+UNET/VAE/text-encoder resolution with Qwen Multi-angle via the extracted
+qwen_edit_assets module — the first half of this file is a REGRESSION check
+that the extraction left Qwen Multi-angle's own behaviour unchanged,
+mirroring test_qwen_multiangle.py's own fixtures."""
 import struct
 from unittest.mock import patch
 
@@ -20,11 +25,11 @@ def _install(base, *relparts, data=_VALID_ST):
     return p
 
 
-def _comfy(tmp_path, cfg, unet=True, vae=True, te=True,
-          consistency=False, lightning=False):
+def _comfy(tmp_path, cfg, unet=True, vae=True, te=True, lightning=False):
     """A ComfyUI tree with a configurable subset of the shared Qwen-Image-Edit
     assets present (mirrors test_qwen_multiangle.py's own fixture, minus the
-    multi-angle LoRA, which qwen_edit_helper doesn't need)."""
+    multi-angle LoRA and the consistency LoRA, neither of which
+    qwen_edit_helper needs)."""
     base = tmp_path / 'comfyui'
     (base / 'input').mkdir(parents=True)
     (base / 'output').mkdir(parents=True)
@@ -36,8 +41,6 @@ def _comfy(tmp_path, cfg, unet=True, vae=True, te=True,
         _install(base, 'models', 'vae', 'qwen_image_vae.safetensors')
     if te:
         _install(base, 'models', 'text_encoders', 'qwen_2.5_vl_7b_fp8_scaled.safetensors')
-    if consistency:
-        _install(base, 'models', 'loras', 'consistence_edit_v2.safetensors')
     if lightning:
         _install(base, 'models', 'loras', 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
     cfg.save_config({'comfyui': {'base_dir': str(base)}})
@@ -58,16 +61,6 @@ def test_multiangle_resolvers_unchanged_after_extraction(app, tmp_path):
         assert qmh.resolve_qwen_ma_text_encoder() == 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
 
 
-def test_multiangle_consistency_lora_resolver_unchanged_after_extraction(app, tmp_path):
-    from app import config as cfg
-    from app.services import qwen_multiangle_helper as qmh
-    with app.app_context():
-        _comfy(tmp_path, cfg, consistency=True)
-        rel, path = qmh.resolve_qwen_ma_consistency_lora()
-        assert rel == 'consistence_edit_v2.safetensors'
-        assert path is not None
-
-
 # --- qwen_edit_assets: shared resolvers ---------------------------------------
 
 def test_qwen_edit_assets_resolve_unet_vae_text_encoder(app, tmp_path):
@@ -82,20 +75,17 @@ def test_qwen_edit_assets_resolve_unet_vae_text_encoder(app, tmp_path):
         assert qea.resolve_text_encoder() == 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
 
 
-def test_qwen_edit_assets_resolve_consistency_and_lightning_loras(app, tmp_path):
+def test_qwen_edit_assets_resolve_lightning_lora(app, tmp_path):
     from app import config as cfg
     from app.services import qwen_edit_assets as qea
     with app.app_context():
-        _comfy(tmp_path, cfg, consistency=True, lightning=True)
-        cons_rel, cons_path = qea.resolve_consistency_lora()
-        assert cons_rel == 'consistence_edit_v2.safetensors'
-        assert cons_path is not None
+        _comfy(tmp_path, cfg, lightning=True)
         light_rel, light_path = qea.resolve_lightning_lora()
         assert light_rel == 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
         assert light_path is not None
 
 
-# --- qwen_edit_helper: missing-assets probe -----------------------------------
+# --- qwen_edit_helper: missing-assets probe (no consistency LoRA anymore) ----
 
 def test_qwen_edit_missing_assets_lists_every_absent_action(app, tmp_path):
     from app import config as cfg
@@ -105,38 +95,80 @@ def test_qwen_edit_missing_assets_lists_every_absent_action(app, tmp_path):
         missing = qeh.qwen_edit_missing_assets()
         assert 'qwen_edit_unet' in missing
         assert 'qwen_edit_vae' not in missing   # present in this fixture
-        # optional assets are missing by default (not installed in this fixture)
-        assert 'qwen_edit_consistency_lora' in missing
-        assert 'qwen_edit_lightning_lora' in missing
+        assert 'qwen_edit_lightning_lora' in missing   # not installed in this fixture
+        assert 'qwen_edit_consistency_lora' not in missing   # not part of this engine anymore
 
 
 def test_qwen_edit_missing_assets_empty_when_everything_present(app, tmp_path):
     from app import config as cfg
     from app.services import qwen_edit_helper as qeh
     with app.app_context():
-        _comfy(tmp_path, cfg, consistency=True, lightning=True)
+        _comfy(tmp_path, cfg, lightning=True)
         assert qeh.qwen_edit_missing_assets() == []
 
 
-# --- wrap_variation_qwen_edit: render_style tail-swap + identity override ----
+def test_qwen_edit_recommended_has_no_consistency_lora():
+    from app.services import qwen_edit_helper as qeh
+    assert qeh.QWEN_EDIT_RECOMMENDED == ('qwen_edit_lightning_lora',)
 
-def test_wrap_variation_qwen_edit_photoreal_default_has_photo_wording(app):
+
+# --- render_style_presets: negative prompt ------------------------------------
+
+def test_generation_negative_for_photoreal_avoids_stylization():
+    from app.services.render_style_presets import generation_negative_for
+    neg = generation_negative_for('photoreal')
+    assert 'cartoon' in neg and 'anime' in neg
+    assert 'photorealistic' not in neg
+
+
+def test_generation_negative_for_non_photoreal_avoids_photorealism():
+    from app.services.render_style_presets import generation_negative_for
+    neg = generation_negative_for('anime_2d')
+    assert 'photorealistic' in neg
+    neg_3d = generation_negative_for('render_3d')
+    assert neg_3d == neg   # every stylized target shares the same anti-photo direction
+
+
+def test_generation_negative_for_never_empty():
+    from app.services.render_style_presets import generation_negative_for
+    for style in ('photoreal', 'render_3d', 'anime_2d', 'cartoon_semireal',
+                  'illustration', 'custom', 'unknown-garbage', None):
+        assert generation_negative_for(style)
+
+
+# --- wrap_variation_qwen_edit: edit-instruction shape + render_style + nsfw --
+
+def test_wrap_variation_qwen_edit_is_an_edit_instruction_not_a_creation(app):
+    from app.services.face_variations import wrap_variation_qwen_edit
+    with app.app_context():
+        out = wrap_variation_qwen_edit('full body shot, standing, front view', framing='body')
+        assert out.startswith('Keep the same character identity. Restage the image as:')
+        assert 'Create a new' not in out
+
+
+def test_wrap_variation_qwen_edit_identity_clause_present(app):
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
-        assert 'same character' not in out
-        assert 'photograph' in out.lower()
-        assert 'SFW' in out
+        assert 'Do not change the facial identity' in out
+        assert 'eye shape and color' in out
 
 
-def test_wrap_variation_qwen_edit_non_photoreal_swaps_person_to_character(app):
+def test_wrap_variation_qwen_edit_non_photoreal_appends_style_tail(app):
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust',
                                        render_style='anime_2d')
-        assert 'same character' in out
-        assert 'skin tone and texture' not in out
-        assert 'photograph' not in out.lower()
+        assert 'cel-shaded 2D anime' in out
+        assert 'Professional realistic photograph' not in out
+
+
+def test_wrap_variation_qwen_edit_photoreal_default_mentions_photograph(app):
+    from app.services.face_variations import wrap_variation_qwen_edit
+    with app.app_context():
+        out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
+        assert 'Professional realistic photograph' in out
+        assert out.rstrip().endswith('SFW.')
 
 
 def test_wrap_variation_qwen_edit_nsfw_drops_sfw_clamp(app):
@@ -144,13 +176,12 @@ def test_wrap_variation_qwen_edit_nsfw_drops_sfw_clamp(app):
     with app.app_context():
         out = wrap_variation_qwen_edit('lying on a bed', framing='body', nsfw=True)
         assert 'Explicit nudity is allowed' in out
-        assert out.strip().endswith('SFW.') is False
+        assert not out.rstrip().endswith('SFW.')
 
 
 def test_identity_prompts_override_wins_over_qwen_edit_default(app):
     """The user's global identity_prompts.qwen_edit_identity override beats
-    BOTH the shipped default and the render_style tail — same precedence rule
-    Klein's own identity guard already has."""
+    the shipped default, same precedence rule every identity-prompt kind has."""
     from app import config as cfg
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
@@ -160,13 +191,13 @@ def test_identity_prompts_override_wins_over_qwen_edit_default(app):
         assert 'MY CUSTOM GUARD TEXT' in out
 
 
-# --- enqueue_qwen_edit_variation: graph mutation ------------------------------
+# --- enqueue_qwen_edit_variation: graph mutation (new node ids, no cons LoRA) -
 
-def test_enqueue_sets_prompt_source_and_model_files(app, tmp_path, monkeypatch):
+def test_enqueue_sets_prompt_negative_source_and_model_files(app, tmp_path, monkeypatch):
     from app import config as cfg
     from app.services import qwen_edit_helper as qeh
     with app.app_context():
-        _comfy(tmp_path, cfg, consistency=True, lightning=True)
+        _comfy(tmp_path, cfg, lightning=True)
         src = tmp_path / 'source.png'
         src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
 
@@ -183,33 +214,54 @@ def test_enqueue_sets_prompt_source_and_model_files(app, tmp_path, monkeypatch):
 
         job_id = qeh.enqueue_qwen_edit_variation(
             user_id='local', source_filename='source.png',
-            edit_prompt='Create a new image of the same character: test prompt',
+            edit_prompt='Keep the same character identity. Restage as: test prompt.',
+            negative_prompt='lowres, worst quality',
             source_path=str(src))
 
         assert job_id
         wf = captured['workflow']
-        assert wf['112']['inputs']['prompt'] == \
-            'Create a new image of the same character: test prompt'
-        assert wf['115']['inputs']['image'].endswith('source.png')
-        assert wf['108']['inputs']['unet_name']
-        assert wf['95']['inputs']['vae_name'] == 'qwen_image_vae.safetensors'
-        assert wf['93']['inputs']['clip_name'] == 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
-        # consistency + Lightning present -> both stay in the chain, Lightning envelope active
-        assert '114' in wf and wf['114']['inputs']['lora_name'] == 'consistence_edit_v2.safetensors'
-        assert '102' in wf and wf['102']['inputs']['lora_name'] == \
+        assert wf['10']['inputs']['prompt'] == \
+            'Keep the same character identity. Restage as: test prompt.'
+        assert wf['21']['inputs']['text'] == 'lowres, worst quality'
+        assert wf['39']['inputs']['image'].endswith('source.png')
+        assert wf['31']['inputs']['unet_name']
+        assert wf['7']['inputs']['vae_name'] == 'qwen_image_vae.safetensors'
+        assert wf['6']['inputs']['clip_name'] == 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
+        # Lightning present -> stays in the chain, Lightning envelope active
+        assert '23' in wf and wf['23']['inputs']['lora_name'] == \
             'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
-        assert wf['106']['inputs']['steps'] == 4 and wf['106']['inputs']['cfg'] == 1
+        assert wf['17']['inputs']['steps'] == 8 and wf['17']['inputs']['cfg'] == 1
+        # dynamic aspect-ratio sizing stays wired statically (GetImageSize -> EmptyLatentImage)
+        assert wf['33']['inputs']['width'] == ['40', 0]
+        assert wf['33']['inputs']['height'] == ['40', 1]
+        assert wf['40']['inputs']['image'] == ['8', 0]
         assert captured['metadata']['model_name'] == 'qwen_edit_dataset'
-        assert wf['121']['inputs']['filename_prefix'].startswith('local_QwenEdit_')
+        assert wf['38']['inputs']['filename_prefix'].startswith('local_QwenEdit_')
+        # no consistency LoRA node in this graph
+        assert '114' not in wf
 
 
-def test_enqueue_bypasses_consistency_lora_at_strength_zero(app, tmp_path, monkeypatch):
-    """Same degrade-not-fail contract as Klein: an explicit 0 strength bypasses
-    the node rather than failing the job, even when the file IS present."""
+def test_enqueue_negative_prompt_defaults_to_empty_string(app, tmp_path, monkeypatch):
     from app import config as cfg
     from app.services import qwen_edit_helper as qeh
     with app.app_context():
-        _comfy(tmp_path, cfg, consistency=True, lightning=True)
+        _comfy(tmp_path, cfg)
+        src = tmp_path / 'source.png'
+        src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        captured = {}
+        monkeypatch.setattr(qeh.queue_manager, 'add_job',
+                            lambda **kw: captured.update(kw) or (kw.get('job_id') or 'job-x'))
+        qeh.enqueue_qwen_edit_variation(
+            user_id='local', source_filename='source.png',
+            edit_prompt='test prompt', source_path=str(src))
+        assert captured['workflow_data']['21']['inputs']['text'] == ''
+
+
+def test_enqueue_bypasses_lightning_lora_when_absent(app, tmp_path, monkeypatch):
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, lightning=False)
         src = tmp_path / 'source.png'
         src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
 
@@ -219,35 +271,32 @@ def test_enqueue_bypasses_consistency_lora_at_strength_zero(app, tmp_path, monke
 
         qeh.enqueue_qwen_edit_variation(
             user_id='local', source_filename='source.png',
-            edit_prompt='test prompt', source_path=str(src), lora_strength=0)
-
-        wf = captured['workflow_data']
-        assert '114' not in wf   # consistency LoRA bypassed
-        assert '102' in wf       # Lightning LoRA untouched
-
-
-def test_enqueue_bypasses_both_optional_loras_when_absent(app, tmp_path, monkeypatch):
-    from app import config as cfg
-    from app.services import qwen_edit_helper as qeh
-    with app.app_context():
-        _comfy(tmp_path, cfg, consistency=False, lightning=False)
-        src = tmp_path / 'source.png'
-        src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
-
-        captured = {}
-        monkeypatch.setattr(qeh.queue_manager, 'add_job',
-                            lambda **kw: captured.update(kw) or (kw.get('job_id') or 'job-3'))
-
-        qeh.enqueue_qwen_edit_variation(
-            user_id='local', source_filename='source.png',
             edit_prompt='test prompt', source_path=str(src))
 
         wf = captured['workflow_data']
-        assert '114' not in wf   # consistency LoRA bypassed
-        assert '102' not in wf   # Lightning LoRA bypassed
-        assert wf['106']['inputs']['steps'] == 20 and wf['106']['inputs']['cfg'] == 4
-        # the model chain still reaches the sampler through what's left
-        assert wf['94']['inputs']['model'] == ['108', 0]
+        assert '23' not in wf   # Lightning LoRA bypassed
+        assert wf['17']['inputs']['steps'] == 20 and wf['17']['inputs']['cfg'] == 4
+        # KSampler.model reconnects straight to node 5 (CFGNorm), skipping the
+        # bypassed LoRA node — the chain is 31(UNET)->4->5->[23 skipped]->17.
+        assert wf['17']['inputs']['model'] == ['5', 0]
+
+
+def test_enqueue_lightning_disabled_explicitly_bypasses_even_when_file_present(app, tmp_path, monkeypatch):
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, lightning=True)
+        src = tmp_path / 'source.png'
+        src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        captured = {}
+        monkeypatch.setattr(qeh.queue_manager, 'add_job',
+                            lambda **kw: captured.update(kw) or (kw.get('job_id') or 'job-3'))
+        qeh.enqueue_qwen_edit_variation(
+            user_id='local', source_filename='source.png',
+            edit_prompt='test prompt', source_path=str(src), lightning_enabled=False)
+        wf = captured['workflow_data']
+        assert '23' not in wf
+        assert wf['17']['inputs']['steps'] == 20 and wf['17']['inputs']['cfg'] == 4
 
 
 def test_enqueue_raises_when_unet_missing(app, tmp_path):
@@ -273,6 +322,14 @@ def test_enqueue_raises_on_missing_source_file(app, tmp_path):
             qeh.enqueue_qwen_edit_variation(
                 user_id='local', source_filename='nope.png',
                 edit_prompt='test prompt', source_path=str(tmp_path / 'nope.png'))
+
+
+def test_workflow_required_nodes_all_present_in_shipped_file():
+    from app.services import qwen_edit_helper as qeh
+    from app.utils.comfyui import load_workflow_local
+    workflow = load_workflow_local(str(qeh.WORKFLOW_QWEN_EDIT_PATH))
+    for node in qeh._REQUIRED_NODES:
+        assert node in workflow, f'required node {node} missing from qwen_edit_variation.json'
 
 
 # --- job-queue completion dispatch -------------------------------------------

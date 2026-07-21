@@ -195,13 +195,12 @@ DEFAULTS = {
                         'lightning_enabled': True},
     # Qwen Edit (Wave 4): the general-purpose "Generate variations" engine on
     # Qwen-Image-Edit-2511 (a peer of Klein, not of Qwen Multi-angle — no
-    # fixed rotation vocabulary). Resolves the SAME UNET/VAE/TE/consistency
-    # LoRA files as qwen_multiangle (see qwen_edit_assets.py), so only the
-    # strengths/toggle live here — independently tunable since a default
-    # consistency strength for general shots need not match the one for a
-    # fixed-angle rotation.
-    'qwen_edit': {'consistency_strength': 0.5,
-                 'lightning_strength': 1.0,
+    # fixed rotation vocabulary). Resolves the SAME UNET/VAE/TE files as
+    # qwen_multiangle (see qwen_edit_assets.py). No consistency_strength here
+    # (unlike qwen_multiangle) — that LoRA exists to fight drift across
+    # SEVERAL reference images, and this engine always starts from ONE
+    # (Character datasets), so it isn't part of its workflow.
+    'qwen_edit': {'lightning_strength': 1.0,
                  'lightning_enabled': True},
     # Editable identity / quality prompts (feature request by @bbsorry / 雨田壹).
     # The identity "locks" that ride ahead of every generated variation used to be

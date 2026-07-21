@@ -202,27 +202,19 @@ function QwenMultiangleCard({ config, setField }) {
 
 function QwenEditLorasCard({ config, setField }) {
   const qe = config.qwen_edit || {}
-  const cons = Number.isFinite(Number(qe.consistency_strength)) ? Number(qe.consistency_strength) : 0.5
   const light = Number.isFinite(Number(qe.lightning_strength)) ? Number(qe.lightning_strength) : 1.0
   const lightningOn = qe.lightning_enabled !== false
   return (
     <Card
       id="qwen-edit"
       title="Qwen Edit (optional tuning)"
-      help="A local, general-purpose peer of Klein for Generate variations, using Qwen-Image-Edit-2511 — a different base model, useful when Klein's own photoreal-biased fine-tune fights a non-photoreal render style. The model files aren't downloaded by this app — point ComfyUI at whatever you already have (Settings ▸ Local tools ▸ ComfyUI). The per-run consistency-LoRA strength is also editable from the 🎨 Qwen Edit tuning panel in Generate variations."
+      help="A local, general-purpose peer of Klein for Generate variations, using Qwen-Image-Edit-2511 — a different base model, useful when Klein's own photoreal-biased fine-tune fights a non-photoreal render style. The model files aren't downloaded by this app — point ComfyUI at whatever you already have (Settings ▸ Local tools ▸ ComfyUI). No consistency-LoRA setting here (unlike Klein/Qwen Multi-angle): that LoRA fights drift across several reference images, and this engine always starts from one."
     >
-      <label className="flex items-center gap-1.5 text-sm text-content">
-        <span className="whitespace-nowrap">Consistency LoRA strength: {cons.toFixed(2)}</span>
-        <input type="range" min={0} max={1.5} step={0.05} value={cons}
-          aria-label="Qwen Edit consistency LoRA strength"
-          onChange={(e) => setField('qwen_edit', 'consistency_strength', Number(e.target.value))}
-          className="w-40 accent-indigo-500" />
-      </label>
       <label className="flex items-center gap-2 text-sm text-content">
         <input type="checkbox" checked={lightningOn}
           onChange={(e) => setField('qwen_edit', 'lightning_enabled', e.target.checked)}
           className="h-4 w-4 rounded border-border-strong" />
-        Use the Lightning speed LoRA (4 steps) when available
+        Use the Lightning speed LoRA (8 steps) when available
       </label>
       {lightningOn && (
         <label className="flex items-center gap-1.5 text-sm text-content">

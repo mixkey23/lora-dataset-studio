@@ -9,24 +9,36 @@ klein_edit_helper.py, not a replacement for either existing engine.
 Same asset-resolution contract as klein_edit_helper.py / qwen_multiangle_helper.py
 (canonical filename first, narrow token fallback, never a blind first-file
 guess) via the SHARED qwen_edit_assets module — this engine and Qwen
-Multi-angle resolve the identical UNET/VAE/TE/consistency-LoRA files, so the
-user never configures the same path twice. Same degrade-not-fail LoRA
-injection as Klein's consistency LoRA (klein_edit_helper.py:590-629): a
-missing file or strength<=0 bypasses the node instead of failing the job.
+Multi-angle resolve the identical UNET/VAE/TE files, so the user never
+configures the same path twice.
 
-Multi-reference chaining (Klein's `extra_ref_paths`) is NOT supported here
-yet — whether `TextEncodeQwenImageEditPlus`/`FluxKontextMultiReferenceLatentMethod`
-accept more than one reference image the way Klein's native `ReferenceLatent`
-chain does was not verified against a live ComfyUI in this session. Single
-source reference only; extend once confirmed against a real install.
+Workflow redesign (user-supplied, real ComfyUI capture): this engine no
+longer uses the Kontext-lineage nodes (`TextEncodeQwenImageEditPlus`,
+`FluxKontextMultiReferenceLatentMethod`, `FluxKontextImageScale`) — instead
+`TextEncodeQwenImageEditPlusCustom_lrzjason` + `QwenEditConfigPreparer` +
+`QwenEditAdaptiveLongestEdge` (the lrzjason ComfyUI-QwenEditUtils pack) let
+a VLM (Qwen2.5-VL, the same text encoder) read the reference image and the
+user's plain-language EDIT instruction together, rather than a hand-built
+"create a new X of the same Y" prompt. There is also no consistency LoRA in
+this graph: that LoRA exists to fight drift across SEVERAL reference images
+(Qwen's own multi-ref use case) — Character datasets here always start from
+ONE reference image, so it doesn't apply and was deliberately left out.
+
+Same degrade-not-fail LoRA injection as Klein's consistency LoRA
+(klein_edit_helper.py:590-629) for the one LoRA this graph DOES have
+(Lightning, speed-only): a missing file or an explicit 0 strength bypasses
+the node instead of failing the job.
+
+Multi-reference chaining (Klein's `extra_ref_paths`) is NOT supported here —
+this workflow is single-reference by design (see above).
 """
 from __future__ import annotations
 import logging
 import os
 import random
 import shutil
-import time
 import uuid
+import time
 
 from .. import config as cfg
 from . import qwen_edit_assets as qea
@@ -40,14 +52,14 @@ WORKFLOW_QWEN_EDIT_PATH = cfg.BACKEND_DIR / 'workflows' / 'qwen_edit_variation.j
 # Nodes this helper rewires or otherwise depends on the shape of — fail LOUDLY
 # if the workflow file changes shape instead of silently enqueuing a job with
 # the wrong source/prompt/model.
-_REQUIRED_NODES = ('115', '112', '106', '121', '108', '95', '93', '114', '102', '122', '123')
+_REQUIRED_NODES = ('39', '10', '17', '38', '31', '7', '6', '21', '23', '33', '13', '8', '40')
 
-# REQUIRED = the graph is invalid without it. Unlike Qwen Multi-angle, this
-# engine needs no extra LoRA to function — the consistency LoRA is
-# RECOMMENDED-only (structure anchor, same role as Klein's own), exactly
-# Klein's own required/recommended split.
+# REQUIRED = the graph is invalid without it. No consistency LoRA here (see
+# module docstring) — Lightning is the only LoRA, and it's RECOMMENDED-only
+# (quality/speed, the graph still runs without it via the non-distilled
+# step/cfg fallback).
 QWEN_EDIT_REQUIRED = ('qwen_edit_unet', 'qwen_edit_text_encoder', 'qwen_edit_vae')
-QWEN_EDIT_RECOMMENDED = ('qwen_edit_consistency_lora', 'qwen_edit_lightning_lora')
+QWEN_EDIT_RECOMMENDED = ('qwen_edit_lightning_lora',)
 
 
 class QwenEditModelsMissing(Exception):
@@ -70,9 +82,6 @@ def qwen_edit_missing_assets():
         missing.append('qwen_edit_text_encoder')
     if not qea.resolve_vae():
         missing.append('qwen_edit_vae')
-    _, cons_path = qea.resolve_consistency_lora()
-    if not (cons_path and os.path.exists(cons_path)):
-        missing.append('qwen_edit_consistency_lora')
     _, light_path = qea.resolve_lightning_lora()
     if not (light_path and os.path.exists(light_path)):
         missing.append('qwen_edit_lightning_lora')
@@ -83,7 +92,6 @@ QWEN_EDIT_MIN_BYTES = {
     'qwen_edit_unet': qea.QWEN_EDIT_MIN_BYTES['unet'],
     'qwen_edit_text_encoder': qea.QWEN_EDIT_MIN_BYTES['text_encoder'],
     'qwen_edit_vae': qea.QWEN_EDIT_MIN_BYTES['vae'],
-    'qwen_edit_consistency_lora': qea.QWEN_EDIT_MIN_BYTES['consistency_lora'],
     'qwen_edit_lightning_lora': qea.QWEN_EDIT_MIN_BYTES['lightning_lora'],
 }
 
@@ -91,16 +99,19 @@ QWEN_EDIT_MIN_BYTES = {
 def qwen_edit_invalid_assets():
     """Assets that ARE on disk under the resolved name but are NOT real,
     loadable weights (e.g. a licence-gate HTML page saved as .safetensors).
-    Mirrors klein_edit_helper.klein_invalid_assets()."""
+    Mirrors klein_edit_helper.klein_invalid_assets(). The shared resolver
+    (qea.base_asset_paths()) also reports 'consistency_lora' — this engine
+    doesn't use it (see module docstring), so it's skipped here rather than
+    KeyError'd; Qwen Multi-angle's own probe still covers it."""
     from . import model_integrity
     out = []
     paths = qea.base_asset_paths()
-    # Map qea's short keys ('unet', 'vae', ...) to this engine's asset names.
     key_map = {'unet': 'qwen_edit_unet', 'text_encoder': 'qwen_edit_text_encoder',
-              'vae': 'qwen_edit_vae', 'consistency_lora': 'qwen_edit_consistency_lora',
-              'lightning_lora': 'qwen_edit_lightning_lora'}
+              'vae': 'qwen_edit_vae', 'lightning_lora': 'qwen_edit_lightning_lora'}
     for qea_key, path in paths.items():
-        asset = key_map[qea_key]
+        asset = key_map.get(qea_key)
+        if asset is None:
+            continue
         res = model_integrity.validate_model_file(path, min_bytes=QWEN_EDIT_MIN_BYTES.get(asset))
         if res['ok']:
             continue
@@ -110,12 +121,13 @@ def qwen_edit_invalid_assets():
     return out
 
 
-# --- Custom-node preflight — same class set qwen_multiangle_helper needs,
-# since both use the Kontext-lineage editing nodes.
+# --- Custom-node preflight. The lrzjason ComfyUI-QwenEditUtils pack — exact
+# repo/download URL unconfirmed, left (None, None) like every other
+# not-yet-verified pack in this codebase rather than guessing a link.
 QWEN_EDIT_NODE_PACKS = {
-    'TextEncodeQwenImageEditPlus': (None, None),
-    'FluxKontextMultiReferenceLatentMethod': (None, None),
-    'FluxKontextImageScale': (None, None),
+    'QwenEditAdaptiveLongestEdge': (None, None),
+    'QwenEditConfigPreparer': (None, None),
+    'TextEncodeQwenImageEditPlusCustom_lrzjason': (None, None),
     'CFGNorm': (None, None),
     'ModelSamplingAuraFlow': (None, None),
 }
@@ -196,8 +208,8 @@ def _comfy_output_dir():
     return str(d) if d else None
 
 
-def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, qwen_model=None,
-                                extra_metadata=None, lora_strength=None, source_path=None,
+def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, negative_prompt='',
+                                qwen_model=None, extra_metadata=None, source_path=None,
                                 sampler_steps=None, lightning_enabled=True,
                                 lightning_strength=None):
     """Copy the source into ComfyUI input, configure the qwen_edit_variation
@@ -205,12 +217,18 @@ def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, qwen_mode
     app job_id. Raises ValueError on a missing source / unloadable workflow /
     missing required node, RuntimeError if ComfyUI isn't configured,
     QwenEditModelsMissing if a graph-critical asset is absent.
-    `lora_strength` overrides `qwen_edit.consistency_strength` (clamped
-    [0.0, 1.5]); 0 disables the consistency LoRA entirely — same "degrade,
-    don't fail" contract as Klein's own consistency LoRA.
-    `lightning_enabled` toggles the Lightning speed LoRA; off falls back to a
-    non-distilled step/cfg envelope (both step counts are extrapolated, not
-    yet measured against a real run — same honesty flag as Qwen Multi-angle)."""
+    `negative_prompt` (render_style-aware, see
+    face_variations/render_style_presets) goes straight into the plain
+    CLIPTextEncode negative node — unlike Klein, this graph doesn't run at a
+    guidance-distilled CFG=1, so the negative conditioning has a real effect.
+    The empty latent's width/height are NOT set here — they're wired
+    statically in the workflow file itself (GetImageSize on the adaptively-
+    resized reference -> EmptyLatentImage), so the output always matches the
+    reference's aspect ratio without any code-side calculation.
+    `lightning_enabled` toggles the Lightning speed LoRA (the only LoRA in
+    this graph); off falls back to a non-distilled step/cfg envelope (both
+    step counts are extrapolated, not yet measured against a real run — same
+    honesty flag as Qwen Multi-angle)."""
     if source_path is None:
         out_dir = _comfy_output_dir()
         if out_dir is None:
@@ -238,57 +256,43 @@ def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, qwen_mode
     comfy_input = f"qwen_edit_source_{uid}_{source_filename}"
     shutil.copy2(source_path, os.path.join(comfy_input_dir, comfy_input))
 
-    workflow["115"]["inputs"]["image"] = comfy_input
-    workflow["112"]["inputs"]["prompt"] = edit_prompt
-    workflow["108"]["inputs"]["unet_name"] = unet_ref
-    workflow["95"]["inputs"]["vae_name"] = vae_ref
-    workflow["93"]["inputs"]["clip_name"] = te_ref
-    workflow["106"]["inputs"]["seed"] = random.randint(0, 2 ** 64 - 1)
+    workflow["39"]["inputs"]["image"] = comfy_input
+    workflow["10"]["inputs"]["prompt"] = edit_prompt
+    workflow["21"]["inputs"]["text"] = negative_prompt or ''
+    workflow["31"]["inputs"]["unet_name"] = unet_ref
+    workflow["7"]["inputs"]["vae_name"] = vae_ref
+    workflow["6"]["inputs"]["clip_name"] = te_ref
+    workflow["17"]["inputs"]["seed"] = random.randint(0, 2 ** 64 - 1)
     # UNIQUE prefix per job — same ComfyUI-output-counter reasoning as Klein's
     # own note (a shared prefix made every tile display the same file).
-    workflow["121"]["inputs"]["filename_prefix"] = f"{user_id}_QwenEdit_{uid}"
+    workflow["38"]["inputs"]["filename_prefix"] = f"{user_id}_QwenEdit_{uid}"
 
-    # Consistency LoRA (optional, node 114, model = 108 UNETLoader directly —
-    # this workflow has no multi-angle LoRA ahead of it) — degrade by
-    # bypassing, never fail.
-    cons_lora, cons_path = qea.resolve_consistency_lora()
-    cons_strength = cfg.get('qwen_edit.consistency_strength', 0.5)
-    if lora_strength is not None:
-        cons_strength = max(0.0, min(1.5, float(lora_strength)))
-    if not cons_path or not os.path.exists(cons_path):
-        logger.warning(f"consistency LoRA not found at {cons_path} — bypassing node 114")
-        _bypass_node(workflow, "114", "model")
-    elif not cons_strength or float(cons_strength) <= 0:
-        logger.info("consistency LoRA strength 0 — bypassing node 114 (LoRA off)")
-        _bypass_node(workflow, "114", "model")
-    else:
-        workflow["114"]["inputs"]["lora_name"] = cons_lora
-        workflow["114"]["inputs"]["strength_model"] = cons_strength
-
-    # Lightning speed LoRA (optional, node 102) — bypass + fall back to a
-    # non-distilled step/cfg envelope when off or the file is absent.
+    # Lightning speed LoRA (optional, node 23, the ONLY LoRA in this graph —
+    # see module docstring for why there's no consistency LoRA) — bypass +
+    # fall back to a non-distilled step/cfg envelope when off or absent.
     light_lora, light_path = qea.resolve_lightning_lora()
     light_strength = cfg.get('qwen_edit.lightning_strength', 1.0)
     if lightning_strength is not None:
         light_strength = max(0.0, min(1.5, float(lightning_strength)))
     use_lightning = (lightning_enabled and light_path and os.path.exists(light_path)
                      and light_strength and float(light_strength) > 0)
-    if "102" in workflow:
+    if "23" in workflow:
         if use_lightning:
-            workflow["102"]["inputs"]["lora_name"] = light_lora
-            workflow["102"]["inputs"]["strength_model"] = light_strength
+            workflow["23"]["inputs"]["lora_name"] = light_lora
+            workflow["23"]["inputs"]["strength_model"] = light_strength
         else:
             if lightning_enabled and not (light_path and os.path.exists(light_path)):
-                logger.warning(f"Lightning LoRA not found at {light_path} — bypassing node 102")
-            _bypass_node(workflow, "102", "model")
-    if "106" in workflow:
+                logger.warning(f"Lightning LoRA not found at {light_path} — bypassing node 23")
+            _bypass_node(workflow, "23", "model")
+    if "17" in workflow:
         if sampler_steps is not None:
-            workflow["106"]["inputs"]["steps"] = max(1, int(sampler_steps))
+            workflow["17"]["inputs"]["steps"] = max(1, int(sampler_steps))
         else:
-            # EXTRAPOLATED, untested — mirrors Qwen Multi-angle's own non-distilled
-            # fallback envelope (no research vault entry for this engine yet).
-            workflow["106"]["inputs"]["steps"] = 4 if use_lightning else 20
-        workflow["106"]["inputs"]["cfg"] = 1 if use_lightning else 4
+            # 8 steps matches the reference capture this workflow was built
+            # from (Lightning-8steps LoRA); the non-Lightning fallback is
+            # EXTRAPOLATED, untested — same honesty flag as Qwen Multi-angle.
+            workflow["17"]["inputs"]["steps"] = 8 if use_lightning else 20
+        workflow["17"]["inputs"]["cfg"] = 1 if use_lightning else 4
 
     job_id = str(uuid.uuid4())
     meta = {"model_name": "qwen_edit_dataset"}

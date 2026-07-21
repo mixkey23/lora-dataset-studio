@@ -48,6 +48,7 @@ from .face_variations import (CAPTION_PROMPT, CAPTION_PROMPT_BOORU,
                               is_nsfw_label, prompt_by_label, wrap_variation,
                               wrap_variation_klein, wrap_variation_qwen_edit, get_identity_prompt,
                               KLEIN_IMAGE_IMPROVE_PROMPT)
+from .render_style_presets import generation_negative_for
 
 logger = logging.getLogger(__name__)
 
@@ -4433,8 +4434,8 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
                                 v['prompt'], nsfw=nsfw, framing=v.get('framing'),
                                 suffix=dataset_prompt_suffix(ds, v.get('framing')),
                                 render_style=render_style),
+                            negative_prompt=generation_negative_for(render_style),
                             qwen_model=klein_model,
-                            lora_strength=lora_strength,
                             lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
                             extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
                                             'variation_label': v.get('label')})
@@ -4760,6 +4761,7 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
         model = (img.klein_model if img.klein_model not in API_ENGINES
                  and img.generation_engine == 'qwen_edit' else None)
         ref_path = os.path.join(_dataset_path(ds.id), ds.ref_filename)
+        _render_style = getattr(ds, 'render_style', None) or 'photoreal'
         new_job_id = enqueue_qwen_edit_variation(
             user_id=str(user_id), source_filename=ds.ref_filename,
             source_path=ref_path,
@@ -4767,9 +4769,9 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
                 prompt, nsfw=is_nsfw_label(img.variation_label),
                 framing=img.framing,
                 suffix=dataset_prompt_suffix(ds, img.framing),
-                render_style=getattr(ds, 'render_style', None) or 'photoreal'),
+                render_style=_render_style),
+            negative_prompt=generation_negative_for(_render_style),
             qwen_model=model,
-            lora_strength=lora_strength,
             lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
             extra_metadata={'is_dataset': True, 'dataset_id': img.dataset_id,
                             'variation_label': img.variation_label})

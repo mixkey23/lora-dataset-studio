@@ -59,18 +59,24 @@ IDENTITY_GUARD_KLEIN = (
     "pores, realistic lighting with soft shadows, high detail.")
 
 # Qwen-Image-Edit-2511 restage + face-identity block (see
-# wrap_variation_qwen_edit, Wave 4) — same instruction-edit shape as Klein's
-# own (neither guard names its engine in the text, so the wording transfers
-# as-is to a second edit-capable model), held separately so it gets its own
-# editable Settings override, independent of Klein's.
-_IDENTITY_GUARD_QWEN_EDIT_BASE = _IDENTITY_GUARD_KLEIN_BASE
-IDENTITY_GUARD_QWEN_EDIT = IDENTITY_GUARD_KLEIN
+# wrap_variation_qwen_edit, Wave 4 redesign). UNLIKE Klein's own guard, this is
+# NOT a "create a new photograph of..." template — the new workflow
+# (TextEncodeQwenImageEditPlusCustom_lrzjason + QwenEditConfigPreparer) is a
+# genuine EDIT model fed a plain-language instruction, and its own VLM already
+# reasons about "what changes vs. what stays the same" from an `instruction`
+# meta-prompt baked into the workflow file. So this guard stays short and
+# already says "character" (no photo-specific "person"/"skin tone and
+# texture" wording to swap for render_style — same text works for every
+# style), independent of Klein's — held separately so it gets its own
+# editable Settings override.
+IDENTITY_GUARD_QWEN_EDIT = (
+    "Do not change the facial identity: keep the same eye shape and color, nose, "
+    "jawline, lips, and face proportions. Do not beautify, slim, age, or alter the face.")
 
 _GUARD_BASE_BY_KIND = {
     'face_single': _IDENTITY_GUARD_BASE,
     'face_multi': _IDENTITY_GUARD_MULTI_BASE,
     'klein_identity': _IDENTITY_GUARD_KLEIN_BASE,
-    'qwen_edit_identity': _IDENTITY_GUARD_QWEN_EDIT_BASE,
 }
 
 # Wave 3 follow-up: the tail swap alone left the identity-lock BODY itself
@@ -110,7 +116,6 @@ _GUARD_BASE_STYLED_BY_KIND = {
     'face_single': _IDENTITY_GUARD_BASE_STYLED,
     'face_multi': _IDENTITY_GUARD_MULTI_BASE_STYLED,
     'klein_identity': _IDENTITY_GUARD_KLEIN_BASE_STYLED,
-    'qwen_edit_identity': _IDENTITY_GUARD_KLEIN_BASE_STYLED,
 }
 
 # Fixed instruction for the manual "Klein upscale & improve" action. Lives here
@@ -325,38 +330,33 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
 
 def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | None = None,
                              suffix: str = '', render_style: str = 'photoreal') -> str:
-    """Qwen-Image-Edit-2511 (Wave 4) is, like Klein, an INSTRUCTION-edit model
-    (native `TextEncodeQwenImageEditPlus`/Kontext-lineage reference
-    conditioning) — same command-first structure as wrap_variation_klein()
-    for the same reason (a preservation-order-first wrapper reads as "change
-    nothing" to an edit model). The framing-specific detail
-    (`_KLEIN_FRAMING_DETAIL`, reused as-is) and the non-Lightning step/cfg
-    fallback are EXTRAPOLATED from Klein's own research — there is no prior
-    prompt-tuning study for this engine yet, flag any retuning need honestly
-    once real output is reviewed.
+    """Qwen-Image-Edit-2511 (Wave 4, redesigned after real-world debugging —
+    see the qwen_edit_helper.py module docstring for the workflow swap this
+    tracks). UNLIKE Klein's "create a new X of the same Y" template, this
+    engine is fed a plain EDIT instruction: the workflow's own
+    TextEncodeQwenImageEditPlusCustom_lrzjason node already reads the
+    reference image via a VLM (the same Qwen2.5-VL text encoder) plus a fixed
+    meta-`instruction` baked into the workflow file that tells it to
+    reconcile "what's in the image" with "what the user's instruction asks
+    for" — so the prompt here reads as an edit request, not a from-scratch
+    scene description.
     `nsfw=True` (local-only, same fail-closed rule as Klein: the route refuses
     NSFW on API engines) drops the SFW clamp.
-    `render_style='photoreal'` (default) still applies the style tail/subject
-    swap exactly like Klein's wrapper — there is no "photoreal default" to
-    preserve here (this is a brand-new wrapper), the render_style plumbing is
-    simply reused unchanged (Wave 3's `_style_aware_identity`/
-    `generation_tail_for`)."""
-    tail = generation_tail_for(render_style)
+    `render_style` swaps the trailing style clause, same shape as Klein's own
+    `ending` (Wave 3's `generation_tail_for`). No BASE/STYLED split is needed
+    for the identity block here (unlike Klein/API guards) — IDENTITY_GUARD_QWEN_EDIT
+    was written style-neutral from the start (no photo-specific wording to
+    swap out), so `get_identity_prompt` is used directly."""
     detail = _KLEIN_FRAMING_DETAIL.get(framing or '', '')
-    if tail:
-        subject, noun = 'image', 'character'
-        ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {tail}"
-                  if nsfw else f"{tail} SFW.")
-    else:
-        subject, noun = 'photograph', 'person'
-        ending = ("Explicit nudity is allowed; render natural, anatomically correct forms. "
-                  "Professional realistic photograph.") if nsfw else \
-                 "Professional realistic photograph, SFW."
-    identity_block = _style_aware_identity('qwen_edit_identity', render_style, include_tail=not tail)
+    identity = get_identity_prompt('qwen_edit_identity')
+    tail = generation_tail_for(render_style)
+    style_clause = tail if tail else 'Professional realistic photograph.'
+    ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {style_clause}"
+              if nsfw else f"{style_clause} SFW.")
     return (
-        f"Create a new {subject} of the same {noun} as the reference image: {_append_suffix(prompt, suffix)}. "
+        f"Keep the same character identity. Restage the image as: {_append_suffix(prompt, suffix)}. "
         + (f"{detail} " if detail else "")
-        + f"{identity_block} {ending}")
+        + f"{identity} {ending}")
 
 
 # --- Anti-fuite tenue / expression (constat terrain 2026-07-14) ---------------

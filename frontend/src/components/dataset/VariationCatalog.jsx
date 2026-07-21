@@ -1029,48 +1029,28 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
 
       {/* Qwen Edit-only tuning: model picker (only rendered when 2+ Qwen-Image-
           Edit-2511 checkpoints are on disk — e.g. an SFW build alongside a
-          community NSFW fine-tune) + consistency-LoRA strength (shares the
-          same slider state Klein's panel uses — both engines take the
-          identical `lora_strength` field on the wire). The Lightning speed
-          toggle is Settings-only (config.qwen_edit.lightning_enabled) — no
-          per-run override yet. */}
+          community NSFW fine-tune). No consistency-LoRA slider here (unlike
+          Klein) — that LoRA fights drift across SEVERAL reference images,
+          and this engine always starts from ONE (Character datasets), so
+          the redesigned workflow doesn't use it. The Lightning speed toggle
+          is Settings-only (config.qwen_edit.lightning_enabled) — no per-run
+          override yet. */}
       {isQwenEdit && qeAvailable && (
         <details className="rounded-lg border border-border bg-app/30 open:pb-2">
           <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
             🎨 Qwen Edit tuning
-            <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
-              consistency LoRA {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
-            </span>
           </summary>
           <div className="px-2.5 pt-1 flex flex-col gap-2">
             <div className="max-w-sm"><QwenEditModelPicker onChange={setQwenModel} /></div>
-            <div className="flex flex-col gap-0.5">
-              <label className="flex items-center gap-2 text-content-muted text-[0.6875rem]">
-                <span className="whitespace-nowrap">
-                  Consistency LoRA: {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
-                </span>
-                <input type="range" min={0} max={1.2} step={0.05} value={loraStrength}
-                  onChange={(e) => { loraTouchedRef.current = true; setLoraStrength(Number(e.target.value)); }}
-                  aria-label="Consistency LoRA strength"
-                  className="flex-1 min-w-[120px] accent-fuchsia-500" />
-              </label>
-              <p className="text-content-subtle text-[0.625rem]">
-                Anchors structure during the edit, same role as Klein's own consistency LoRA —
-                ~0.5 balanced · lower for bigger restagings · 0 = off.
-              </p>
-              {renderStyle !== 'photoreal' && (
-                <p className="text-amber-300/90 text-[0.625rem]">
-                  This dataset targets a non-photoreal render style: the consistency LoRA is
-                  skipped automatically unless you set a strength above by hand.
-                </p>
-              )}
-              <p className="text-content-subtle text-[0.625rem]">
-                Lightning (speed) LoRA is configured in{' '}
-                <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
-                  Settings › Image engines
-                </a>.
-              </p>
-            </div>
+            <p className="text-content-subtle text-[0.625rem]">
+              The edit instruction and its negative prompt (anti-photorealism terms for a
+              non-photoreal render style, generic quality terms otherwise) are built
+              automatically from the shot and your dataset's render style. Lightning
+              (speed) LoRA is configured in{' '}
+              <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
+                Settings › Image engines
+              </a>.
+            </p>
           </div>
         </details>
       )}
