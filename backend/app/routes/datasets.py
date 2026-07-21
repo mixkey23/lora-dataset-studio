@@ -415,6 +415,18 @@ def dataset_generate(dataset_id):
                 current_app._get_current_object(), LOCAL_USER, dataset_id,
                 data.get('variations') or [], data.get('multiplier', 1),
                 engine=generator)
+        elif generator == 'qwen_edit':
+            # Wave 4: general-purpose Qwen-Image-Edit-2511 engine, a LOCAL peer
+            # of Klein. Same node-preflight-then-enqueue shape as Klein below.
+            from ..services import qwen_edit_helper as qeh
+            missing_nodes = qeh.qwen_edit_missing_nodes()
+            if missing_nodes:
+                return _qwen_edit_missing_response(qeh.qwen_edit_missing_assets(), missing_nodes)
+            ids = svc.generate_variations(LOCAL_USER, dataset_id,
+                                          data.get('variations') or [], data.get('multiplier', 1),
+                                          data.get('klein_model'),
+                                          lora_strength=data.get('lora_strength'),
+                                          engine='qwen_edit')
         else:
             # Klein node preflight (once per request — /object_info is large, so
             # never per-tile): if the workflow needs a custom node this ComfyUI
@@ -434,12 +446,16 @@ def dataset_generate(dataset_id):
                                           # Optional generation-LoRA preset
                                           # (Idea by @waltm): a NAME resolved
                                           # from config — absent/'' = none.
-                                          generation_lora_preset=data.get('generation_lora_preset'))
+                                          generation_lora_preset=data.get('generation_lora_preset'),
+                                          engine='klein')
             _autostart_optional_klein()  # bg-fetch the consistency LoRA if it's absent
     except Exception as e:
         from ..services.klein_edit_helper import KleinModelsMissing
+        from ..services.qwen_edit_helper import QwenEditModelsMissing
         if isinstance(e, KleinModelsMissing):  # a required Klein model isn't installed
             return _klein_missing_response(e.missing)
+        if isinstance(e, QwenEditModelsMissing):  # a required Qwen Edit model isn't installed
+            return _qwen_edit_missing_response(e.missing)
         return _map_error(e)
     return jsonify({'ok': True, 'created': len(ids)})
 
@@ -845,6 +861,37 @@ _QWEN_MA_ASSET_LABELS = {
     'qwen_ma_consistency_lora': 'consistency LoRA', 'qwen_ma_lightning_lora': 'Lightning LoRA',
 }
 
+_QWEN_EDIT_ASSET_LABELS = {
+    'qwen_edit_unet': 'Qwen-Image-Edit-2511 model', 'qwen_edit_text_encoder': 'text encoder',
+    'qwen_edit_vae': 'VAE', 'qwen_edit_consistency_lora': 'consistency LoRA',
+    'qwen_edit_lightning_lora': 'Lightning LoRA',
+}
+
+
+def _qwen_edit_missing_response(missing, missing_nodes=None):
+    """Turn a Qwen Edit preflight miss into a (body, 409) — mirrors
+    _qwen_ma_missing_response (no auto-download, same as Qwen Multi-angle: the
+    user points ComfyUI at what they already have)."""
+    from .. import capabilities, config as cfg
+    from ..services import qwen_edit_helper as qeh
+    missing = missing or []
+    missing_nodes = missing_nodes or []
+    if missing and not capabilities.resolve_comfyui_base(cfg.get('comfyui.base_dir') or '')['valid']:
+        return jsonify({'ok': False,
+                        'error': 'Point the app at your ComfyUI install folder in '
+                                 'Setup ▸ ComfyUI first, so Qwen Edit can find its models.'}), 409
+    parts = []
+    if missing:
+        names = ', '.join(_QWEN_EDIT_ASSET_LABELS.get(m, m) for m in missing)
+        it = 'them' if len(missing) > 1 else 'it'
+        parts.append(f"Qwen Edit needs {names}. Place {it} in your ComfyUI models "
+                     "folder (see Settings ▸ Engines), then retry.")
+    if missing_nodes:
+        parts.append(qeh.format_missing_nodes_message(missing_nodes))
+    return jsonify({'ok': False, 'error': ' '.join(parts),
+                    'qwen_edit_missing': missing,
+                    'qwen_edit_nodes_missing': missing_nodes}), 409
+
 
 def _qwen_ma_missing_response(missing, missing_nodes=None):
     """Turn a Qwen Multi-angle preflight miss into a (body, 409) — mirrors
@@ -930,11 +977,16 @@ def dataset_image_regenerate(image_id):
     klein_model = (data.get('klein_model') or '').strip() or None
     try:
         from flask import current_app
-        # Klein node preflight (skip when the user explicitly picked an API engine,
-        # which doesn't touch ComfyUI): surface a missing custom node as one 409
-        # instead of a silent failed re-roll. Fail-open if /object_info is down;
-        # combined with the model scan (same rationale as the batch generate).
-        if engine not in svc.API_ENGINES:
+        # Local-engine node preflight (skip when the user explicitly picked an API
+        # engine, which doesn't touch ComfyUI): surface a missing custom node as
+        # one 409 instead of a silent failed re-roll. Fail-open if /object_info is
+        # down; combined with the model scan (same rationale as the batch generate).
+        if engine == 'qwen_edit':
+            from ..services import qwen_edit_helper as qeh
+            missing_nodes = qeh.qwen_edit_missing_nodes()
+            if missing_nodes:
+                return _qwen_edit_missing_response(qeh.qwen_edit_missing_assets(), missing_nodes)
+        elif engine not in svc.API_ENGINES:
             from ..services import klein_edit_helper as keh
             missing_nodes = keh.klein_missing_nodes()
             if missing_nodes:
@@ -947,8 +999,11 @@ def dataset_image_regenerate(image_id):
                                       app=current_app._get_current_object())
     except Exception as e:
         from ..services.klein_edit_helper import KleinModelsMissing
+        from ..services.qwen_edit_helper import QwenEditModelsMissing
         if isinstance(e, KleinModelsMissing):
             return _klein_missing_response(e.missing)  # auto-download, tell them to retry
+        if isinstance(e, QwenEditModelsMissing):
+            return _qwen_edit_missing_response(e.missing)
         return _map_error(e)
     if job_id is None:
         return jsonify({'error': 'not found'}), 404

@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-qwen-edit-engine',
+    date: '2026-07-21',
+    title: '🎨 A second local engine for Generate variations',
+    blurb:
+      "Klein isn't the only local option anymore — Qwen Edit (Qwen-Image-Edit-2511) joins as a 4th generator with the same full shot catalog and the same local-only NSFW lane, a different base model useful when Klein's photoreal-biased fine-tune fights a non-photoreal Render style. Point ComfyUI at the checkpoint once (it shares files with Qwen Multi-angle) and it's ready.",
+    to: '/settings/engines',
+  },
+  {
     id: '2026-07-21-render-style',
     date: '2026-07-21',
     title: '🎨 Datasets aren\'t just for real photos anymore',

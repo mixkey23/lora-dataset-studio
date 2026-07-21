@@ -70,7 +70,7 @@ DEFAULTS = {
                      'python': '',
                      'qwen_image_dit': '', 'qwen_image_vae': '',
                      'qwen_image_text_encoder': ''},
-    'engines': {'default': 'chatgpt', 'enabled': ['nanobanana', 'chatgpt', 'klein'],
+    'engines': {'default': 'chatgpt', 'enabled': ['nanobanana', 'chatgpt', 'klein', 'qwen_edit'],
                 # chatgpt_auth: 'auto' = subscription when connected, else API key.
                 'chatgpt_auth': 'auto',            # auto|api|subscription
                 'chatgpt_subscription_model': 'gpt-5.4-mini'},   # Codex router model (image model is gpt-image-2 regardless)
@@ -193,6 +193,16 @@ DEFAULTS = {
                         'consistency_strength': 1.0,
                         'lightning_strength': 1.0,
                         'lightning_enabled': True},
+    # Qwen Edit (Wave 4): the general-purpose "Generate variations" engine on
+    # Qwen-Image-Edit-2511 (a peer of Klein, not of Qwen Multi-angle — no
+    # fixed rotation vocabulary). Resolves the SAME UNET/VAE/TE/consistency
+    # LoRA files as qwen_multiangle (see qwen_edit_assets.py), so only the
+    # strengths/toggle live here — independently tunable since a default
+    # consistency strength for general shots need not match the one for a
+    # fixed-angle rotation.
+    'qwen_edit': {'consistency_strength': 0.5,
+                 'lightning_strength': 1.0,
+                 'lightning_enabled': True},
     # Editable identity / quality prompts (feature request by @bbsorry / 雨田壹).
     # The identity "locks" that ride ahead of every generated variation used to be
     # hardcoded and invisible; these overrides expose them without touching the
@@ -204,10 +214,13 @@ DEFAULTS = {
     #   face_multi   — API-engine identity guard, multi reference (IDENTITY_GUARD_MULTI)
     #   klein_identity — Klein restage + face-identity block (wrap_variation_klein)
     #   klein_improve  — the fixed "Klein upscale & improve" instruction
+    #   qwen_edit_identity — Qwen Edit restage + face-identity block (Wave 4,
+    #     wrap_variation_qwen_edit), independent override from Klein's own.
     # klein_improve_enabled (default True): when False the manual "Klein upscale &
     # improve" applies NO prompt at all (pure upscale), instead of the default/override.
     'identity_prompts': {'face_single': '', 'face_multi': '', 'klein_identity': '',
-                         'klein_improve': '', 'klein_improve_enabled': True},
+                         'klein_improve': '', 'klein_improve_enabled': True,
+                         'qwen_edit_identity': ''},
     'updates': {'repo': 'perfectgf/lora-dataset-studio'},      # GitHub repo for the release feed
 }
 

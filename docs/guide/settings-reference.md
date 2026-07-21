@@ -33,7 +33,7 @@ The Overview section has **no settings of its own** — it's the at-a-glance das
 
 ## Image engines
 
-This is where you connect the services that *generate* dataset images. The app has three generator engines: **Nano Banana** (Google Gemini), **ChatGPT** (`gpt-image-2`), and **Klein** (local, via ComfyUI); Klein is configured under **Local tools**, the two API engines are configured here. A separate, fourth local engine, **Qwen Multi-angle**, doesn't generate new dataset images from a reference — it rotates the camera angle of an image you already have, and is configured below.
+This is where you connect the services that *generate* dataset images. **Generate variations** offers four generator engines: **Nano Banana** (Google Gemini), **ChatGPT** (`gpt-image-2`), **Klein** (local, via ComfyUI) and **Qwen Edit** (local, via ComfyUI, Qwen-Image-Edit-2511) — Klein and Qwen Edit are configured under **Local tools** (ComfyUI) plus the tuning cards below, the two API engines are configured here. A separate, fifth local engine, **Qwen Multi-angle**, doesn't generate new dataset images from a reference — it rotates the camera angle of an image you already have, and is configured below.
 
 ### API keys
 
@@ -61,8 +61,8 @@ Good to know: in subscription mode you get up to **5 reference images** per gene
 
 ### Engines
 
-- **Default engine** → `engines.default`. Which engine is preselected in the workspace. One of `nanobanana`, `chatgpt`, `klein`. Default **`chatgpt`**.
-- **Enabled engines** → `engines.enabled`. Checkboxes deciding which engines appear as options at all. Default: **all three** enabled. Untick an engine you never use to declutter the generator picker.
+- **Default engine** → `engines.default`. Which engine is preselected in the workspace. One of `nanobanana`, `chatgpt`, `klein`, `qwen_edit`. Default **`chatgpt`**.
+- **Enabled engines** → `engines.enabled`. Checkboxes deciding which engines appear as options at all. Default: **all four** enabled. Untick an engine you never use to declutter the generator picker.
 
 ### Klein generation LoRA presets (optional)
 
@@ -93,6 +93,15 @@ Unlike Klein's assets, **none of the three model files below are downloaded by t
 - **Lightning speed LoRA** → `qwen_multiangle.lightning_enabled` (default **on**) + `qwen_multiangle.lightning_strength` (`0`–`1.5`, default **`1.0`**). When on, sampling runs the LoRA's fast 4-step/cfg-1 envelope; when off (or the file is missing), sampling falls back to a slower, non-distilled envelope — both step counts are extrapolated, not yet measured against a real run.
 
 The engine only lights up (`caps.engines.qwen_multiangle`) once the UNET, VAE, text-encoder **and** the multi-angle LoRA are all found on disk — the two extra LoRAs above are quality-only and degrade gracefully when absent.
+
+### Qwen Edit (optional tuning)
+
+A general-purpose, local peer of **Klein** inside **Generate variations** — same shot catalog, same NSFW lane, same fan-out mechanics, but running **Qwen-Image-Edit-2511** instead of Klein's FLUX.2-Kontext lineage. It's useful when a dataset's **render style** (3D / anime / cartoon / illustration — see *Per-dataset settings* below) fights Klein's own photoreal-biased fine-tune; Qwen-Image-Edit-2511 has no equivalent documented bias, though this is not yet validated against real output. It shares its model files (UNET, VAE, text encoder, consistency LoRA) with **Qwen Multi-angle** above — point ComfyUI at the same checkpoint once and both engines pick it up automatically; there's no separate model path to configure here. Stored in `qwen_edit.*`:
+
+- **Consistency LoRA strength** → `qwen_edit.consistency_strength`, `0`–`1.5`, default **`0.5`** — the same structure-anchoring role as Klein's own consistency LoRA; `0` disables it. Also editable per run from the workspace's **🎨 Qwen Edit tuning** panel (`lora_strength` on that request always wins over this default).
+- **Lightning speed LoRA** → `qwen_edit.lightning_enabled` (default **on**) + `qwen_edit.lightning_strength` (`0`–`1.5`, default **`1.0`**). Same fast 4-step/cfg-1 vs. slower non-distilled fallback behaviour as Qwen Multi-angle's own toggle, and the same "extrapolated, not yet measured" caveat.
+
+The engine only lights up (`caps.engines.qwen_edit`) once the UNET, VAE and text-encoder are found on disk (the consistency and Lightning LoRAs are quality-only and degrade gracefully when absent). NSFW shots on Qwen Edit never leave your machine, exactly like Klein.
 
 ### Identity & Klein prompts (advanced)
 

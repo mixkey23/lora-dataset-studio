@@ -92,14 +92,17 @@ caption rules below to body marks.
 a photograph — every generated variation was wrapped in language locking a
 "realistic photographic portrait". A dataset's **Render style** (⚙ Dataset
 settings) now steers generation toward **3D render**, **2D anime**, a
-**semi-realistic cartoon look**, or a general **illustration** instead — Nano
-Banana/ChatGPT/Klein all follow it, and Klein additionally skips its
-photoreal-anchoring consistency LoRA automatically for a non-photoreal style.
-Klein's own model stays fine-tuned for realistic restaging, so treat that
-engine's stylized output as best-effort; the API engines follow a style
-direction more reliably. Style-kind datasets already worked for any aesthetic
-via scraped/imported images (their captions never describe the render at all)
-and are unaffected by this setting.
+**semi-realistic cartoon look**, or a general **illustration** instead — every
+engine follows it, and both local engines (Klein, Qwen Edit) additionally skip
+their photoreal-anchoring consistency LoRA automatically for a non-photoreal
+style. Klein's own model stays fine-tuned for realistic restaging, so treat
+its stylized output as best-effort; the API engines follow a style direction
+more reliably, and Qwen Edit (Generate variations' other local engine, a
+different base model than Klein — see Settings ▸ Image engines) has no
+equivalent documented photoreal bias, though that's not yet validated against
+real output either. Style-kind datasets already worked for any aesthetic via
+scraped/imported images (their captions never describe the render at all) and
+are unaffected by this setting.
 
 ---
 

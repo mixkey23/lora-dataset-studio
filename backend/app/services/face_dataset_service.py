@@ -46,7 +46,7 @@ from .face_variations import (CAPTION_PROMPT, CAPTION_PROMPT_BOORU,
                               compose_prompt_suffix, concept_lexical_field,
                               drop_identity_sentences, drop_identity_tags,
                               is_nsfw_label, prompt_by_label, wrap_variation,
-                              wrap_variation_klein, get_identity_prompt,
+                              wrap_variation_klein, wrap_variation_qwen_edit, get_identity_prompt,
                               KLEIN_IMAGE_IMPROVE_PROMPT)
 
 logger = logging.getLogger(__name__)
@@ -4331,9 +4331,15 @@ def _sync_generate_activity(dataset_id):
 
 
 def generate_variations(user_id, dataset_id, variations, multiplier, klein_model,
-                        lora_strength=None, generation_lora_preset=None):
-    """For each (variation x multiplier), enqueue a Klein edit of the reference
-    and create a pending FaceDatasetImage. Returns the created image ids.
+                        lora_strength=None, generation_lora_preset=None, engine='klein'):
+    """For each (variation x multiplier), enqueue a LOCAL edit-engine job of the
+    reference and create a pending FaceDatasetImage. Returns the created image
+    ids. `engine` picks which local ComfyUI engine runs the fan-out:
+    'klein' (default, FLUX.2-Kontext) or 'qwen_edit' (Wave 4,
+    Qwen-Image-Edit-2511) — both are edit-capable models, unlike the API
+    engines (see generate_variations_nanobanana). Unknown values fall back to
+    'klein' rather than raising, matching the route's own historical
+    fallback shape.
 
     The row is committed BEFORE enqueuing (so an enqueue/commit failure can never
     leave an untracked orphan job); on enqueue failure the row is marked 'failed'
@@ -4344,24 +4350,40 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
     CONFIG only (fail-closed: the request can't define files/strengths/order;
     an unknown name degrades to no extra LoRAs with a log). The preset's chain
     applies to EVERY variation of the run — picking the preset IS the intent,
-    there is no automatic per-variation gating."""
-    try:
-        from .klein_edit_helper import enqueue_klein_edit
-    except ImportError:
-        raise RuntimeError('ComfyUI is not configured')
+    there is no automatic per-variation gating. Klein-only for now (the preset
+    config stores Klein-compatible LoRA files); the qwen_edit engine ignores it.
+    `extra_ref_paths` (multi-reference chaining) is also Klein-only: whether
+    Qwen-Image-Edit-2511's Kontext nodes accept more than one reference the
+    way Klein's native ReferenceLatent chain does was not verified against a
+    live ComfyUI — qwen_edit runs single-reference only until confirmed."""
+    is_qwen_edit = engine == 'qwen_edit'
+    if is_qwen_edit:
+        from .qwen_edit_helper import (enqueue_qwen_edit_variation,
+                                       qwen_edit_missing_assets, QWEN_EDIT_REQUIRED,
+                                       QwenEditModelsMissing)
+    else:
+        try:
+            from .klein_edit_helper import enqueue_klein_edit
+        except ImportError:
+            raise RuntimeError('ComfyUI is not configured')
     ds = get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
     if not ds.ref_filename:
         raise ValueError('reference image required')
-    # Preflight the Klein model files BEFORE creating any rows: a missing model
-    # then surfaces as one actionable "downloading, retry" 409 (route handler) —
-    # not a dataset full of failed tiles, each doomed by a ComfyUI validation
-    # error on a file that isn't there.
-    from .klein_edit_helper import klein_missing_assets, KLEIN_REQUIRED, KleinModelsMissing
-    _missing = klein_missing_assets()
-    if any(a in _missing for a in KLEIN_REQUIRED):
-        raise KleinModelsMissing(_missing)
+    # Preflight the engine's model files BEFORE creating any rows: a missing
+    # model then surfaces as one actionable "downloading, retry" 409 (route
+    # handler) — not a dataset full of failed tiles, each doomed by a ComfyUI
+    # validation error on a file that isn't there.
+    if is_qwen_edit:
+        _missing = qwen_edit_missing_assets()
+        if any(a in _missing for a in QWEN_EDIT_REQUIRED):
+            raise QwenEditModelsMissing(_missing)
+    else:
+        from .klein_edit_helper import klein_missing_assets, KLEIN_REQUIRED, KleinModelsMissing
+        _missing = klein_missing_assets()
+        if any(a in _missing for a in KLEIN_REQUIRED):
+            raise KleinModelsMissing(_missing)
     mult = max(1, int(multiplier))
     total = len(variations) * mult
     if total > MAX_FANOUT:
@@ -4374,15 +4396,18 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
     if in_flight + total > MAX_FANOUT:
         raise ValueError(f'too many generations in flight ({in_flight}), wait or cancel')
     # Extra identity refs (multi-references) : chaînées en ReferenceLatent natifs
-    # côté Klein — mêmes fichiers que le chemin Nano Banana multi-réfs.
+    # côté Klein — mêmes fichiers que le chemin Nano Banana multi-réfs. Klein-only
+    # for now (see docstring) — qwen_edit ignores this.
     extra_paths = [os.path.join(_dataset_dir(ds.id), fn) for fn in extra_ref_filenames(ds)]
-    # Optional generation LoRAs: resolve the picked preset from the config ONCE
-    # (fail-closed — unknown name -> [] with a log). Same chain for every job.
-    from .klein_edit_helper import resolve_generation_lora_preset
-    run_loras = resolve_generation_lora_preset(generation_lora_preset)
+    # Optional generation LoRAs (Klein-only, see docstring): resolve the picked
+    # preset from the config ONCE (fail-closed — unknown name -> [] with a log).
+    run_loras = []
+    if not is_qwen_edit:
+        from .klein_edit_helper import resolve_generation_lora_preset
+        run_loras = resolve_generation_lora_preset(generation_lora_preset)
     ids = []
     # try/finally: advertise the live 'generate' indicator even if an enqueue
-    # fails partway (the already-queued rows are still in flight). Each Klein job
+    # fails partway (the already-queued rows are still in flight). Each job
     # completes asynchronously; _sync_generate_activity keeps the count honest and
     # link_completed_dataset_image clears it when the last one lands.
     try:
@@ -4390,30 +4415,46 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
             for _ in range(mult):
                 img = FaceDatasetImage(dataset_id=dataset_id, source='generated', status='pending',
                                        variation_label=v.get('label'), framing=v.get('framing'),
-                                       variation_prompt=v['prompt'], klein_model=klein_model)
+                                       variation_prompt=v['prompt'], klein_model=klein_model,
+                                       generation_engine=(engine if is_qwen_edit else None))
                 db.session.add(img)
                 db.session.commit()
                 # NSFW (flag explicite OU label du catalogue NSFW) : wrapper sans le
-                # clamp SFW — chemin Klein local uniquement, les moteurs API sont
+                # clamp SFW — chemins locaux uniquement, les moteurs API sont
                 # refusés en amont (route + generate_variations_nanobanana).
                 nsfw = bool(v.get('nsfw')) or is_nsfw_label(v.get('label'))
+                render_style = getattr(ds, 'render_style', None) or 'photoreal'
                 try:
-                    job_id = enqueue_klein_edit(
-                        user_id=str(user_id), source_filename=ds.ref_filename,
-                        source_path=_ref_path(ds),
-                        # Dataset suffix applied AT WRAP — the row above keeps the
-                        # raw catalog prompt, so regenerate re-applies the CURRENT
-                        # suffix exactly once (never a double application).
-                        edit_prompt=wrap_variation_klein(
-                            v['prompt'], nsfw=nsfw, framing=v.get('framing'),
-                            suffix=dataset_prompt_suffix(ds, v.get('framing')),
-                            render_style=getattr(ds, 'render_style', None) or 'photoreal'),
-                        klein_model=klein_model,
-                        lora_strength=_effective_klein_lora_strength(ds, lora_strength),
-                        extra_ref_paths=extra_paths,
-                        generation_loras=run_loras,
-                        extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
-                                        'variation_label': v.get('label')})
+                    if is_qwen_edit:
+                        job_id = enqueue_qwen_edit_variation(
+                            user_id=str(user_id), source_filename=ds.ref_filename,
+                            source_path=_ref_path(ds),
+                            edit_prompt=wrap_variation_qwen_edit(
+                                v['prompt'], nsfw=nsfw, framing=v.get('framing'),
+                                suffix=dataset_prompt_suffix(ds, v.get('framing')),
+                                render_style=render_style),
+                            qwen_model=klein_model,
+                            lora_strength=lora_strength,
+                            lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
+                            extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
+                                            'variation_label': v.get('label')})
+                    else:
+                        job_id = enqueue_klein_edit(
+                            user_id=str(user_id), source_filename=ds.ref_filename,
+                            source_path=_ref_path(ds),
+                            # Dataset suffix applied AT WRAP — the row above keeps the
+                            # raw catalog prompt, so regenerate re-applies the CURRENT
+                            # suffix exactly once (never a double application).
+                            edit_prompt=wrap_variation_klein(
+                                v['prompt'], nsfw=nsfw, framing=v.get('framing'),
+                                suffix=dataset_prompt_suffix(ds, v.get('framing')),
+                                render_style=render_style),
+                            klein_model=klein_model,
+                            lora_strength=_effective_klein_lora_strength(ds, lora_strength),
+                            extra_ref_paths=extra_paths,
+                            generation_loras=run_loras,
+                            extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
+                                            'variation_label': v.get('label')})
                 except Exception:
                     img.status = 'failed'
                     db.session.commit()
@@ -4664,19 +4705,23 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
     prompt = stored_prompt or prompt_by_label(img.variation_label or '')
     if prompt is None:
         raise ValueError('variation prompt unknown')
+    LOCAL_ENGINES = ('klein', 'qwen_edit')
     requested = (engine or '').strip() or None
-    if requested is not None and requested != 'klein' and requested not in API_ENGINES:
+    if requested is not None and requested not in LOCAL_ENGINES and requested not in API_ENGINES:
         raise ValueError(f'unknown engine: {requested}')
-    target = requested or (img.klein_model if img.klein_model in API_ENGINES else 'klein')
-    if is_nsfw_label(img.variation_label):
-        target = 'klein'              # fail-closed: NSFW never reaches an API engine
+    target = requested or (img.klein_model if img.klein_model in API_ENGINES
+                           else (img.generation_engine or 'klein'))
+    if is_nsfw_label(img.variation_label) and target in API_ENGINES:
+        # fail-closed: NSFW never reaches an API engine — stay on whichever
+        # local engine this row already used (or Klein for a fresh switch).
+        target = img.generation_engine or 'klein'
     else:
         # Engines disabled in Settings must not be used even when the row (or a
         # stale workspace selection) points at them: fall back to the default
         # engine, then to the first enabled one. An empty list means "all
-        # enabled" (legacy configs); NSFW above already forced local Klein.
+        # enabled" (legacy configs); NSFW above already forced a local engine.
         enabled = [e for e in (cfg.get('engines.enabled') or [])
-                   if e == 'klein' or e in API_ENGINES]
+                   if e in LOCAL_ENGINES or e in API_ENGINES]
         if enabled and target not in enabled:
             default = cfg.get('engines.default')
             target = default if default in enabled else enabled[0]
@@ -4687,7 +4732,7 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
     old_state = {
         field: getattr(img, field) for field in (
             'filename', 'caption', 'status', 'fail_reason', 'job_id',
-            'klein_model', 'variation_prompt', 'watermark_state',
+            'klein_model', 'generation_engine', 'variation_prompt', 'watermark_state',
             'watermark_bbox', 'watermark_regions')
     }
     old_path = (os.path.join(_dataset_path(img.dataset_id), img.filename)
@@ -4705,15 +4750,40 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
             raise ValueError('reference image file missing')
         aspect = aspect_for_label(img.variation_label, img.framing)
         ref_bytes = _all_ref_bytes(ds)  # principale + extras (multi-références)
+    elif target == 'qwen_edit':
+        try:
+            from .qwen_edit_helper import enqueue_qwen_edit_variation
+        except ImportError:
+            raise RuntimeError('ComfyUI is not configured')
+        # A row switching FROM an API engine (or from Klein) has no real Qwen
+        # model file in klein_model yet — None lets the enqueue pick its own default.
+        model = (img.klein_model if img.klein_model not in API_ENGINES
+                 and img.generation_engine == 'qwen_edit' else None)
+        ref_path = os.path.join(_dataset_path(ds.id), ds.ref_filename)
+        new_job_id = enqueue_qwen_edit_variation(
+            user_id=str(user_id), source_filename=ds.ref_filename,
+            source_path=ref_path,
+            edit_prompt=wrap_variation_qwen_edit(
+                prompt, nsfw=is_nsfw_label(img.variation_label),
+                framing=img.framing,
+                suffix=dataset_prompt_suffix(ds, img.framing),
+                render_style=getattr(ds, 'render_style', None) or 'photoreal'),
+            qwen_model=model,
+            lora_strength=lora_strength,
+            lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
+            extra_metadata={'is_dataset': True, 'dataset_id': img.dataset_id,
+                            'variation_label': img.variation_label})
     else:
         try:
             from .klein_edit_helper import enqueue_klein_edit, resolve_generation_lora_preset
         except ImportError:
             raise RuntimeError('ComfyUI is not configured')
         # Klein target: keep the row's real model file when it has one; a row born
-        # on an API engine holds an engine TAG here, not a model — use the
-        # workspace's Klein pick instead (None = enqueue's default model).
+        # on an API engine (or on qwen_edit) holds an engine TAG or a foreign
+        # model here, not a Klein model — use the workspace's Klein pick instead
+        # (None = enqueue's default model).
         model = (img.klein_model if img.klein_model not in API_ENGINES
+                 and img.generation_engine != 'qwen_edit'
                  else ((klein_model or '').strip() or None))
         ref_path = os.path.join(_dataset_path(ds.id), ds.ref_filename)
         extra_paths = [os.path.join(_dataset_path(ds.id), fn)
@@ -4746,6 +4816,7 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
             img.variation_prompt = stored_prompt
         _clear_watermark_metadata(img)
         img.klein_model = engine if target in API_ENGINES else model
+        img.generation_engine = None if target in API_ENGINES else target
         img.filename = None
         img.caption = None
         img.status = 'pending'

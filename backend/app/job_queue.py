@@ -189,7 +189,7 @@ def _dispatch_completion(job, filename, failed):
             reason = job.error_message if job.error_message != 'generation failed' else None
             lora_test_studio.link_completed_test_image(job.job_id, filename,
                                                        failed=failed, reason=reason)
-        elif md.get('model_name') in ('klein_edit_dataset', 'qwen_multiangle_dataset'):
+        elif md.get('model_name') in ('klein_edit_dataset', 'qwen_multiangle_dataset', 'qwen_edit_dataset'):
             from .services import face_dataset_service
             # The bare fallback 'generation failed' is LESS useful than the tile's
             # own default (which points at the server log) — only pass real detail.

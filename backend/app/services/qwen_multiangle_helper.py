@@ -22,6 +22,7 @@ import uuid
 
 from .. import config as cfg
 from . import comfy_model_paths
+from . import qwen_edit_assets as qea
 from ..utils.comfyui import load_workflow_local
 from ..job_queue import queue_manager
 
@@ -40,23 +41,12 @@ _REQUIRED_NODES = ('115', '112', '106', '121', '108', '95', '93', '109', '114', 
 QWEN_MA_REQUIRED = ('qwen_ma_unet', 'qwen_ma_text_encoder', 'qwen_ma_vae', 'qwen_ma_multiangle_lora')
 QWEN_MA_RECOMMENDED = ('qwen_ma_consistency_lora', 'qwen_ma_lightning_lora')
 
-_MODEL_SUFFIXES = ('.safetensors', '.gguf', '.sft')
-
-# Canonical filenames, from the real workflow this engine was built against.
-# Matching is canonical-first with NARROW token fallbacks (mirrors Klein's
-# _find_model_file/_klein_unet_folders reasoning): a loose 'qwen' match would
-# just as easily grab Z-Image's qwen3vl_* or the base (non-Edit) Qwen-Image
-# text encoder/UNET sitting in the same shared folder.
-_CANONICAL_UNET = 'Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors'
-_CANONICAL_VAE = 'qwen_image_vae.safetensors'
-_CANONICAL_TEXT_ENCODER = 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
+# Multi-angle LoRA: the one asset that stays specific to THIS engine (no role
+# outside camera rotation) — everything else (UNET/VAE/TE/consistency/
+# Lightning) is resolved from the SHARED qwen_edit_assets module (Wave 4) so
+# this engine and the general-purpose "Generate variations" Qwen Edit engine
+# resolve the identical files, never asking the user to configure them twice.
 _CANONICAL_MULTIANGLE_LORA = 'qwen-image-edit-2511-multiple-angles-lora.safetensors'
-_CANONICAL_CONSISTENCY_LORA = 'consistence_edit_v2.safetensors'
-_CANONICAL_LIGHTNING_LORA = 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
-
-_UNET_TOKENS = ('qwen-image-edit-2511', 'qwen_image_edit_2511', 'qwen-image-edit', 'qwen_image_edit')
-_VAE_TOKENS = ('qwen_image_vae', 'qwen-image-vae')
-_TEXT_ENCODER_TOKENS = ('qwen_2.5_vl', 'qwen2.5_vl', 'qwen_2_5_vl')
 
 
 class QwenMultiangleModelsMissing(Exception):
@@ -68,126 +58,37 @@ class QwenMultiangleModelsMissing(Exception):
         super().__init__('Qwen multi-angle models missing: ' + ', '.join(self.missing))
 
 
-_FOLDER_DISCOVERY_TOKENS = ('qwen',)   # broad: real installs just use one 'QwenImage' folder
-
-
-def _model_folders(comfy_type):
-    """(prefix, [model files]) candidates for a model of `comfy_type` across every
-    search root: every subfolder whose NAME contains a broad 'qwen' token (real
-    installs use one shared 'QwenImage' folder for base + Edit + everything else,
-    unlike Klein's own dedicated 'klein' folder), plus the root's own top-level
-    files unfiltered — callers apply their own NARROW file-level token filter to
-    tell apart what's actually inside (e.g. Qwen-Image-Edit-2511 vs. the base
-    Qwen-Image checkpoint, or the multi-angle LoRA vs. an unrelated one)."""
-    out = []
-    for base_dir in comfy_model_paths.search_roots(comfy_type):
-        try:
-            entries = os.listdir(base_dir)
-        except OSError:
-            continue
-        subs = sorted(d for d in entries
-                      if any(tok in d.lower() for tok in _FOLDER_DISCOVERY_TOKENS)
-                      and os.path.isdir(os.path.join(base_dir, d)))
-        for sub in subs:
-            try:
-                names = sorted(n for n in os.listdir(os.path.join(base_dir, sub))
-                               if n.lower().endswith(_MODEL_SUFFIXES))
-            except OSError:
-                continue
-            if names:
-                out.append((sub, names))
-        root_names = sorted(n for n in entries
-                            if n.lower().endswith(_MODEL_SUFFIXES)
-                            and os.path.isfile(os.path.join(base_dir, n)))
-        if root_names:
-            out.append(('', root_names))
-    return out
-
-
-def _resolve_model(comfy_type, canonical, file_tokens, selected=None):
-    """ComfyUI-relative loader value for a model of `comfy_type`, or None if
-    nothing matches. Returns the value WITH its subfolder prefix (e.g.
-    'QwenImage\\Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors'). Preference: the
-    caller's choice, then the canonical filename, then a NARROW file-name token
-    match — never a blind first-file guess, since the folder name alone can't
-    discriminate a shared 'QwenImage' folder the way Klein's dedicated folder does."""
-    folders = _model_folders(comfy_type)
-    if not folders:
-        return None
-    bare_pick = os.path.basename(selected) if selected else None
-    if bare_pick:
-        for sub, names in folders:
-            if bare_pick in names:
-                return os.path.join(sub, bare_pick)
-    for sub, names in folders:
-        if canonical in names:
-            return os.path.join(sub, canonical)
-    for sub, names in folders:
-        for n in names:
-            if any(tok in n.lower() for tok in file_tokens):
-                return os.path.join(sub, n)
-    return None
-
+# --- Asset resolution: thin delegators to the shared qwen_edit_assets module
+# (Wave 4) for everything except the multi-angle LoRA, which stays local since
+# it has no purpose outside this engine. Public names kept EXACTLY as before
+# (capabilities.py and test_qwen_multiangle.py reference them) — behavior is
+# unchanged, only the implementation moved.
 
 def resolve_qwen_ma_unet(selected=None):
     """`unet_name` for node 108."""
-    return _resolve_model('diffusion_models', _CANONICAL_UNET, _UNET_TOKENS, selected)
+    return qea.resolve_unet(selected)
 
 
 def resolve_qwen_ma_vae():
     """`vae_name` for node 95."""
-    return _resolve_model('vae', _CANONICAL_VAE, _VAE_TOKENS)
+    return qea.resolve_vae()
 
 
 def resolve_qwen_ma_text_encoder():
-    """`clip_name` for node 93. NEVER a bare 'qwen' match — the base (non-Edit)
-    Qwen-Image text encoder and Z-Image's qwen3vl_* live in the same folder."""
-    return _resolve_model('text_encoders', _CANONICAL_TEXT_ENCODER, _TEXT_ENCODER_TOKENS)
-
-
-def _lora_abs(rel_name):
-    """Absolute path of a loras-relative name under the FIRST loras search root
-    that holds it, else None (mirrors klein_edit_helper._lora_abs)."""
-    if not rel_name:
-        return None
-    for root in comfy_model_paths.search_roots('loras'):
-        cand = os.path.join(root, rel_name)
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
-def _resolve_lora(canonical, file_tokens):
-    """(relative_name, absolute_path) of a configurable LoRA, resolved like the
-    UNET/VAE/text-encoder above (canonical-first, narrow file-token fallback)
-    rather than a free-text config path — none of these files are
-    auto-downloaded by this app, so a stale config value must not silently
-    point at nothing."""
-    folders = _model_folders('loras')
-    if not folders:
-        return None, None
-    for sub, names in folders:
-        if canonical in names:
-            rel = os.path.join(sub, canonical)
-            return rel, _lora_abs(rel)
-    for sub, names in folders:
-        for n in names:
-            if any(tok in n.lower() for tok in file_tokens):
-                rel = os.path.join(sub, n)
-                return rel, _lora_abs(rel)
-    return None, None
+    """`clip_name` for node 93."""
+    return qea.resolve_text_encoder()
 
 
 def resolve_qwen_ma_multiangle_lora():
-    return _resolve_lora(_CANONICAL_MULTIANGLE_LORA, ('multiple-angles', 'multiple_angles'))
+    return qea._resolve_lora(_CANONICAL_MULTIANGLE_LORA, ('multiple-angles', 'multiple_angles'))
 
 
 def resolve_qwen_ma_consistency_lora():
-    return _resolve_lora(_CANONICAL_CONSISTENCY_LORA, ('consistence_edit', 'consistency_edit'))
+    return qea.resolve_consistency_lora()
 
 
 def resolve_qwen_ma_lightning_lora():
-    return _resolve_lora(_CANONICAL_LIGHTNING_LORA, ('lightning',))
+    return qea.resolve_lightning_lora()
 
 
 def qwen_ma_missing_assets():
@@ -214,15 +115,15 @@ def qwen_ma_missing_assets():
 
 
 # Minimum plausible on-disk size per asset, for model_integrity's advisory
-# `too_small` floor — deliberately conservative (well under the real size) so
-# it never cries wolf on a legitimate file. Mirrors klein_edit_helper.KLEIN_MIN_BYTES.
+# `too_small` floor. The 4 shared assets delegate to qea.QWEN_EDIT_MIN_BYTES;
+# only the multi-angle LoRA's floor is local.
 QWEN_MA_MIN_BYTES = {
-    'qwen_ma_unet': 1024 ** 3,               # 1 GB   (fp8 20B DiT is much larger)
-    'qwen_ma_text_encoder': 512 * 1024 ** 2,  # 512 MB (Qwen2.5-VL-7B fp8 is several GB)
-    'qwen_ma_vae': 8 * 1024 ** 2,             # 8 MB
+    'qwen_ma_unet': qea.QWEN_EDIT_MIN_BYTES['unet'],
+    'qwen_ma_text_encoder': qea.QWEN_EDIT_MIN_BYTES['text_encoder'],
+    'qwen_ma_vae': qea.QWEN_EDIT_MIN_BYTES['vae'],
     'qwen_ma_multiangle_lora': 512 * 1024,    # 512 KB
-    'qwen_ma_consistency_lora': 512 * 1024,
-    'qwen_ma_lightning_lora': 512 * 1024,
+    'qwen_ma_consistency_lora': qea.QWEN_EDIT_MIN_BYTES['consistency_lora'],
+    'qwen_ma_lightning_lora': qea.QWEN_EDIT_MIN_BYTES['lightning_lora'],
 }
 
 

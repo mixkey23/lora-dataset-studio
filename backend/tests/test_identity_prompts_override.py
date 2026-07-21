@@ -50,7 +50,8 @@ def test_identity_prompt_defaults_returns_all_four_constants():
     d = fv.identity_prompt_defaults()
     assert d == {'face_single': fv.IDENTITY_GUARD, 'face_multi': fv.IDENTITY_GUARD_MULTI,
                  'klein_identity': fv.IDENTITY_GUARD_KLEIN,
-                 'klein_improve': fv.KLEIN_IMAGE_IMPROVE_PROMPT}
+                 'klein_improve': fv.KLEIN_IMAGE_IMPROVE_PROMPT,
+                 'qwen_edit_identity': fv.IDENTITY_GUARD_QWEN_EDIT}
     # a copy, not the live registry — a mutating caller cannot corrupt defaults
     d['face_single'] = 'x'
     assert fv.identity_prompt_default('face_single') == fv.IDENTITY_GUARD
@@ -107,7 +108,8 @@ def test_config_defaults_are_additive_and_blank():
     from app.config import DEFAULTS
     ip = DEFAULTS['identity_prompts']
     assert ip == {'face_single': '', 'face_multi': '', 'klein_identity': '',
-                  'klein_improve': '', 'klein_improve_enabled': True}
+                  'klein_improve': '', 'klein_improve_enabled': True,
+                  'qwen_edit_identity': ''}
 
 
 # --- D: Klein-improve toggle + override (service path) -----------------------

@@ -126,7 +126,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const addCustomShot = () => {
     const p = customPrompt.trim();
     if (!p) return;
-    const hot = nsfwMode && isKlein;
+    const hot = nsfwMode && isLocal;
     const shot = { id: `custom_${Date.now()}`, label: `${hot ? '🔞' : '✨'} ${p.slice(0, 40)}`,
                    prompt: p, framing: customFraming, nsfw: hot };
     setCustomShots((s) => [...s, shot]);
@@ -172,11 +172,16 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   }, [generator]);
   const isNB = generator === 'nanobanana';
   const isGPT = generator === 'chatgpt';
-  const isKlein = !isNB && !isGPT;
+  const isQwenEdit = generator === 'qwen_edit';
+  const isKlein = !isNB && !isGPT && !isQwenEdit;
+  // Generic "runs locally on ComfyUI" checks (NSFW eligibility, the consistency-
+  // LoRA auto-skip, the cost estimate) apply to EITHER local engine; Klein-
+  // specific UI (its model picker, its own tuning panel) stays `isKlein`-only.
+  const isLocal = isKlein || isQwenEdit;
 
   // Which engines the user actually enabled in Settings (config.engines.enabled),
   // on top of the live reachability probe in `caps.engines`.
-  const [enabledEngines, setEnabledEngines] = useState(['nanobanana', 'chatgpt', 'klein']);
+  const [enabledEngines, setEnabledEngines] = useState(['nanobanana', 'chatgpt', 'klein', 'qwen_edit']);
   // ChatGPT auth lane (auto|api|subscription) — decides whether the card shows a
   // per-image API price or "uses your ChatGPT subscription quota".
   const [chatgptAuth, setChatgptAuth] = useState('auto');
@@ -196,7 +201,8 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const nbAvailable = enabledEngines.includes('nanobanana') && caps.engines.nanobanana;
   const gptAvailable = enabledEngines.includes('chatgpt') && caps.engines.chatgpt;
   const klAvailable = enabledEngines.includes('klein') && caps.engines.klein;
-  const currentAvailable = isKlein ? klAvailable : isNB ? nbAvailable : gptAvailable;
+  const qeAvailable = enabledEngines.includes('qwen_edit') && caps.engines.qwen_edit;
+  const currentAvailable = isKlein ? klAvailable : isQwenEdit ? qeAvailable : isNB ? nbAvailable : gptAvailable;
 
   // The persisted generator can point at an engine that has since been
   // disabled in Settings (or lost its key/backend): auto-switch to the first
@@ -204,9 +210,9 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   // regenerate, which follows the persisted selection.
   useEffect(() => {
     if (currentAvailable) return;
-    const first = nbAvailable ? 'nanobanana' : gptAvailable ? 'chatgpt' : klAvailable ? 'klein' : null;
+    const first = nbAvailable ? 'nanobanana' : gptAvailable ? 'chatgpt' : klAvailable ? 'klein' : qeAvailable ? 'qwen_edit' : null;
     if (first && first !== generator) setGenerator(first);
-  }, [currentAvailable, nbAvailable, gptAvailable, klAvailable, generator]);
+  }, [currentAvailable, nbAvailable, gptAvailable, klAvailable, qeAvailable, generator]);
   // Effective ChatGPT lane: the subscription (ChatGPT Plus/Pro image quota) vs the
   // pay-per-use API key. Mirrors the backend "auto = subscription when connected".
   const gptSub = caps.chatgpt_subscription || {};
@@ -229,6 +235,15 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
     : !enabledEngines.includes('klein') ? '⚠ Klein is disabled in Settings (engines)'
     : !caps.comfyui?.reachable ? '⚠ Configure ComfyUI in Settings'
     : kleinAssetHint;
+  // Same three-cause pattern for the Qwen Edit card.
+  const qwenEditMissingWords = kleinMissingLabels(caps.comfyui?.qwen_edit_missing);
+  const qwenEditAssetHint = qwenEditMissingWords.length
+    ? `⚠ Qwen-Image-Edit ${qwenEditMissingWords.join(' + ')} missing — download it in the Setup step`
+    : '⚠ Qwen-Image-Edit model missing — see Settings ▸ Engines';
+  const qwenEditHint = qeAvailable ? null
+    : !enabledEngines.includes('qwen_edit') ? '⚠ Qwen Edit is disabled in Settings (engines)'
+    : !caps.comfyui?.reachable ? '⚠ Configure ComfyUI in Settings'
+    : qwenEditAssetHint;
 
   useEffect(() => {
     let cancelled = false;
@@ -262,13 +277,13 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   // Switching to an API engine drops any selected NSFW shots (Klein-only) —
   // catalog nsfw_ entries AND 🔞 custom cards alike.
   useEffect(() => {
-    if (isKlein) return;
+    if (isLocal) return;
     const hotCustom = new Set(customShots.filter((c) => c.nsfw).map((c) => c.id));
     setSelected((s) => {
       const n = new Set([...s].filter((id) => !id.startsWith('nsfw_') && !hotCustom.has(id)));
       return n.size === s.size ? s : n;
     });
-  }, [isKlein, customShots]);
+  }, [isLocal, customShots]);
 
   // "Already in the dataset" per variation label: live images (kept, pending or
   // still generating — not failed/rejected) → the green ✓×N state on the cards.
@@ -401,16 +416,16 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const go = async () => {
     const variations = catalog.filter((e) => selected.has(e.id))
       .map((e) => ({ label: e.label, prompt: e.prompt, framing: e.framing }));
-    // NSFW shots: local Klein only (the toggle is gated on the Klein engine,
+    // NSFW shots: local engines only (the toggle is gated on a local engine,
     // and the backend refuses them on API engines).
-    if (nsfwMode && isKlein) {
+    if (nsfwMode && isLocal) {
       variations.push(...nsfwCatalog.filter((e) => selected.has(e.id))
         .map((e) => ({ label: e.label, prompt: e.prompt, framing: e.framing, nsfw: true })));
     }
-    // Custom cards: selectable like catalog shots; 🔞 ones only ride with Klein
-    // (the label prefix is what regenerate uses to re-pick the uncensored wrapper).
+    // Custom cards: selectable like catalog shots; 🔞 ones only ride with a local
+    // engine (the label prefix is what regenerate uses to re-pick the uncensored wrapper).
     variations.push(...customShots
-      .filter((c) => selected.has(c.id) && (isKlein || !c.nsfw))
+      .filter((c) => selected.has(c.id) && (isLocal || !c.nsfw))
       .map((c) => ({ label: c.label, prompt: c.prompt, framing: c.framing,
                      ...(c.nsfw ? { nsfw: true } : {}) })));
     if (!variations.length) return;
@@ -473,7 +488,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
           where the images are made — Klein runs free on your GPU · APIs bill per image (or use your ChatGPT subscription)
         </span>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
         <button type="button" onClick={() => setGenerator('klein')} aria-pressed={isKlein}
           disabled={!klAvailable || !!generating}
           title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
@@ -496,6 +511,34 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
               <a href="#/setup" onClick={(e) => e.stopPropagation()}
                 className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
                 {kleinHint}
+              </a>
+            )}
+          </span>
+        </button>
+        <button type="button" onClick={() => setGenerator('qwen_edit')} aria-pressed={isQwenEdit}
+          disabled={!qeAvailable || !!generating}
+          title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
+          className={`flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isQwenEdit
+            ? 'border-fuchsia-400/60 bg-fuchsia-500/15 ring-1 ring-fuchsia-400/40'
+            : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
+          <span className="w-9 h-9 shrink-0 grid place-items-center text-2xl" aria-hidden="true">🎨</span>
+          <span className="flex flex-col gap-1 min-w-0">
+            <span className={`text-[0.8125rem] font-semibold ${isQwenEdit ? 'text-white' : 'text-content-muted'}`}>
+              Qwen Edit <span className="font-normal text-content-subtle">· local</span>
+            </span>
+            <span className="flex flex-wrap gap-1">
+              <span className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>
+              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>
+              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>
+            </span>
+            {qeAvailable ? (
+              <span className="text-content-subtle text-[0.625rem]">
+                Qwen-Image-Edit-2511 — a different base model than Klein, useful for non-photoreal render styles.
+              </span>
+            ) : (
+              <a href="#/setup" onClick={(e) => e.stopPropagation()}
+                className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
+                {qwenEditHint}
               </a>
             )}
           </span>
@@ -729,7 +772,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
               {customShots.map((c) => {
                 const on = selected.has(c.id);
                 const done = doneByLabel.get(c.label) || 0;
-                const blocked = c.nsfw && !isKlein;   // 🔞 card while an API engine is active
+                const blocked = c.nsfw && !isLocal;   // 🔞 card while an API engine is active
                 const cls = on
                   ? 'bg-primary/20 border-primary/50 text-white ring-1 ring-primary/30'
                   : done > 0
@@ -739,7 +782,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                   <div key={c.id} className={`relative flex items-center gap-1.5 px-1.5 py-1 rounded-lg text-[0.625rem] border transition-colors ${cls} ${blocked ? 'opacity-40' : ''}`}>
                     <button type="button" onClick={() => !blocked && toggle(c.id)} aria-pressed={on}
                       disabled={blocked}
-                      title={blocked ? '🔞 shot — switch the generator to Klein' : c.prompt}
+                      title={blocked ? '🔞 shot — switch the generator to a local engine' : c.prompt}
                       className="flex items-center gap-1.5 flex-1 min-w-0 text-left disabled:cursor-not-allowed">
                       <ShotIllustration framing={c.framing} label={c.label} className="w-7 h-7 shrink-0" />
                       <span className="min-w-0 leading-tight truncate">{c.label}</span>
@@ -761,9 +804,9 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         )}
       </div>
 
-      {/* 🔞 NSFW — local Klein only. Uncensored body catalog + free prompt.
+      {/* 🔞 NSFW — local engines only. Uncensored body catalog + free prompt.
           Never offered on the API engines (and the backend refuses them there). */}
-      {isKlein && klAvailable && (
+      {isLocal && currentAvailable && (
         <div className={`rounded-lg border p-2 flex flex-col gap-2 ${nsfwMode
           ? 'border-rose-500/40 bg-rose-500/5' : 'border-border bg-app/30'}`}>
           <button type="button" onClick={() => setNsfwMode((v) => !v)} aria-pressed={nsfwMode}
@@ -823,7 +866,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
           ✨ Custom shot
           <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
-            write your own prompt — it becomes a reusable card in the Custom group above{nsfwMode && isKlein ? ' — 🔞 register active' : ''}
+            write your own prompt — it becomes a reusable card in the Custom group above{nsfwMode && isLocal ? ' — 🔞 register active' : ''}
           </span>
         </summary>
         <div className="px-2.5 pt-1 flex flex-col gap-1">
@@ -975,6 +1018,52 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                   </ol>
                 )
               )}
+            </div>
+          </div>
+        </details>
+      )}
+
+      {/* Qwen Edit-only tuning: consistency-LoRA strength (shares the same
+          slider state Klein's panel uses — both engines take the identical
+          `lora_strength` field on the wire). No model picker: the UNET/VAE/TE
+          are auto-resolved by filename scan (Wave 1's Qwen Multi-angle already
+          established that pattern). The Lightning speed toggle is Settings-only
+          (config.qwen_edit.lightning_enabled) — no per-run override yet. */}
+      {isQwenEdit && qeAvailable && (
+        <details className="rounded-lg border border-border bg-app/30 open:pb-2">
+          <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
+            🎨 Qwen Edit tuning
+            <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
+              consistency LoRA {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
+            </span>
+          </summary>
+          <div className="px-2.5 pt-1 flex flex-col gap-2">
+            <div className="flex flex-col gap-0.5">
+              <label className="flex items-center gap-2 text-content-muted text-[0.6875rem]">
+                <span className="whitespace-nowrap">
+                  Consistency LoRA: {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
+                </span>
+                <input type="range" min={0} max={1.2} step={0.05} value={loraStrength}
+                  onChange={(e) => { loraTouchedRef.current = true; setLoraStrength(Number(e.target.value)); }}
+                  aria-label="Consistency LoRA strength"
+                  className="flex-1 min-w-[120px] accent-fuchsia-500" />
+              </label>
+              <p className="text-content-subtle text-[0.625rem]">
+                Anchors structure during the edit, same role as Klein's own consistency LoRA —
+                ~0.5 balanced · lower for bigger restagings · 0 = off.
+              </p>
+              {renderStyle !== 'photoreal' && (
+                <p className="text-amber-300/90 text-[0.625rem]">
+                  This dataset targets a non-photoreal render style: the consistency LoRA is
+                  skipped automatically unless you set a strength above by hand.
+                </p>
+              )}
+              <p className="text-content-subtle text-[0.625rem]">
+                Lightning (speed) LoRA and the exact model file are configured in{' '}
+                <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
+                  Settings › Image engines
+                </a>.
+              </p>
             </div>
           </div>
         </details>

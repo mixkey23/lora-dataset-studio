@@ -58,10 +58,19 @@ IDENTITY_GUARD_KLEIN = (
     f"{_IDENTITY_GUARD_KLEIN_BASE} Sharp focus, natural skin texture with visible "
     "pores, realistic lighting with soft shadows, high detail.")
 
+# Qwen-Image-Edit-2511 restage + face-identity block (see
+# wrap_variation_qwen_edit, Wave 4) — same instruction-edit shape as Klein's
+# own (neither guard names its engine in the text, so the wording transfers
+# as-is to a second edit-capable model), held separately so it gets its own
+# editable Settings override, independent of Klein's.
+_IDENTITY_GUARD_QWEN_EDIT_BASE = _IDENTITY_GUARD_KLEIN_BASE
+IDENTITY_GUARD_QWEN_EDIT = IDENTITY_GUARD_KLEIN
+
 _GUARD_BASE_BY_KIND = {
     'face_single': _IDENTITY_GUARD_BASE,
     'face_multi': _IDENTITY_GUARD_MULTI_BASE,
     'klein_identity': _IDENTITY_GUARD_KLEIN_BASE,
+    'qwen_edit_identity': _IDENTITY_GUARD_QWEN_EDIT_BASE,
 }
 
 # Wave 3 follow-up: the tail swap alone left the identity-lock BODY itself
@@ -101,6 +110,7 @@ _GUARD_BASE_STYLED_BY_KIND = {
     'face_single': _IDENTITY_GUARD_BASE_STYLED,
     'face_multi': _IDENTITY_GUARD_MULTI_BASE_STYLED,
     'klein_identity': _IDENTITY_GUARD_KLEIN_BASE_STYLED,
+    'qwen_edit_identity': _IDENTITY_GUARD_KLEIN_BASE_STYLED,
 }
 
 # Fixed instruction for the manual "Klein upscale & improve" action. Lives here
@@ -119,12 +129,14 @@ KLEIN_IMAGE_IMPROVE_PROMPT = (
 # byte-identical to the pre-feature behaviour (the reproducibility invariant the
 # existing wrapper tests lock). The config read is lazy: this module stays
 # import-pure (no Flask), and a caller with no config configured gets the default.
-IDENTITY_PROMPT_KINDS = ('face_single', 'face_multi', 'klein_identity', 'klein_improve')
+IDENTITY_PROMPT_KINDS = ('face_single', 'face_multi', 'klein_identity', 'klein_improve',
+                         'qwen_edit_identity')
 _IDENTITY_PROMPT_DEFAULTS = {
     'face_single': IDENTITY_GUARD,
     'face_multi': IDENTITY_GUARD_MULTI,
     'klein_identity': IDENTITY_GUARD_KLEIN,
     'klein_improve': KLEIN_IMAGE_IMPROVE_PROMPT,
+    'qwen_edit_identity': IDENTITY_GUARD_QWEN_EDIT,
 }
 
 
@@ -305,6 +317,42 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
     # identity block drops its own trailing photographic clause instead of
     # repeating the same wording twice.
     identity_block = _style_aware_identity('klein_identity', render_style, include_tail=not tail)
+    return (
+        f"Create a new {subject} of the same {noun} as the reference image: {_append_suffix(prompt, suffix)}. "
+        + (f"{detail} " if detail else "")
+        + f"{identity_block} {ending}")
+
+
+def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | None = None,
+                             suffix: str = '', render_style: str = 'photoreal') -> str:
+    """Qwen-Image-Edit-2511 (Wave 4) is, like Klein, an INSTRUCTION-edit model
+    (native `TextEncodeQwenImageEditPlus`/Kontext-lineage reference
+    conditioning) — same command-first structure as wrap_variation_klein()
+    for the same reason (a preservation-order-first wrapper reads as "change
+    nothing" to an edit model). The framing-specific detail
+    (`_KLEIN_FRAMING_DETAIL`, reused as-is) and the non-Lightning step/cfg
+    fallback are EXTRAPOLATED from Klein's own research — there is no prior
+    prompt-tuning study for this engine yet, flag any retuning need honestly
+    once real output is reviewed.
+    `nsfw=True` (local-only, same fail-closed rule as Klein: the route refuses
+    NSFW on API engines) drops the SFW clamp.
+    `render_style='photoreal'` (default) still applies the style tail/subject
+    swap exactly like Klein's wrapper — there is no "photoreal default" to
+    preserve here (this is a brand-new wrapper), the render_style plumbing is
+    simply reused unchanged (Wave 3's `_style_aware_identity`/
+    `generation_tail_for`)."""
+    tail = generation_tail_for(render_style)
+    detail = _KLEIN_FRAMING_DETAIL.get(framing or '', '')
+    if tail:
+        subject, noun = 'image', 'character'
+        ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {tail}"
+                  if nsfw else f"{tail} SFW.")
+    else:
+        subject, noun = 'photograph', 'person'
+        ending = ("Explicit nudity is allowed; render natural, anatomically correct forms. "
+                  "Professional realistic photograph.") if nsfw else \
+                 "Professional realistic photograph, SFW."
+    identity_block = _style_aware_identity('qwen_edit_identity', render_style, include_tail=not tail)
     return (
         f"Create a new {subject} of the same {noun} as the reference image: {_append_suffix(prompt, suffix)}. "
         + (f"{detail} " if detail else "")

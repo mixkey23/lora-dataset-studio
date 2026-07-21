@@ -829,6 +829,19 @@ def probe(force=False) -> dict:
                      and bool(_qmh.resolve_qwen_ma_text_encoder())
                      and bool(_qmh.resolve_qwen_ma_multiangle_lora()[1])
                      and not qwen_ma_blocking_invalid)
+    # Qwen Edit engine (Wave 4) — the general-purpose "Generate variations"
+    # peer of Klein. THREE required components (no extra LoRA needed, unlike
+    # Qwen Multi-angle) — same honest, resolver-driven readiness pattern.
+    from .services import qwen_edit_helper as _qeh
+    from .services import qwen_edit_assets as _qea
+    qwen_edit_missing = _qeh.qwen_edit_missing_assets()
+    qwen_edit_invalid = _qeh.qwen_edit_invalid_assets()
+    qwen_edit_blocking_invalid = any(
+        i['blocking'] and i['asset'] in _qeh.QWEN_EDIT_REQUIRED for i in qwen_edit_invalid)
+    qwen_edit_ready = (comfy['ok'] and bool(_qea.resolve_unet())
+                       and bool(_qea.resolve_vae())
+                       and bool(_qea.resolve_text_encoder())
+                       and not qwen_edit_blocking_invalid)
     base_dir = cfg.get('comfyui.base_dir') or ''
     comfy_dir = resolve_comfyui_base(base_dir)
     # Conscious "continue without ComfyUI" skip (Setup wizard). DERIVED, not just the
@@ -849,6 +862,7 @@ def probe(force=False) -> dict:
             'chatgpt': openai_['ok'],
             'klein': klein_ready,
             'qwen_multiangle': qwen_ma_ready,
+            'qwen_edit': qwen_edit_ready,
         },
         'chatgpt_subscription': {
             'connected': sub_status['connected'],
@@ -884,6 +898,10 @@ def probe(force=False) -> dict:
             # the optional consistency/Lightning LoRAs).
             'qwen_ma_missing': qwen_ma_missing,
             'qwen_ma_invalid': qwen_ma_invalid,
+            # Same shape, for the Qwen Edit engine's three required assets
+            # (unet/text-encoder/vae) plus the optional consistency/Lightning LoRAs.
+            'qwen_edit_missing': qwen_edit_missing,
+            'qwen_edit_invalid': qwen_edit_invalid,
         },
         'ollama': {
             'reachable': ollama['ok'],

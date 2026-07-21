@@ -118,6 +118,12 @@ class FaceDatasetImage(db.Model):
     job_id = db.Column(String(36), nullable=True, index=True)
     variation_prompt = db.Column(String(500), nullable=True)    # RAW catalog prompt (regenerate)
     klein_model = db.Column(String(255), nullable=True)         # UNET used (regenerate)
+    # Which LOCAL edit engine produced this row (Wave 4): NULL/'klein' (historical
+    # default — every row before this column existed was Klein or an API engine,
+    # the latter already distinguished via klein_model in API_ENGINES) or
+    # 'qwen_edit'. Regenerate reads this to route to the right enqueue function
+    # instead of assuming Klein for any non-API row. Additive migration in create_app.
+    generation_engine = db.Column(String(16), nullable=True)
     # Provenance for derived dataset images. Small scraped sources rescued through
     # Klein keep their own row/file and the generated candidate points back to it;
     # both stay outside training until the user resolves the pair explicitly.
