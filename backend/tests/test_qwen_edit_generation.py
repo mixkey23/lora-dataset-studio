@@ -326,7 +326,11 @@ def test_enqueue_sets_prompt_negative_source_and_model_files(app, tmp_path, monk
         # dynamic aspect-ratio sizing stays wired statically (GetImageSize -> EmptyLatentImage)
         assert wf['33']['inputs']['width'] == ['40', 0]
         assert wf['33']['inputs']['height'] == ['40', 1]
-        assert wf['40']['inputs']['image'] == ['8', 0]
+        # GetImageSize reads the ORIGINAL loaded image (39), not node 8's
+        # output — QwenEditAdaptiveLongestEdge outputs an INT (the computed
+        # longest-edge size, already consumed as ref_longest_edge by node 13),
+        # not a resized IMAGE (a real ComfyUI validation error caught this).
+        assert wf['40']['inputs']['image'] == ['39', 0]
         assert captured['metadata']['model_name'] == 'qwen_edit_dataset'
         assert wf['38']['inputs']['filename_prefix'].startswith('local_QwenEdit_')
         # no consistency LoRA node in this graph

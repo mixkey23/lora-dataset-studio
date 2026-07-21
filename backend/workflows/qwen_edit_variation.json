@@ -144,7 +144,7 @@
   },
   "40": {
     "inputs": {
-      "image": ["8", 0]
+      "image": ["39", 0]
     },
     "class_type": "GetImageSize",
     "_meta": {"title": "Get Image Size (matches the reference's aspect ratio)"}
