@@ -283,12 +283,19 @@ def test_wrap_variation_qwen_edit_photoreal_has_no_style_clause(app):
         assert out.rstrip().endswith('Keep everything else the same.')
 
 
-def test_wrap_variation_qwen_edit_non_photoreal_appends_short_style_note(app):
+def test_wrap_variation_qwen_edit_render_style_adds_no_positive_clause(app):
+    """Repo owner feedback, confirmed against real output: this is an EDIT
+    model — the reference image already carries the target aesthetic, so a
+    render_style style clause in the POSITIVE prompt is redundant (or fights
+    the edit). render_style must produce byte-identical output regardless of
+    value (it still drives the separate negative prompt, untouched here)."""
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
-        out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust',
-                                       render_style='anime_2d')
-        assert 'cel-shaded 2D anime' in out
+        photoreal = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
+        for style in ('render_3d', 'anime_2d', 'cartoon_semireal', 'illustration', 'custom'):
+            out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust',
+                                           render_style=style)
+            assert out == photoreal
 
 
 def test_wrap_variation_qwen_edit_nsfw_adds_explicit_nudity_note(app):

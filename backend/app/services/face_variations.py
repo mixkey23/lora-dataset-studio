@@ -348,20 +348,24 @@ def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | Non
     with wrap_variation_klein but unused: framing is described inline in the
     instruction text itself.
     `nsfw=True` (local-only, same fail-closed rule as Klein) adds a short
-    explicit-nudity clause. `render_style` appends a short style note only
-    when non-photoreal (Wave 3's `generation_tail_for`; None for photoreal —
-    the reference photo already IS photoreal, no need to state it, matching
-    what the winning test prompt did: no style clause at all).
+    explicit-nudity clause. NO style/render_style clause is added here
+    (repo owner feedback, confirmed against real output): the reference
+    image already carries the target aesthetic (photoreal, anime, 3D
+    render...) — this is an EDIT model, it adapts that existing style to
+    the new shot on its own; stating a style tail in the prompt was
+    redundant at best and fought the edit at worst. `render_style` is kept
+    as a parameter for signature symmetry with wrap_variation_klein and
+    because it still drives the (separate) negative prompt
+    (generation_negative_for) and the other engines' wrappers, but it is
+    NOT read here.
     IDENTITY_GUARD_QWEN_EDIT's default is now the short "Keep everything else
     the same." (was a multi-clause identity paragraph) — still overridable
     via Settings ▸ identity_prompts.qwen_edit_identity."""
     identity = get_identity_prompt('qwen_edit_identity')
-    tail = generation_tail_for(render_style)
-    style_note = f' {tail}' if tail else ''
     nsfw_note = ' Explicit nudity and natural anatomy are allowed.' if nsfw else ''
     return (
         f"Keep the same character identity. The character is {_append_suffix(prompt, suffix)}. "
-        f"{identity}{style_note}{nsfw_note}")
+        f"{identity}{nsfw_note}")
 
 
 # --- Anti-fuite tenue / expression (constat terrain 2026-07-14) ---------------
@@ -626,11 +630,15 @@ _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
 # the target pose/outfit/setting directly, on the SAME shot with the SAME
 # reference. Every entry here follows that pattern — "{pose/action}, {outfit
 # change 'distinct from image 1' when relevant}, {setting}" — completing "The
-# character is ___." No camera-equipment wording, no "full-length shot"/
-# "half-length portrait" framing-jargon phrases (framing instead comes from a
-# short natural viewpoint cue only where it's not otherwise inferable: face
-# close-ups and the back view; bust/body entries rely on the pose itself, per
-# the tested example). "distinct from image 1" (not "the reference") names
+# character is ___." No camera-equipment wording ("full-length shot"/"half-
+# length portrait"/lens references) — but EVERY entry still states its
+# camera angle/framing in plain language ("in a close-up of the face",
+# "seen from the waist up", "in a full-body view", "seen from behind"): the
+# app can't assume the dataset's single reference photo already matches a
+# given shot's target framing, so it can't be left implicit (a first attempt
+# dropped it for bust/body entries because ONE tested example happened to
+# already be a full-body reference — corrected after repo owner feedback).
+# "distinct from image 1" (not "the reference") names
 # TextEncodeQwenImageEditPlusCustom_lrzjason's own reference-image input slot,
 # which read more reliably in testing than a generic "the reference" phrase.
 # Keyed by the catalog's display LABEL (same join key prompt_by_label()/
@@ -694,39 +702,42 @@ QWEN_EDIT_CATALOG_PROMPTS = {
                            'golden-hour light, outdoors'),
     'Bust, swimsuit (beach)': ('seen from the waist up, wearing a bikini top, a sunny beach in the '
                                'background, bright daylight, a natural relaxed pose'),
-    # --- Body (no explicit framing cue — the tested winning prompt was a body
-    # shot with none, relying on the pose alone) ---
-    'Body standing, front': 'standing, facing the camera, wearing casual clothes distinct from image 1, on a street',
-    'Body standing, three-quarter': 'standing, turned three-quarters, a distinct outfit from image 1, outdoors',
-    'Body sitting': 'sitting on a chair, a relaxed pose, indoors',
-    'Body walking': 'walking, a dynamic pose, with a city street in the background',
-    'Body, café': 'standing inside a café, warm ambient light',
-    'Body, beach (clothed)': 'standing on a beach, wearing summer casual clothes distinct from image 1, bright daylight',
-    'Body, wide urban shot': 'standing off-center within a wide urban plaza, with lots of background visible',
-    'Body walking, wide shot': 'walking across a wide street, a dynamic pose, with a wide cinematic view of the street',
-    'Body, outdoor landscape': 'standing outdoors with a wide natural landscape filling the background',
-    'Body sitting, wide terrace': 'sitting on a café terrace with a wide view of the surroundings, warm light',
-    'Body, wide open field': 'standing in an open field with a wide expanse of nature in the background, soft daylight',
-    'Body, bodycon dress': 'standing in an upscale hotel lobby, wearing a fitted bodycon evening dress, warm ambient light',
-    'Body, sportswear': 'wearing fitted athletic sportswear (leggings and a sports top), in a gym setting, a confident stance',
-    'Body, bikini beach': 'standing on a sunny beach, wearing a bikini, a natural relaxed pose, bright daylight',
-    'Body, swimsuit pool': 'standing at the edge of a swimming pool, wearing a one-piece swimsuit, summer daylight',
-    'Body, fitted jeans': 'wearing fitted high-waisted jeans and a tucked-in top, on an urban street, daylight',
-    'Body, backlit silhouette': ('backlit near a large window so the figure is outlined by rim light, '
-                                 'wearing an elegant fitted dress, in a moody interior'),
+    # --- Body (a short "in a full-body view" cue restored, Wave 4 follow-up:
+    # dropping it entirely worked in the ONE tested case only because that
+    # particular reference photo already happened to be a full-body shot —
+    # the app can't assume the reference matches the target framing, so
+    # every framing states its camera angle explicitly, same as face/bust/back) ---
+    'Body standing, front': 'in a full-body view, standing, facing the camera, wearing casual clothes distinct from image 1, on a street',
+    'Body standing, three-quarter': 'in a full-body view, standing, turned three-quarters, a distinct outfit from image 1, outdoors',
+    'Body sitting': 'in a full-body view, sitting on a chair, a relaxed pose, indoors',
+    'Body walking': 'in a full-body view, walking, a dynamic pose, with a city street in the background',
+    'Body, café': 'in a full-body view, standing inside a café, warm ambient light',
+    'Body, beach (clothed)': 'in a full-body view, standing on a beach, wearing summer casual clothes distinct from image 1, bright daylight',
+    'Body, wide urban shot': 'in a full-body view, standing off-center within a wide urban plaza, with lots of background visible',
+    'Body walking, wide shot': 'in a full-body view, walking across a wide street, a dynamic pose, with a wide cinematic view of the street',
+    'Body, outdoor landscape': 'in a full-body view, standing outdoors with a wide natural landscape filling the background',
+    'Body sitting, wide terrace': 'in a full-body view, sitting on a café terrace with a wide view of the surroundings, warm light',
+    'Body, wide open field': 'in a full-body view, standing in an open field with a wide expanse of nature in the background, soft daylight',
+    'Body, bodycon dress': 'in a full-body view, standing in an upscale hotel lobby, wearing a fitted bodycon evening dress, warm ambient light',
+    'Body, sportswear': 'in a full-body view, wearing fitted athletic sportswear (leggings and a sports top), in a gym setting, a confident stance',
+    'Body, bikini beach': 'in a full-body view, standing on a sunny beach, wearing a bikini, a natural relaxed pose, bright daylight',
+    'Body, swimsuit pool': 'in a full-body view, standing at the edge of a swimming pool, wearing a one-piece swimsuit, summer daylight',
+    'Body, fitted jeans': 'in a full-body view, wearing fitted high-waisted jeans and a tucked-in top, on an urban street, daylight',
+    'Body, backlit silhouette': ('in a full-body view, backlit near a large window so the figure is outlined '
+                                 'by rim light, wearing an elegant fitted dress, in a moody interior'),
     # --- Back (viewpoint stated — not otherwise inferable) ---
-    'Back, three-quarter': 'seen from behind at a three-quarter angle, showing the hairstyle and silhouette',
+    'Back, three-quarter': 'in a full-body view, seen from behind at a three-quarter angle, showing the hairstyle and silhouette',
     # --- NSFW (local Qwen Edit only, Rapid-AIO checkpoint) ---
     'Bust, lingerie': 'seen from the waist up, wearing delicate lace lingerie, a bedroom setting, soft window light',
     'Bust, topless': 'seen from the waist up, topless with the bare chest visible, a neutral indoor background, natural light',
     'Bust, towel': 'seen from the waist up, wrapped in a bath towel with bare shoulders, a bathroom setting, soft light',
-    'Body, lingerie standing': 'standing, wearing a matching lace lingerie set, in a bedroom interior, soft light',
-    'Body, nude standing': 'standing fully nude with natural anatomy, a relaxed pose, a neutral studio background, soft even light',
-    'Body, nude three-quarter': 'turned three-quarters, fully nude with natural anatomy, standing by a large window, soft daylight',
-    'Body, nude sitting on bed': 'sitting nude on the edge of a bed, a relaxed natural pose, warm bedroom light',
-    'Body, nude lying': 'lying nude on a bed on her side, natural anatomy, soft morning light',
-    'Body, nude shower': 'nude in the shower, wet skin and hair with visible water droplets, a glass and tile background',
-    'Back, nude': 'seen from behind, standing nude with the back and buttocks visible, natural anatomy, a neutral background',
+    'Body, lingerie standing': 'in a full-body view, standing, wearing a matching lace lingerie set, in a bedroom interior, soft light',
+    'Body, nude standing': 'in a full-body view, standing fully nude with natural anatomy, a relaxed pose, a neutral studio background, soft even light',
+    'Body, nude three-quarter': 'in a full-body view, turned three-quarters, fully nude with natural anatomy, standing by a large window, soft daylight',
+    'Body, nude sitting on bed': 'in a full-body view, sitting nude on the edge of a bed, a relaxed natural pose, warm bedroom light',
+    'Body, nude lying': 'in a full-body view, lying nude on a bed on her side, natural anatomy, soft morning light',
+    'Body, nude shower': 'in a full-body view, nude in the shower, wet skin and hair with visible water droplets, a glass and tile background',
+    'Back, nude': 'in a full-body view, seen from behind, standing nude with the back and buttocks visible, natural anatomy, a neutral background',
 }
 
 
