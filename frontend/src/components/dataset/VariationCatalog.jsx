@@ -142,7 +142,17 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   // lower = more variety in the generated variations.
   // dx8152 consistency LoRA: anchors STRUCTURE, its guide recommends ~0.5 and
   // warns 0.8-1.0 can stop edits from applying (0.9 made variations near-copies).
-  const [loraStrength, setLoraStrength] = useState(0.5);
+  // Wave 3 (render_style): this slider ALWAYS sends an explicit number (never
+  // omitted), so the backend's None-based auto-skip never fires for this path —
+  // the UI itself must default to 0 for a non-photoreal dataset instead.
+  // `photoreal` keeps the historical 0.5 default untouched.
+  const [loraStrength, setLoraStrength] = useState(renderStyle !== 'photoreal' ? 0 : 0.5);
+  // Only auto-reset the slider on a render_style change the user hasn't
+  // manually overridden — a deliberate touch always wins.
+  const loraTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!loraTouchedRef.current) setLoraStrength(renderStyle !== 'photoreal' ? 0 : 0.5);
+  }, [renderStyle]);
   // Optional generation-LoRA PRESETS (Idea by @waltm — Discord feature
   // request): the user's named combinations from Settings
   // (klein.generation_lora_presets). Per run the workspace just PICKS one —
@@ -903,7 +913,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                   Consistency LoRA: {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
                 </span>
                 <input type="range" min={0} max={1.2} step={0.05} value={loraStrength}
-                  onChange={(e) => setLoraStrength(Number(e.target.value))}
+                  onChange={(e) => { loraTouchedRef.current = true; setLoraStrength(Number(e.target.value)); }}
                   aria-label="Consistency LoRA strength"
                   className="flex-1 min-w-[120px] accent-indigo-500" />
               </label>
