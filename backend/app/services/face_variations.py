@@ -638,6 +638,15 @@ _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
 # given shot's target framing, so it can't be left implicit (a first attempt
 # dropped it for bust/body entries because ONE tested example happened to
 # already be a full-body reference — corrected after repo owner feedback).
+# For the SAME reason, EVERY entry also states a background/scene, even
+# entries that never needed one for Klein/API engines: this is an EDIT
+# model under a "keep everything else the same" instruction, so anything
+# NOT mentioned is genuinely PRESERVED from the reference rather than
+# invented — a reference photo with a plain studio background produced
+# every shot with that same plain background until this was caught (repo
+# owner, real ComfyUI test: consistent character/pose/expression, but the
+# background never varied). Klein/API engines don't have this failure mode
+# (their own generative bias fills unstated gaps with plausible variety).
 # "distinct from image 1" (not "the reference") names
 # TextEncodeQwenImageEditPlusCustom_lrzjason's own reference-image input slot,
 # which read more reliably in testing than a generic "the reference" phrase.
@@ -651,12 +660,12 @@ QWEN_EDIT_CATALOG_PROMPTS = {
                             'expression, soft even light, a plain neutral background'),
     'Face front, smile': ('in a close-up of the face, facing the camera directly, a slight smile, '
                           'soft window light, a blurred home interior in the background'),
-    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling',
-    'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression',
-    'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing',
-    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression',
-    'Profile left': 'in a close-up of the face, in full left profile, a neutral expression',
-    'Profile right': 'in a close-up of the face, in full right profile, a neutral expression',
+    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling, soft indoor light, a blurred background',
+    'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression, even studio light, a plain background',
+    'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing, soft daylight, a blurred outdoor background',
+    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression, warm indoor light, a blurred background',
+    'Profile left': 'in a close-up of the face, in full left profile, a neutral expression, a plain studio background',
+    'Profile right': 'in a close-up of the face, in full right profile, a neutral expression, a blurred outdoor background',
     'Profile left, smile': ('in a close-up of the face, in strict left profile, a slight smile, soft '
                             'window light, a blurred background'),
     'Profile right, smile': ('in a close-up of the face, in strict right profile, a slight smile, soft '
@@ -678,24 +687,25 @@ QWEN_EDIT_CATALOG_PROMPTS = {
     'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a blurred background',
     'Face, studio': 'in a close-up of the face, facing the camera, even studio lighting, a plain background',
     'Face, golden hour': 'in a close-up of the face, turned three-quarters, warm golden-hour sunlight, outdoors',
-    'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression',
+    'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression, a plain neutral background',
     'Face, looking up': 'in a close-up of the face, looking slightly upward, soft daylight, a blurred outdoor background',
     'Face, looking down': 'in a close-up of the face, looking slightly downward, a pensive expression, a blurred indoor background',
     'Face, landscape framing': ('in a close-up of the face placed to one side of a wide frame with the '
                                 'surrounding environment visible, turned three-quarters, outdoors'),
     'Face, tall framing': ('in a close-up of the face within a tall vertical frame, facing the camera, '
-                           'soft natural light'),
+                           'soft natural light, a blurred outdoor background'),
     'Face, cinematic framing': ('in a close-up of the face placed off-center within a wide frame, a '
                                 'blurred background'),
     # --- Bust ---
-    'Bust, front': 'seen from the waist up, facing the camera, a neutral expression, wearing a top distinct from image 1',
+    'Bust, front': ('seen from the waist up, facing the camera, a neutral expression, wearing a top '
+                    'distinct from image 1, a plain studio background'),
     'Bust, three-quarter': ('seen from the waist up, turned three-quarters, smiling, wearing an outfit '
                             'distinct from image 1, indoors'),
     'Bust, outdoor': 'seen from the waist up, facing the camera, an outdoor park in the background',
     'Bust, studio': 'seen from the waist up, turned three-quarters, a plain studio backdrop',
     'Bust, jacket': 'seen from the waist up, wearing a jacket distinct from image 1, an urban background',
     'Bust, evening outfit': ('seen from the waist up, wearing an elegant evening outfit distinct from '
-                             'image 1, dim ambient light'),
+                             'image 1, at a dim evening venue, ambient light'),
     'Bust, landscape framing': 'seen from the waist up with the surrounding environment visible on both sides, outdoors',
     'Bust, fitted top': 'seen from the waist up, wearing a fitted ribbed knit top, a natural relaxed pose, soft indoor light',
     'Bust, summer dress': ('seen from the waist up, wearing a fitted summer dress with thin straps, warm '
@@ -726,7 +736,8 @@ QWEN_EDIT_CATALOG_PROMPTS = {
     'Body, backlit silhouette': ('in a full-body view, backlit near a large window so the figure is outlined '
                                  'by rim light, wearing an elegant fitted dress, in a moody interior'),
     # --- Back (viewpoint stated — not otherwise inferable) ---
-    'Back, three-quarter': 'in a full-body view, seen from behind at a three-quarter angle, showing the hairstyle and silhouette',
+    'Back, three-quarter': ('in a full-body view, seen from behind at a three-quarter angle, showing the '
+                            'hairstyle and silhouette, a plain neutral background'),
     # --- NSFW (local Qwen Edit only, Rapid-AIO checkpoint) ---
     'Bust, lingerie': 'seen from the waist up, wearing delicate lace lingerie, a bedroom setting, soft window light',
     'Bust, topless': 'seen from the waist up, topless with the bare chest visible, a neutral indoor background, natural light',
@@ -735,7 +746,8 @@ QWEN_EDIT_CATALOG_PROMPTS = {
     'Body, nude standing': 'in a full-body view, standing fully nude with natural anatomy, a relaxed pose, a neutral studio background, soft even light',
     'Body, nude three-quarter': 'in a full-body view, turned three-quarters, fully nude with natural anatomy, standing by a large window, soft daylight',
     'Body, nude sitting on bed': 'in a full-body view, sitting nude on the edge of a bed, a relaxed natural pose, warm bedroom light',
-    'Body, nude lying': 'in a full-body view, lying nude on a bed on her side, natural anatomy, soft morning light',
+    'Body, nude lying': ('in a full-body view, lying nude on a bed on her side, natural anatomy, soft '
+                         'morning light, a cozy bedroom interior'),
     'Body, nude shower': 'in a full-body view, nude in the shower, wet skin and hair with visible water droplets, a glass and tile background',
     'Back, nude': 'in a full-body view, seen from behind, standing nude with the back and buttocks visible, natural anatomy, a neutral background',
 }

@@ -322,6 +322,23 @@ def test_qwen_edit_catalog_has_no_camera_lens_jargon():
         assert 'mm ' not in text, f'{label!r} still has a focal-length reference'
 
 
+def test_qwen_edit_catalog_every_entry_states_a_background_or_scene():
+    """Real ComfyUI test (repo owner): a shot with no background/scene cue
+    inherited the reference photo's own background verbatim (a plain white
+    studio backdrop reproduced on every shot) instead of the varied scenes
+    the dataset composition needs — this is an EDIT model under a "keep
+    everything else the same" instruction, so an unstated background is
+    genuinely PRESERVED, never invented, unlike Klein/API engines. Every
+    entry must name SOME location/background/lighting-context word."""
+    from app.services.face_variations import QWEN_EDIT_CATALOG_PROMPTS
+    bg_words = ('background', 'outdoor', 'indoor', 'street', 'café', 'cafe', 'beach',
+               'studio', 'bedroom', 'bathroom', 'gym', 'field', 'lobby', 'pool',
+               'plaza', 'shower', 'interior', 'park', 'window', 'hotel', 'venue')
+    for label, text in QWEN_EDIT_CATALOG_PROMPTS.items():
+        assert any(w in text.lower() for w in bg_words), \
+            f'{label!r} has no background/scene cue — will inherit the reference photo\'s own'
+
+
 def test_qwen_edit_prompt_for_resolves_known_label():
     from app.services.face_variations import qwen_edit_prompt_for
     out = qwen_edit_prompt_for('Body standing, front', 'unused fallback')
