@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-qwen-edit-prompt-rewrite',
+    date: '2026-07-21',
+    title: '🎨 Cleaner, less hallucination-prone prompts for Qwen Edit',
+    blurb:
+      "Every shot's prompt for the Qwen Edit engine is now a single compact restage instruction instead of several stacked sentences (tag-soup description + a separate photography-jargon framing line like \"85mm lens look\" + an identity block) — that stacking was competing with the engine's own scene-reasoning and causing hallucinated details. All 63 shots (SFW + NSFW) were rewritten in plain instruction style with no camera-lens wording, which also reads more naturally for non-photoreal render styles.",
+    to: '/datasets',
+  },
+  {
     id: '2026-07-21-qwen-edit-nsfw-checkpoint',
     date: '2026-07-21',
     title: '🔞 Real NSFW support for the Qwen Edit engine',

@@ -330,16 +330,24 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
 
 def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | None = None,
                              suffix: str = '', render_style: str = 'photoreal') -> str:
-    """Qwen-Image-Edit-2511 (Wave 4, redesigned after real-world debugging —
-    see the qwen_edit_helper.py module docstring for the workflow swap this
-    tracks). UNLIKE Klein's "create a new X of the same Y" template, this
-    engine is fed a plain EDIT instruction: the workflow's own
-    TextEncodeQwenImageEditPlusCustom_lrzjason node already reads the
-    reference image via a VLM (the same Qwen2.5-VL text encoder) plus a fixed
-    meta-`instruction` baked into the workflow file that tells it to
+    """Qwen-Image-Edit-2511 (Wave 4, redesigned twice after real-world
+    debugging — see the qwen_edit_helper.py module docstring for the
+    workflow swap, and QWEN_EDIT_CATALOG_PROMPTS above for the prompt-content
+    swap this tracks). UNLIKE Klein's "create a new X of the same Y"
+    template, this engine is fed a plain EDIT instruction: the workflow's
+    own TextEncodeQwenImageEditPlusCustom_lrzjason node already reads the
+    reference image via a VLM (the same Qwen2.5-VL text encoder) plus a
+    fixed meta-`instruction` baked into the workflow file that tells it to
     reconcile "what's in the image" with "what the user's instruction asks
-    for" — so the prompt here reads as an edit request, not a from-scratch
-    scene description.
+    for" — a dense multi-sentence prompt (identity lock + separate
+    photography-jargon framing sentence + tag-soup description) competed
+    with that reasoning and caused hallucinated output in practice, so this
+    is now a single compact restage instruction. `prompt` is expected to
+    already BE that instruction (qwen_edit_prompt_for() resolves it from
+    QWEN_EDIT_CATALOG_PROMPTS before calling this) — `framing` is kept for
+    signature symmetry with wrap_variation_klein but unused: framing is
+    described inline in the instruction text itself now, not as a separate
+    sentence.
     `nsfw=True` (local-only, same fail-closed rule as Klein: the route refuses
     NSFW on API engines) drops the SFW clamp.
     `render_style` swaps the trailing style clause, same shape as Klein's own
@@ -347,16 +355,14 @@ def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | Non
     for the identity block here (unlike Klein/API guards) — IDENTITY_GUARD_QWEN_EDIT
     was written style-neutral from the start (no photo-specific wording to
     swap out), so `get_identity_prompt` is used directly."""
-    detail = _KLEIN_FRAMING_DETAIL.get(framing or '', '')
     identity = get_identity_prompt('qwen_edit_identity')
     tail = generation_tail_for(render_style)
-    style_clause = tail if tail else 'Professional realistic photograph.'
+    style_clause = tail if tail else 'a realistic photograph.'
     ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {style_clause}"
               if nsfw else f"{style_clause} SFW.")
     return (
-        f"Keep the same character identity. Restage the image as: {_append_suffix(prompt, suffix)}. "
-        + (f"{detail} " if detail else "")
-        + f"{identity} {ending}")
+        f"Keep the same character identity. Restage the image as {_append_suffix(prompt, suffix)}. "
+        f"{identity} {ending}")
 
 
 # --- Anti-fuite tenue / expression (constat terrain 2026-07-14) ---------------
@@ -610,6 +616,147 @@ for _entry in NSFW_VARIATION_CATALOG:
 del _entry
 
 _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
+
+
+# --- Qwen Edit instruction catalog (Wave 4 follow-up, repo owner feedback) ----
+# VARIATION_CATALOG/NSFW_VARIATION_CATALOG above are comma-tag descriptions
+# written for Klein/API engines, and the shared framing detail they used to pair
+# with (_KLEIN_FRAMING_DETAIL) carries photography-specific wording ("85mm
+# portrait lens look") — both fight Qwen Edit's own VLM-driven EDIT paradigm
+# (see wrap_variation_qwen_edit): a tag-soup description read as a from-scratch
+# scene to compose, rather than a restage instruction, and the lens jargon
+# reads as photoreal regardless of the dataset's actual render_style. Every
+# shot here is instead a plain restage INSTRUCTION with the framing described
+# in prose, no camera-equipment references — keyed by the catalog's display
+# LABEL (same join key prompt_by_label()/regenerate() already use) so no
+# frontend or route plumbing changes are needed; qwen_edit_prompt_for() falls
+# back to the shared catalog's own prompt for any label not (yet) covered.
+QWEN_EDIT_CATALOG_PROMPTS = {
+    # --- Face ---
+    'Face front, neutral': ('a close-up of the head and shoulders, facing the camera directly, '
+                            'a calm neutral expression, soft even light, a plain neutral background'),
+    'Face front, smile': ('a close-up of the head and shoulders, facing the camera directly, '
+                          'a slight smile, soft window light, a blurred home interior in the background'),
+    'Face 3/4 left, smile': 'a close-up of the head and shoulders, turned three-quarters to the left, smiling',
+    'Face 3/4 left, serious': 'a close-up of the head and shoulders, turned three-quarters to the left, a serious expression',
+    'Face 3/4 right, laugh': 'a close-up of the head and shoulders, turned three-quarters to the right, laughing',
+    'Face 3/4 right, gentle': 'a close-up of the head and shoulders, turned three-quarters to the right, a gentle soft expression',
+    'Profile left': 'a close-up of the head and shoulders, in full left profile, a neutral expression',
+    'Profile right': 'a close-up of the head and shoulders, in full right profile, a neutral expression',
+    'Profile left, smile': ('a close-up of the head and shoulders, in strict left profile, a slight smile, '
+                            'soft window light, a blurred background'),
+    'Profile right, smile': ('a close-up of the head and shoulders, in strict right profile, a slight smile, '
+                             'soft window light, a blurred background'),
+    'Profile left, serious': ('a close-up of the head and shoulders, in strict left profile, a serious '
+                              'expression, even studio light, a plain background'),
+    'Profile right, serious': ('a close-up of the head and shoulders, in strict right profile, a serious '
+                               'expression, even studio light, a plain background'),
+    'Profile left, looking up': ('a close-up of the head and shoulders, in strict left profile, head tilted '
+                                 'slightly upward, eyes looking up, a pensive expression, soft daylight, '
+                                 'a blurred outdoor background'),
+    'Profile right, looking up': ('a close-up of the head and shoulders, in strict right profile, head tilted '
+                                  'slightly upward, eyes looking up, a pensive expression, soft daylight, '
+                                  'a blurred outdoor background'),
+    'Profile left, rim light': ('a close-up of the head and shoulders, in strict left profile, a neutral '
+                                'expression, dramatic rim lighting from behind, a dark blurred background'),
+    'Profile right, rim light': ('a close-up of the head and shoulders, in strict right profile, a neutral '
+                                 'expression, dramatic rim lighting from behind, a dark blurred background'),
+    'Face, window light': 'a close-up of the head and shoulders, facing the camera, soft window light, a blurred background',
+    'Face, studio': 'a close-up of the head and shoulders, facing the camera, even studio lighting, a plain background',
+    'Face, golden hour': 'a close-up of the head and shoulders, turned three-quarters, warm golden-hour sunlight, outdoors',
+    'Face, surprise': 'a close-up of the head and shoulders, facing the camera, a surprised expression',
+    'Face, looking up': 'a close-up of the head and shoulders, looking slightly upward, soft daylight, a blurred outdoor background',
+    'Face, looking down': 'a close-up of the head and shoulders, looking slightly downward, a pensive expression, a blurred indoor background',
+    'Face, landscape framing': ('a close-up of the head and shoulders placed to one side of a wide frame with '
+                                'the surrounding environment visible, turned three-quarters, outdoors'),
+    'Face, tall framing': ('a close-up of the head and shoulders within a tall vertical frame, facing the '
+                           'camera, soft natural light'),
+    'Face, cinematic framing': ('a close-up of the head and shoulders placed off-center within a wide frame, '
+                                'a blurred background'),
+    # --- Bust ---
+    'Bust, front': ('a half-length portrait from the waist up, facing the camera, a neutral expression, '
+                    'wearing a different casual top than the reference'),
+    'Bust, three-quarter': ('a half-length portrait from the waist up, turned three-quarters, smiling, '
+                            'a different outfit than the reference, indoors'),
+    'Bust, outdoor': 'a half-length portrait from the waist up, facing the camera, an outdoor park in the background',
+    'Bust, studio': 'a half-length portrait from the waist up, turned three-quarters, a plain studio backdrop',
+    'Bust, jacket': ('a half-length portrait from the waist up, wearing a jacket different from the '
+                     'reference, an urban background'),
+    'Bust, evening outfit': ('a half-length portrait from the waist up, an elegant evening outfit different '
+                             'from the reference, dim ambient light'),
+    'Bust, landscape framing': ('a half-length portrait from the waist up with the surrounding environment '
+                                'visible on both sides, outdoors'),
+    'Bust, fitted top': ('a half-length portrait from the waist up, wearing a fitted ribbed knit top, a '
+                         'natural relaxed pose, soft indoor light'),
+    'Bust, summer dress': ('a half-length portrait from the waist up, wearing a fitted summer dress with '
+                           'thin straps, warm golden-hour light, outdoors'),
+    'Bust, swimsuit (beach)': ('a half-length portrait from the waist up, wearing a bikini top, a sunny beach '
+                               'in the background, bright daylight, a natural relaxed pose'),
+    # --- Body ---
+    'Body standing, front': ('a full-length shot, the entire body visible from head to toe, standing and '
+                             'facing the camera, casual clothes different from the reference, on a street'),
+    'Body standing, three-quarter': ('a full-length shot, standing, turned three-quarters, a different outfit '
+                                     'than the reference, outdoors'),
+    'Body sitting': 'a full-length shot, sitting on a chair, a relaxed pose, indoors',
+    'Body walking': 'a full-length shot, walking, a dynamic pose, a city street in the background',
+    'Body, café': 'a full-length shot, standing inside a café, warm ambient light',
+    'Body, beach (clothed)': ('a full-length shot, standing on a beach, summer casual clothes different from '
+                              'the reference, bright daylight'),
+    'Body, wide urban shot': ('a full-length shot with the figure placed off-center within a wide urban '
+                              'plaza, lots of background visible'),
+    'Body walking, wide shot': ('a full-length shot, walking across a wide street, a dynamic pose, a wide '
+                                'cinematic framing with lots of the street visible'),
+    'Body, outdoor landscape': ('a full-length shot, standing outdoors with a wide natural landscape filling '
+                                'the background'),
+    'Body sitting, wide terrace': ('a full-length shot, sitting on a café terrace with a wide view of the '
+                                   'surroundings, warm light'),
+    'Body, wide open field': ('a full-length shot, standing in an open field with a wide expanse of nature '
+                              'in the background, soft daylight'),
+    'Body, bodycon dress': ('a full-length shot, wearing a fitted bodycon evening dress, standing in an '
+                            'upscale hotel lobby, warm ambient light'),
+    'Body, sportswear': ('a full-length shot, wearing fitted athletic sportswear (leggings and a sports '
+                         'top), in a gym setting, a confident stance'),
+    'Body, bikini beach': ('a full-length shot, wearing a bikini, standing on a sunny beach, a natural '
+                           'relaxed pose, bright daylight'),
+    'Body, swimsuit pool': ('a full-length shot, wearing a one-piece swimsuit, standing at the edge of a '
+                            'swimming pool, summer daylight'),
+    'Body, fitted jeans': ('a full-length shot, wearing fitted high-waisted jeans and a tucked-in top, on '
+                           'an urban street, daylight'),
+    'Body, backlit silhouette': ('a full-length shot, backlit near a large window so the figure is outlined '
+                                 'by rim light, wearing an elegant fitted dress, a moody interior'),
+    # --- Back ---
+    'Back, three-quarter': ('a full-length shot seen from a three-quarter back angle, showing the '
+                            'hairstyle and silhouette'),
+    # --- NSFW (local Qwen Edit only) ---
+    'Bust, lingerie': ('a half-length portrait from the waist up, wearing delicate lace lingerie, a '
+                       'bedroom setting, soft window light'),
+    'Bust, topless': ('a half-length portrait from the waist up, topless with the bare chest visible, a '
+                      'neutral indoor background, natural light'),
+    'Bust, towel': ('a half-length portrait from the waist up, wrapped in a bath towel with bare '
+                    'shoulders, a bathroom setting, soft light'),
+    'Body, lingerie standing': ('a full-length shot, standing, wearing a matching lace lingerie set, a '
+                                'bedroom interior, soft light'),
+    'Body, nude standing': ('a full-length shot, standing fully nude with natural anatomy, a relaxed pose, '
+                            'a neutral studio background, soft even light'),
+    'Body, nude three-quarter': ('a full-length shot, turned three-quarters, fully nude with natural '
+                                 'anatomy, standing by a large window, soft daylight'),
+    'Body, nude sitting on bed': ('a full-length shot, sitting nude on the edge of a bed, a relaxed '
+                                  'natural pose, warm bedroom light'),
+    'Body, nude lying': ('a full-length shot, lying nude on a bed on her side, natural anatomy, soft '
+                         'morning light'),
+    'Body, nude shower': ('a full-length shot, nude in the shower, wet skin and hair with visible water '
+                          'droplets, a glass and tile background'),
+    'Back, nude': ('a full-length shot seen from behind, standing nude with the back and buttocks '
+                   'visible, natural anatomy, a neutral background'),
+}
+
+
+def qwen_edit_prompt_for(label: str, fallback: str) -> str:
+    """Instruction-style restage description for this shot LABEL, from the
+    Qwen-Edit-specific catalog above — falls back to the shared catalog's own
+    (Klein/API-oriented) prompt for any label not yet covered, so this stays
+    fillable incrementally without ever breaking a shot."""
+    return QWEN_EDIT_CATALOG_PROMPTS.get(label, fallback)
 
 
 # Legacy label aliases (old French persisted key -> current English catalog label).

@@ -47,7 +47,7 @@ from .face_variations import (CAPTION_PROMPT, CAPTION_PROMPT_BOORU,
                               drop_identity_sentences, drop_identity_tags,
                               is_nsfw_label, prompt_by_label, wrap_variation,
                               wrap_variation_klein, wrap_variation_qwen_edit, get_identity_prompt,
-                              KLEIN_IMAGE_IMPROVE_PROMPT)
+                              qwen_edit_prompt_for, KLEIN_IMAGE_IMPROVE_PROMPT)
 from .render_style_presets import generation_negative_for
 
 logger = logging.getLogger(__name__)
@@ -4431,7 +4431,8 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
                             user_id=str(user_id), source_filename=ds.ref_filename,
                             source_path=_ref_path(ds),
                             edit_prompt=wrap_variation_qwen_edit(
-                                v['prompt'], nsfw=nsfw, framing=v.get('framing'),
+                                qwen_edit_prompt_for(v.get('label'), v['prompt']),
+                                nsfw=nsfw, framing=v.get('framing'),
                                 suffix=dataset_prompt_suffix(ds, v.get('framing')),
                                 render_style=render_style),
                             negative_prompt=generation_negative_for(render_style),
@@ -4768,7 +4769,7 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
             user_id=str(user_id), source_filename=ds.ref_filename,
             source_path=ref_path,
             edit_prompt=wrap_variation_qwen_edit(
-                prompt, nsfw=_nsfw,
+                qwen_edit_prompt_for(img.variation_label, prompt), nsfw=_nsfw,
                 framing=img.framing,
                 suffix=dataset_prompt_suffix(ds, img.framing),
                 render_style=_render_style),
