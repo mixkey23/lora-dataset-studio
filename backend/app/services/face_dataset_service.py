@@ -4437,6 +4437,7 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
                             negative_prompt=generation_negative_for(render_style),
                             qwen_model=klein_model,
                             lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
+                            nsfw=nsfw,
                             extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
                                             'variation_label': v.get('label')})
                     else:
@@ -4762,17 +4763,19 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
                  and img.generation_engine == 'qwen_edit' else None)
         ref_path = os.path.join(_dataset_path(ds.id), ds.ref_filename)
         _render_style = getattr(ds, 'render_style', None) or 'photoreal'
+        _nsfw = is_nsfw_label(img.variation_label)
         new_job_id = enqueue_qwen_edit_variation(
             user_id=str(user_id), source_filename=ds.ref_filename,
             source_path=ref_path,
             edit_prompt=wrap_variation_qwen_edit(
-                prompt, nsfw=is_nsfw_label(img.variation_label),
+                prompt, nsfw=_nsfw,
                 framing=img.framing,
                 suffix=dataset_prompt_suffix(ds, img.framing),
                 render_style=_render_style),
             negative_prompt=generation_negative_for(_render_style),
             qwen_model=model,
             lightning_enabled=cfg.get('qwen_edit.lightning_enabled', True),
+            nsfw=_nsfw,
             extra_metadata={'is_dataset': True, 'dataset_id': img.dataset_id,
                             'variation_label': img.variation_label})
     else:

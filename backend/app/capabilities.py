@@ -846,6 +846,15 @@ def probe(force=False) -> dict:
                        and bool(_qea.resolve_vae())
                        and bool(_qea.resolve_text_encoder())
                        and not qwen_edit_blocking_invalid)
+    # NSFW branch (Rapid-AIO checkpoint) — a SEPARATE readiness gate, since it
+    # needs a completely different asset (see qwen_edit_helper.py). SFW being
+    # ready does not imply NSFW is; the app fails closed on that gap rather
+    # than silently using the (likely-censored) SFW checkpoint.
+    qwen_edit_nsfw_missing = _qeh.qwen_edit_nsfw_missing_assets()
+    qwen_edit_nsfw_invalid = _qeh.qwen_edit_nsfw_invalid_assets()
+    qwen_edit_nsfw_blocking_invalid = any(i['blocking'] for i in qwen_edit_nsfw_invalid)
+    qwen_edit_nsfw_ready = (comfy['ok'] and bool(_qea.resolve_nsfw_checkpoint())
+                            and not qwen_edit_nsfw_blocking_invalid)
     base_dir = cfg.get('comfyui.base_dir') or ''
     comfy_dir = resolve_comfyui_base(base_dir)
     # Conscious "continue without ComfyUI" skip (Setup wizard). DERIVED, not just the
@@ -903,9 +912,13 @@ def probe(force=False) -> dict:
             'qwen_ma_missing': qwen_ma_missing,
             'qwen_ma_invalid': qwen_ma_invalid,
             # Same shape, for the Qwen Edit engine's three required assets
-            # (unet/text-encoder/vae) plus the optional consistency/Lightning LoRAs.
+            # (unet/text-encoder/vae) plus the optional Lightning LoRA.
             'qwen_edit_missing': qwen_edit_missing,
             'qwen_edit_invalid': qwen_edit_invalid,
+            # NSFW branch: a single asset (the Rapid-AIO checkpoint) — separate
+            # from the SFW trio above, see qwen_edit_helper.py.
+            'qwen_edit_nsfw_missing': qwen_edit_nsfw_missing,
+            'qwen_edit_nsfw_invalid': qwen_edit_nsfw_invalid,
         },
         'ollama': {
             'reachable': ollama['ok'],

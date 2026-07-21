@@ -24,6 +24,15 @@ _CANONICAL_VAE = 'qwen_image_vae.safetensors'
 _CANONICAL_TEXT_ENCODER = 'qwen_2.5_vl_7b_fp8_scaled.safetensors'
 _CANONICAL_CONSISTENCY_LORA = 'consistence_edit_v2.safetensors'
 _CANONICAL_LIGHTNING_LORA = 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors'
+# Phr00t/Qwen-Image-Edit-Rapid-AIO: a merged UNet+CLIP+VAE+accelerator
+# checkpoint, loaded via CheckpointLoaderSimple — a DIFFERENT loading shape
+# from the 3 assets above. Used ONLY for the NSFW branch of "Generate
+# variations" (qwen_edit_helper.py): V5+ of this model ships separate
+# NSFW/SFW builds, unlike Klein/FLUX.2 which needs no separate checkpoint
+# for NSFW — the base (split-file) Qwen-Image-Edit-2511 checkpoint has
+# baked-in refusal a prompt alone can't steer around.
+_CANONICAL_NSFW_CHECKPOINT = 'Qwen-Rapid-AIO-v1.safetensors'
+_NSFW_CHECKPOINT_TOKENS = ('rapid-aio', 'rapid_aio', 'qwen-rapid', 'qwen_rapid')
 
 _UNET_TOKENS = ('qwen-image-edit-2511', 'qwen_image_edit_2511', 'qwen-image-edit', 'qwen_image_edit')
 _VAE_TOKENS = ('qwen_image_vae', 'qwen-image-vae')
@@ -39,6 +48,7 @@ QWEN_EDIT_MIN_BYTES = {
     'vae': 8 * 1024 ** 2,             # 8 MB
     'consistency_lora': 512 * 1024,
     'lightning_lora': 512 * 1024,
+    'nsfw_checkpoint': 2 * 1024 ** 3,  # 2 GB (merged UNet+CLIP+VAE, several GB in practice)
 }
 
 
@@ -146,6 +156,12 @@ def resolve_consistency_lora():
 
 def resolve_lightning_lora():
     return _resolve_lora(_CANONICAL_LIGHTNING_LORA, ('lightning',))
+
+
+def resolve_nsfw_checkpoint(selected=None):
+    """The merged Rapid-AIO checkpoint (NSFW branch only) — a single-file
+    'checkpoints' asset, unlike the split unet/vae/text_encoder above."""
+    return _resolve_model('checkpoints', _CANONICAL_NSFW_CHECKPOINT, _NSFW_CHECKPOINT_TOKENS, selected)
 
 
 def _abs_under_roots(comfy_type, rel_name):

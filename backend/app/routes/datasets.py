@@ -418,10 +418,18 @@ def dataset_generate(dataset_id):
         elif generator == 'qwen_edit':
             # Wave 4: general-purpose Qwen-Image-Edit-2511 engine, a LOCAL peer
             # of Klein. Same node-preflight-then-enqueue shape as Klein below.
+            # NSFW shots run a COMPLETELY DIFFERENT graph (Rapid-AIO checkpoint,
+            # see qwen_edit_helper.py) — preflight it too when any are queued.
             from ..services import qwen_edit_helper as qeh
+            has_nsfw = any(v.get('nsfw') or is_nsfw_label(v.get('label')) for v in variations)
             missing_nodes = qeh.qwen_edit_missing_nodes()
+            if has_nsfw:
+                missing_nodes = missing_nodes + qeh.qwen_edit_nsfw_missing_nodes()
             if missing_nodes:
-                return _qwen_edit_missing_response(qeh.qwen_edit_missing_assets(), missing_nodes)
+                missing_assets = qeh.qwen_edit_missing_assets()
+                if has_nsfw:
+                    missing_assets = missing_assets + qeh.qwen_edit_nsfw_missing_assets()
+                return _qwen_edit_missing_response(missing_assets, missing_nodes)
             ids = svc.generate_variations(LOCAL_USER, dataset_id,
                                           data.get('variations') or [], data.get('multiplier', 1),
                                           data.get('klein_model'),
@@ -863,8 +871,8 @@ _QWEN_MA_ASSET_LABELS = {
 
 _QWEN_EDIT_ASSET_LABELS = {
     'qwen_edit_unet': 'Qwen-Image-Edit-2511 model', 'qwen_edit_text_encoder': 'text encoder',
-    'qwen_edit_vae': 'VAE', 'qwen_edit_consistency_lora': 'consistency LoRA',
-    'qwen_edit_lightning_lora': 'Lightning LoRA',
+    'qwen_edit_vae': 'VAE', 'qwen_edit_lightning_lora': 'Lightning LoRA',
+    'qwen_edit_nsfw_checkpoint': 'Qwen-Image-Edit-Rapid-AIO checkpoint (NSFW shots)',
 }
 
 

@@ -25,7 +25,7 @@ def _install(base, *relparts, data=_VALID_ST):
     return p
 
 
-def _comfy(tmp_path, cfg, unet=True, vae=True, te=True, lightning=False):
+def _comfy(tmp_path, cfg, unet=True, vae=True, te=True, lightning=False, nsfw_checkpoint=False):
     """A ComfyUI tree with a configurable subset of the shared Qwen-Image-Edit
     assets present (mirrors test_qwen_multiangle.py's own fixture, minus the
     multi-angle LoRA and the consistency LoRA, neither of which
@@ -43,6 +43,8 @@ def _comfy(tmp_path, cfg, unet=True, vae=True, te=True, lightning=False):
         _install(base, 'models', 'text_encoders', 'qwen_2.5_vl_7b_fp8_scaled.safetensors')
     if lightning:
         _install(base, 'models', 'loras', 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors')
+    if nsfw_checkpoint:
+        _install(base, 'models', 'checkpoints', 'Qwen', 'Qwen-Rapid-AIO-v1.safetensors')
     cfg.save_config({'comfyui': {'base_dir': str(base)}})
     return base
 
@@ -85,6 +87,23 @@ def test_qwen_edit_assets_resolve_lightning_lora(app, tmp_path):
         assert light_path is not None
 
 
+def test_qwen_edit_assets_resolve_nsfw_checkpoint(app, tmp_path):
+    import os
+    from app import config as cfg
+    from app.services import qwen_edit_assets as qea
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=True)
+        assert qea.resolve_nsfw_checkpoint() == os.path.join('Qwen', 'Qwen-Rapid-AIO-v1.safetensors')
+
+
+def test_qwen_edit_assets_resolve_nsfw_checkpoint_none_when_absent(app, tmp_path):
+    from app import config as cfg
+    from app.services import qwen_edit_assets as qea
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=False)
+        assert qea.resolve_nsfw_checkpoint() is None
+
+
 # --- qwen_edit_helper: missing-assets probe (no consistency LoRA anymore) ----
 
 def test_qwen_edit_missing_assets_lists_every_absent_action(app, tmp_path):
@@ -110,6 +129,79 @@ def test_qwen_edit_missing_assets_empty_when_everything_present(app, tmp_path):
 def test_qwen_edit_recommended_has_no_consistency_lora():
     from app.services import qwen_edit_helper as qeh
     assert qeh.QWEN_EDIT_RECOMMENDED == ('qwen_edit_lightning_lora',)
+
+
+# --- NSFW branch: separate checkpoint, fail-closed --------------------------
+
+def test_qwen_edit_nsfw_missing_assets_when_checkpoint_absent(app, tmp_path):
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=False)
+        assert qeh.qwen_edit_nsfw_missing_assets() == ['qwen_edit_nsfw_checkpoint']
+
+
+def test_qwen_edit_nsfw_missing_assets_empty_when_checkpoint_present(app, tmp_path):
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=True)
+        assert qeh.qwen_edit_nsfw_missing_assets() == []
+
+
+def test_enqueue_nsfw_raises_when_checkpoint_missing_never_falls_back_to_sfw(app, tmp_path):
+    """Fail-closed: an NSFW shot with no Rapid-AIO checkpoint configured must
+    NEVER silently render on the (likely-censored) SFW checkpoint."""
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=False)
+        src = tmp_path / 'source.png'
+        src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        with pytest.raises(qeh.QwenEditModelsMissing) as exc:
+            qeh.enqueue_qwen_edit_variation(
+                user_id='local', source_filename='source.png',
+                edit_prompt='test prompt', source_path=str(src), nsfw=True)
+        assert exc.value.missing == ['qwen_edit_nsfw_checkpoint']
+
+
+def test_enqueue_nsfw_uses_the_nsfw_graph_not_the_sfw_one(app, tmp_path, monkeypatch):
+    import os
+    from app import config as cfg
+    from app.services import qwen_edit_helper as qeh
+    with app.app_context():
+        _comfy(tmp_path, cfg, nsfw_checkpoint=True)
+        src = tmp_path / 'source.png'
+        src.write_bytes(b'\x89PNG\r\n\x1a\nfake')
+
+        captured = {}
+        monkeypatch.setattr(qeh.queue_manager, 'add_job',
+                            lambda **kw: captured.update(kw) or (kw.get('job_id') or 'job-nsfw'))
+
+        qeh.enqueue_qwen_edit_variation(
+            user_id='local', source_filename='source.png',
+            edit_prompt='nsfw test prompt', negative_prompt='lowres',
+            source_path=str(src), nsfw=True)
+
+        wf = captured['workflow_data']
+        # NSFW graph shape: CheckpointLoaderSimple (node 1), NOT the SFW
+        # graph's split UNETLoader/CLIPLoader/VAELoader.
+        assert wf['1']['class_type'] == 'CheckpointLoaderSimple'
+        assert wf['1']['inputs']['ckpt_name'] == os.path.join('Qwen', 'Qwen-Rapid-AIO-v1.safetensors')
+        assert wf['3']['inputs']['prompt'] == 'nsfw test prompt'
+        assert wf['4']['inputs']['prompt'] == 'lowres'
+        assert wf['8']['inputs']['image'].endswith('source.png')
+        assert wf['6']['inputs']['filename_prefix'].startswith('local_QwenEditNSFW_')
+        # no lrzjason/VLM nodes from the SFW graph in this one
+        assert '10' not in wf and '13' not in wf
+
+
+def test_workflow_nsfw_required_nodes_all_present_in_shipped_file():
+    from app.services import qwen_edit_helper as qeh
+    from app.utils.comfyui import load_workflow_local
+    workflow = load_workflow_local(str(qeh.WORKFLOW_QWEN_EDIT_NSFW_PATH))
+    for node in qeh._REQUIRED_NODES_NSFW:
+        assert node in workflow, f'required node {node} missing from qwen_edit_variation_nsfw.json'
 
 
 # --- render_style_presets: negative prompt ------------------------------------

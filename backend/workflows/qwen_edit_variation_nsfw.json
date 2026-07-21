@@ -1,0 +1,76 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "Qwen/Qwen-Rapid-AIO-v1.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load Checkpoint (Rapid AIO)"}
+  },
+  "2": {
+    "inputs": {
+      "seed": 0,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "sa_solver",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": ["1", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["9", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {"title": "KSampler"}
+  },
+  "3": {
+    "inputs": {
+      "prompt": "",
+      "clip": ["1", 1],
+      "vae": ["1", 2],
+      "image1": ["8", 0]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {"title": "Positive Prompt"}
+  },
+  "4": {
+    "inputs": {
+      "prompt": "",
+      "clip": ["1", 1],
+      "vae": ["1", 2]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {"title": "Negative Prompt"}
+  },
+  "5": {
+    "inputs": {
+      "samples": ["2", 0],
+      "vae": ["1", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {"title": "VAE Decode"}
+  },
+  "6": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": ["5", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Image"}
+  },
+  "8": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": {"title": "Load Image"}
+  },
+  "9": {
+    "inputs": {
+      "width": 768,
+      "height": 768,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {"title": "Final Image Size"}
+  }
+}

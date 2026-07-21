@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-qwen-edit-nsfw-checkpoint',
+    date: '2026-07-21',
+    title: '🔞 Real NSFW support for the Qwen Edit engine',
+    blurb:
+      "Unlike Klein, Qwen Edit's base checkpoint has baked-in refusal a prompt alone can't get past — so NSFW shots now run on a dedicated checkpoint (Phr00t/Qwen-Image-Edit-Rapid-AIO) instead of quietly failing or ignoring the request. Drop it in any ComfyUI checkpoints folder and it's picked up automatically; until then, NSFW shots fail with a clear message instead of a silent SFW result.",
+    to: '/settings/engines',
+  },
+  {
     id: '2026-07-21-qwen-edit-model-picker',
     date: '2026-07-21',
     title: '🎨 Pick which Qwen Edit checkpoint to use',

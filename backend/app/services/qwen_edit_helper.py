@@ -48,11 +48,20 @@ from ..job_queue import queue_manager
 logger = logging.getLogger(__name__)
 
 WORKFLOW_QWEN_EDIT_PATH = cfg.BACKEND_DIR / 'workflows' / 'qwen_edit_variation.json'
+# NSFW branch: Phr00t/Qwen-Image-Edit-Rapid-AIO, a merged single-file
+# checkpoint (CheckpointLoaderSimple) that ships a dedicated NSFW build —
+# unlike Klein/FLUX.2, the base (split-file) Qwen-Image-Edit-2511 checkpoint
+# has baked-in refusal a prompt alone can't steer around, so NSFW shots need
+# a genuinely different graph, not just a different prompt ending. User-
+# supplied, real ComfyUI capture (simpler than the SFW graph: no VLM prompt
+# optimizer, no dynamic aspect-ratio sizing — fixed 768x768, as captured).
+WORKFLOW_QWEN_EDIT_NSFW_PATH = cfg.BACKEND_DIR / 'workflows' / 'qwen_edit_variation_nsfw.json'
 
 # Nodes this helper rewires or otherwise depends on the shape of — fail LOUDLY
 # if the workflow file changes shape instead of silently enqueuing a job with
 # the wrong source/prompt/model.
 _REQUIRED_NODES = ('39', '10', '17', '38', '31', '7', '6', '21', '23', '33', '13', '8', '40')
+_REQUIRED_NODES_NSFW = ('1', '2', '3', '4', '5', '6', '8', '9')
 
 # REQUIRED = the graph is invalid without it. No consistency LoRA here (see
 # module docstring) — Lightning is the only LoRA, and it's RECOMMENDED-only
@@ -93,7 +102,40 @@ QWEN_EDIT_MIN_BYTES = {
     'qwen_edit_text_encoder': qea.QWEN_EDIT_MIN_BYTES['text_encoder'],
     'qwen_edit_vae': qea.QWEN_EDIT_MIN_BYTES['vae'],
     'qwen_edit_lightning_lora': qea.QWEN_EDIT_MIN_BYTES['lightning_lora'],
+    'qwen_edit_nsfw_checkpoint': qea.QWEN_EDIT_MIN_BYTES['nsfw_checkpoint'],
 }
+
+# NSFW branch: a single REQUIRED asset (the merged checkpoint) — no separate
+# UNET/VAE/TE/Lightning, CheckpointLoaderSimple loads all of it from one file.
+QWEN_EDIT_NSFW_REQUIRED = ('qwen_edit_nsfw_checkpoint',)
+
+
+def qwen_edit_nsfw_missing_assets():
+    """Mirrors qwen_edit_missing_assets() for the NSFW checkpoint."""
+    return [] if qea.resolve_nsfw_checkpoint() else ['qwen_edit_nsfw_checkpoint']
+
+
+def qwen_edit_nsfw_invalid_assets():
+    """Mirrors qwen_edit_invalid_assets() for the single NSFW checkpoint file."""
+    from . import model_integrity
+    from . import comfy_model_paths
+    ckpt = qea.resolve_nsfw_checkpoint()
+    if not ckpt:
+        return []
+    path = None
+    for root in comfy_model_paths.search_roots('checkpoints'):
+        cand = os.path.join(root, ckpt)
+        if os.path.exists(cand):
+            path = cand
+            break
+    if not path:
+        return []
+    res = model_integrity.validate_model_file(
+        path, min_bytes=QWEN_EDIT_MIN_BYTES.get('qwen_edit_nsfw_checkpoint'))
+    if res['ok']:
+        return []
+    return [{'asset': 'qwen_edit_nsfw_checkpoint', 'filename': res['filename'],
+            'verdict': res['verdict'], 'blocking': res['blocking'], 'reason': res['reason']}]
 
 
 def qwen_edit_invalid_assets():
@@ -132,8 +174,16 @@ QWEN_EDIT_NODE_PACKS = {
     'ModelSamplingAuraFlow': (None, None),
 }
 
+# NSFW graph's only non-core node: the NATIVE TextEncodeQwenImageEditPlus
+# (not the lrzjason custom variant the SFW graph uses) — the Rapid-AIO
+# checkpoint's own recommended workflow doesn't use a VLM prompt optimizer.
+QWEN_EDIT_NSFW_NODE_PACKS = {
+    'TextEncodeQwenImageEditPlus': (None, None),
+}
+
 _NODES_OK_TTL_S = 300
 _nodes_ok_until = 0.0
+_nsfw_nodes_ok_until = 0.0
 
 
 def _workflow_class_types(workflow):
@@ -161,6 +211,28 @@ def qwen_edit_missing_nodes(workflow=None):
         out.append({'class_type': ct, 'pack': pack, 'url': url})
     if shipped and not out:
         _nodes_ok_until = time.time() + _NODES_OK_TTL_S
+    return out
+
+
+def qwen_edit_nsfw_missing_nodes(workflow=None):
+    """Mirrors qwen_edit_missing_nodes() for the NSFW graph — separate TTL
+    cache since the two workflows can have different missing-node sets."""
+    global _nsfw_nodes_ok_until
+    shipped = workflow is None
+    if shipped:
+        if time.time() < _nsfw_nodes_ok_until:
+            return []
+        workflow = load_workflow_local(str(WORKFLOW_QWEN_EDIT_NSFW_PATH)) or {}
+    from ..utils.comfyui import fetch_object_info_classes
+    available = fetch_object_info_classes()
+    if available is None:
+        return []
+    out = []
+    for ct in sorted(_workflow_class_types(workflow) - available):
+        pack, url = QWEN_EDIT_NSFW_NODE_PACKS.get(ct, (None, None))
+        out.append({'class_type': ct, 'pack': pack, 'url': url})
+    if shipped and not out:
+        _nsfw_nodes_ok_until = time.time() + _NODES_OK_TTL_S
     return out
 
 
@@ -208,35 +280,9 @@ def _comfy_output_dir():
     return str(d) if d else None
 
 
-def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, negative_prompt='',
-                                qwen_model=None, extra_metadata=None, source_path=None,
-                                sampler_steps=None, lightning_enabled=True,
-                                lightning_strength=None):
-    """Copy the source into ComfyUI input, configure the qwen_edit_variation
-    workflow with the (already-wrapped) prompt, and enqueue it. Returns the
-    app job_id. Raises ValueError on a missing source / unloadable workflow /
-    missing required node, RuntimeError if ComfyUI isn't configured,
-    QwenEditModelsMissing if a graph-critical asset is absent.
-    `negative_prompt` (render_style-aware, see
-    face_variations/render_style_presets) goes straight into the plain
-    CLIPTextEncode negative node — unlike Klein, this graph doesn't run at a
-    guidance-distilled CFG=1, so the negative conditioning has a real effect.
-    The empty latent's width/height are NOT set here — they're wired
-    statically in the workflow file itself (GetImageSize on the adaptively-
-    resized reference -> EmptyLatentImage), so the output always matches the
-    reference's aspect ratio without any code-side calculation.
-    `lightning_enabled` toggles the Lightning speed LoRA (the only LoRA in
-    this graph); off falls back to a non-distilled step/cfg envelope (both
-    step counts are extrapolated, not yet measured against a real run — same
-    honesty flag as Qwen Multi-angle)."""
-    if source_path is None:
-        out_dir = _comfy_output_dir()
-        if out_dir is None:
-            raise RuntimeError('ComfyUI is not configured')
-        source_path = os.path.join(out_dir, source_filename)
-    if not os.path.exists(source_path):
-        raise ValueError(f"source image not found: {source_filename}")
-
+def _enqueue_qwen_edit_sfw(user_id, source_filename, edit_prompt, negative_prompt,
+                           qwen_model, extra_metadata, source_path,
+                           sampler_steps, lightning_enabled, lightning_strength):
     workflow = load_workflow_local(str(WORKFLOW_QWEN_EDIT_PATH))
     if not workflow:
         raise ValueError("failed to load Qwen Edit workflow")
@@ -294,10 +340,90 @@ def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, negative_
             workflow["17"]["inputs"]["steps"] = 8 if use_lightning else 20
         workflow["17"]["inputs"]["cfg"] = 1 if use_lightning else 4
 
-    job_id = str(uuid.uuid4())
     meta = {"model_name": "qwen_edit_dataset"}
     if extra_metadata:
         meta.update(extra_metadata)
+    job_id = str(uuid.uuid4())
     queue_manager.add_job(job_type="image", user_id=str(user_id), workflow_data=workflow,
                           prompt=edit_prompt, job_id=job_id, metadata=meta)
     return job_id
+
+
+def _enqueue_qwen_edit_nsfw(user_id, source_filename, edit_prompt, negative_prompt,
+                            qwen_model, extra_metadata, source_path):
+    """NSFW branch: Phr00t/Qwen-Image-Edit-Rapid-AIO (see module docstring).
+    Fails CLOSED (QwenEditModelsMissing) when the checkpoint isn't
+    configured — never silently falls back to the SFW checkpoint, which is
+    the one the base model's own baked-in refusal applies to."""
+    workflow = load_workflow_local(str(WORKFLOW_QWEN_EDIT_NSFW_PATH))
+    if not workflow:
+        raise ValueError("failed to load Qwen Edit NSFW workflow")
+    for node in _REQUIRED_NODES_NSFW:
+        if node not in workflow:
+            raise ValueError(f"workflow node {node} missing — qwen_edit_variation_nsfw.json has changed")
+
+    ckpt_ref = qea.resolve_nsfw_checkpoint(qwen_model)
+    if not ckpt_ref:
+        raise QwenEditModelsMissing(['qwen_edit_nsfw_checkpoint'])
+
+    comfy_input_dir = _comfy_input_dir()
+    uid = uuid.uuid4().hex[:8]
+    comfy_input = f"qwen_edit_nsfw_source_{uid}_{source_filename}"
+    shutil.copy2(source_path, os.path.join(comfy_input_dir, comfy_input))
+
+    workflow["1"]["inputs"]["ckpt_name"] = ckpt_ref
+    workflow["8"]["inputs"]["image"] = comfy_input
+    workflow["3"]["inputs"]["prompt"] = edit_prompt
+    workflow["4"]["inputs"]["prompt"] = negative_prompt or ''
+    workflow["2"]["inputs"]["seed"] = random.randint(0, 2 ** 64 - 1)
+    # UNIQUE prefix per job, same reasoning as the SFW branch.
+    workflow["6"]["inputs"]["filename_prefix"] = f"{user_id}_QwenEditNSFW_{uid}"
+
+    meta = {"model_name": "qwen_edit_dataset"}
+    if extra_metadata:
+        meta.update(extra_metadata)
+    job_id = str(uuid.uuid4())
+    queue_manager.add_job(job_type="image", user_id=str(user_id), workflow_data=workflow,
+                          prompt=edit_prompt, job_id=job_id, metadata=meta)
+    return job_id
+
+
+def enqueue_qwen_edit_variation(user_id, source_filename, edit_prompt, negative_prompt='',
+                                qwen_model=None, extra_metadata=None, source_path=None,
+                                sampler_steps=None, lightning_enabled=True,
+                                lightning_strength=None, nsfw=False):
+    """Copy the source into ComfyUI input, configure the qwen_edit_variation
+    workflow with the (already-wrapped) prompt, and enqueue it. Returns the
+    app job_id. Raises ValueError on a missing source / unloadable workflow /
+    missing required node, RuntimeError if ComfyUI isn't configured,
+    QwenEditModelsMissing if a graph-critical asset is absent.
+    `nsfw=True` switches to a COMPLETELY DIFFERENT graph (see
+    _enqueue_qwen_edit_nsfw) — the base Qwen-Image-Edit-2511 checkpoint has
+    baked-in refusal a prompt alone can't steer around (unlike Klein/FLUX.2),
+    so real NSFW output needs the Rapid-AIO checkpoint's own dedicated build.
+    `qwen_model` picks the base checkpoint override (SFW: UNET filename;
+    NSFW: the Rapid-AIO checkpoint filename — two different asset spaces).
+    `negative_prompt` (render_style-aware, see
+    face_variations/render_style_presets) goes straight into the plain
+    text-encode negative node — unlike Klein, this graph doesn't run at a
+    guidance-distilled CFG=1, so the negative conditioning has a real effect.
+    SFW-only: the empty latent's width/height are NOT set here — they're
+    wired statically in the workflow file (GetImageSize on the adaptively-
+    resized reference -> EmptyLatentImage), so the output always matches the
+    reference's aspect ratio. `lightning_enabled`/`lightning_strength`/
+    `sampler_steps` are also SFW-only (the NSFW graph's acceleration is
+    baked into the checkpoint, nothing to toggle)."""
+    if source_path is None:
+        out_dir = _comfy_output_dir()
+        if out_dir is None:
+            raise RuntimeError('ComfyUI is not configured')
+        source_path = os.path.join(out_dir, source_filename)
+    if not os.path.exists(source_path):
+        raise ValueError(f"source image not found: {source_filename}")
+
+    if nsfw:
+        return _enqueue_qwen_edit_nsfw(user_id, source_filename, edit_prompt, negative_prompt,
+                                       qwen_model, extra_metadata, source_path)
+    return _enqueue_qwen_edit_sfw(user_id, source_filename, edit_prompt, negative_prompt,
+                                  qwen_model, extra_metadata, source_path,
+                                  sampler_steps, lightning_enabled, lightning_strength)

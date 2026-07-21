@@ -208,7 +208,7 @@ function QwenEditLorasCard({ config, setField }) {
     <Card
       id="qwen-edit"
       title="Qwen Edit (optional tuning)"
-      help="A local, general-purpose peer of Klein for Generate variations, using Qwen-Image-Edit-2511 — a different base model, useful when Klein's own photoreal-biased fine-tune fights a non-photoreal render style. The model files aren't downloaded by this app — point ComfyUI at whatever you already have (Settings ▸ Local tools ▸ ComfyUI). No consistency-LoRA setting here (unlike Klein/Qwen Multi-angle): that LoRA fights drift across several reference images, and this engine always starts from one."
+      help="A local, general-purpose peer of Klein for Generate variations, using Qwen-Image-Edit-2511 — a different base model, useful when Klein's own photoreal-biased fine-tune fights a non-photoreal render style. The model files aren't downloaded by this app — point ComfyUI at whatever you already have (Settings ▸ Local tools ▸ ComfyUI). No consistency-LoRA setting here (unlike Klein/Qwen Multi-angle): that LoRA fights drift across several reference images, and this engine always starts from one. NSFW shots run on a SEPARATE checkpoint (Phr00t/Qwen-Image-Edit-Rapid-AIO) — the base checkpoint above has baked-in refusal a prompt can't steer around. Point ComfyUI at that checkpoint too (any 'checkpoints' folder) for NSFW shots to work; SFW shots don't need it."
     >
       <label className="flex items-center gap-2 text-sm text-content">
         <input type="checkbox" checked={lightningOn}
