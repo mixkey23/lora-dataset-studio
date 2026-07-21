@@ -24,6 +24,7 @@ Dataset Studio, config-driven and slimmed:
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 import re
@@ -374,6 +375,24 @@ def _ensure_comfyui_before_generation():
         return None
 
 
+def _debug_dump_workflow(prompt_workflow):
+    """Debug aid: when LORA_STUDIO_DUMP_WORKFLOWS=1, save the exact workflow
+    JSON about to be POSTed to ComfyUI's /prompt — after every node injection
+    (LoRAs, source image, prompt text) this app does, so a bad injection is
+    visible in the dumped file instead of only surfacing as a ComfyUI 400.
+    Off by default (no disk writes for normal use); never raises."""
+    if os.environ.get('LORA_STUDIO_DUMP_WORKFLOWS') != '1':
+        return
+    try:
+        from datetime import datetime
+        path = f"/tmp/comfyui_workflow_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(prompt_workflow, f, indent=2, ensure_ascii=False)
+        logger.info(f"Debug: dumped outgoing ComfyUI workflow to {path}")
+    except Exception as e:
+        logger.warning(f"Debug workflow dump failed: {e}")
+
+
 def queue_prompt_to_comfyui(prompt_workflow, client_id, worker_url=None):
     """Envoie un workflow à ComfyUI pour exécution.
 
@@ -413,6 +432,8 @@ def queue_prompt_to_comfyui(prompt_workflow, client_id, worker_url=None):
                     logger.warning("Failed to ensure Ollama is running. Workflow might fail.")
         except Exception as e:
             logger.error(f"Error checking for Ollama dependency: {e}")
+
+    _debug_dump_workflow(prompt_workflow)
 
     try:
         payload = {"prompt": prompt_workflow, "client_id": client_id}
