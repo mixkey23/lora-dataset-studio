@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-qwen-edit-declarative-prompts',
+    date: '2026-07-21',
+    title: '🎨 Qwen Edit prompts get even shorter — more consistent shots',
+    blurb:
+      "A real side-by-side test showed a short, plain sentence describing the target pose beats an imperative \"restage as\" command with a long identity-lock paragraph — Qwen Edit's prompts are now that short declarative style, with the reference image addressed directly as \"image 1\". Less prompt, more consistent characters.",
+    to: '/datasets',
+  },
+  {
     id: '2026-07-21-shot-group-select-all',
     date: '2026-07-21',
     title: '☑ Select or deselect a whole shot group in one click',

@@ -69,9 +69,7 @@ IDENTITY_GUARD_KLEIN = (
 # texture" wording to swap for render_style — same text works for every
 # style), independent of Klein's — held separately so it gets its own
 # editable Settings override.
-IDENTITY_GUARD_QWEN_EDIT = (
-    "Do not change the facial identity: keep the same eye shape and color, nose, "
-    "jawline, lips, and face proportions. Do not beautify, slim, age, or alter the face.")
+IDENTITY_GUARD_QWEN_EDIT = "Keep everything else the same."
 
 _GUARD_BASE_BY_KIND = {
     'face_single': _IDENTITY_GUARD_BASE,
@@ -330,39 +328,40 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
 
 def wrap_variation_qwen_edit(prompt: str, nsfw: bool = False, framing: str | None = None,
                              suffix: str = '', render_style: str = 'photoreal') -> str:
-    """Qwen-Image-Edit-2511 (Wave 4, redesigned twice after real-world
-    debugging — see the qwen_edit_helper.py module docstring for the
-    workflow swap, and QWEN_EDIT_CATALOG_PROMPTS above for the prompt-content
-    swap this tracks). UNLIKE Klein's "create a new X of the same Y"
-    template, this engine is fed a plain EDIT instruction: the workflow's
-    own TextEncodeQwenImageEditPlusCustom_lrzjason node already reads the
-    reference image via a VLM (the same Qwen2.5-VL text encoder) plus a
-    fixed meta-`instruction` baked into the workflow file that tells it to
-    reconcile "what's in the image" with "what the user's instruction asks
-    for" — a dense multi-sentence prompt (identity lock + separate
-    photography-jargon framing sentence + tag-soup description) competed
-    with that reasoning and caused hallucinated output in practice, so this
-    is now a single compact restage instruction. `prompt` is expected to
-    already BE that instruction (qwen_edit_prompt_for() resolves it from
-    QWEN_EDIT_CATALOG_PROMPTS before calling this) — `framing` is kept for
-    signature symmetry with wrap_variation_klein but unused: framing is
-    described inline in the instruction text itself now, not as a separate
-    sentence.
-    `nsfw=True` (local-only, same fail-closed rule as Klein: the route refuses
-    NSFW on API engines) drops the SFW clamp.
-    `render_style` swaps the trailing style clause, same shape as Klein's own
-    `ending` (Wave 3's `generation_tail_for`). No BASE/STYLED split is needed
-    for the identity block here (unlike Klein/API guards) — IDENTITY_GUARD_QWEN_EDIT
-    was written style-neutral from the start (no photo-specific wording to
-    swap out), so `get_identity_prompt` is used directly."""
+    """Qwen-Image-Edit-2511 (Wave 4, redesigned a third time after a real A/B
+    test from the repo owner — see the qwen_edit_helper.py module docstring
+    for the workflow swap, and QWEN_EDIT_CATALOG_PROMPTS above for the
+    prompt-CONTENT this tracks). Even a single "restage as: {description}"
+    instruction (the 2nd redesign) still under-performed a short DECLARATIVE
+    sentence describing the target state directly ("The character is
+    standing, turned three-quarters, a distinct outfit from image 1,
+    outdoors" beat "Restage the image as a full-length shot, standing,
+    turned three-quarters..." on the SAME shot, consistent character, less
+    hallucination) — the workflow's own VLM (TextEncodeQwenImageEditPlusCustom_lrzjason)
+    already optimizes the instruction against the reference, so a terse,
+    natural-language description outperforms an imperative command PLUS a
+    verbose identity-lock paragraph. `prompt` is expected to already BE that
+    declarative description (qwen_edit_prompt_for() resolves it from
+    QWEN_EDIT_CATALOG_PROMPTS, phrased as "distinct from image 1" —
+    Qwen-Image-Edit-Plus's own reference-image slot name, which reads more
+    reliably than "the reference"). `framing` is kept for signature symmetry
+    with wrap_variation_klein but unused: framing is described inline in the
+    instruction text itself.
+    `nsfw=True` (local-only, same fail-closed rule as Klein) adds a short
+    explicit-nudity clause. `render_style` appends a short style note only
+    when non-photoreal (Wave 3's `generation_tail_for`; None for photoreal —
+    the reference photo already IS photoreal, no need to state it, matching
+    what the winning test prompt did: no style clause at all).
+    IDENTITY_GUARD_QWEN_EDIT's default is now the short "Keep everything else
+    the same." (was a multi-clause identity paragraph) — still overridable
+    via Settings ▸ identity_prompts.qwen_edit_identity."""
     identity = get_identity_prompt('qwen_edit_identity')
     tail = generation_tail_for(render_style)
-    style_clause = tail if tail else 'a realistic photograph.'
-    ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {style_clause}"
-              if nsfw else f"{style_clause} SFW.")
+    style_note = f' {tail}' if tail else ''
+    nsfw_note = ' Explicit nudity and natural anatomy are allowed.' if nsfw else ''
     return (
-        f"Keep the same character identity. Restage the image as {_append_suffix(prompt, suffix)}. "
-        f"{identity} {ending}")
+        f"Keep the same character identity. The character is {_append_suffix(prompt, suffix)}. "
+        f"{identity}{style_note}{nsfw_note}")
 
 
 # --- Anti-fuite tenue / expression (constat terrain 2026-07-14) ---------------
@@ -618,136 +617,116 @@ del _entry
 _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
 
 
-# --- Qwen Edit instruction catalog (Wave 4 follow-up, repo owner feedback) ----
+# --- Qwen Edit instruction catalog (Wave 4 follow-up, repo owner A/B test) ---
 # VARIATION_CATALOG/NSFW_VARIATION_CATALOG above are comma-tag descriptions
-# written for Klein/API engines, and the shared framing detail they used to pair
-# with (_KLEIN_FRAMING_DETAIL) carries photography-specific wording ("85mm
-# portrait lens look") — both fight Qwen Edit's own VLM-driven EDIT paradigm
-# (see wrap_variation_qwen_edit): a tag-soup description read as a from-scratch
-# scene to compose, rather than a restage instruction, and the lens jargon
-# reads as photoreal regardless of the dataset's actual render_style. Every
-# shot here is instead a plain restage INSTRUCTION with the framing described
-# in prose, no camera-equipment references — keyed by the catalog's display
-# LABEL (same join key prompt_by_label()/regenerate() already use) so no
-# frontend or route plumbing changes are needed; qwen_edit_prompt_for() falls
-# back to the shared catalog's own prompt for any label not (yet) covered.
+# written for Klein/API engines, both fighting Qwen Edit's own VLM-driven EDIT
+# paradigm (see wrap_variation_qwen_edit's docstring for the head-to-head test
+# that settled this): a tag-soup description, or even an imperative "restage
+# as: ..." command, both under-performed a short DECLARATIVE sentence stating
+# the target pose/outfit/setting directly, on the SAME shot with the SAME
+# reference. Every entry here follows that pattern — "{pose/action}, {outfit
+# change 'distinct from image 1' when relevant}, {setting}" — completing "The
+# character is ___." No camera-equipment wording, no "full-length shot"/
+# "half-length portrait" framing-jargon phrases (framing instead comes from a
+# short natural viewpoint cue only where it's not otherwise inferable: face
+# close-ups and the back view; bust/body entries rely on the pose itself, per
+# the tested example). "distinct from image 1" (not "the reference") names
+# TextEncodeQwenImageEditPlusCustom_lrzjason's own reference-image input slot,
+# which read more reliably in testing than a generic "the reference" phrase.
+# Keyed by the catalog's display LABEL (same join key prompt_by_label()/
+# regenerate() already use) so no frontend/route plumbing changes are needed;
+# qwen_edit_prompt_for() falls back to the shared catalog's own prompt for any
+# label not (yet) covered.
 QWEN_EDIT_CATALOG_PROMPTS = {
-    # --- Face ---
-    'Face front, neutral': ('a close-up of the head and shoulders, facing the camera directly, '
-                            'a calm neutral expression, soft even light, a plain neutral background'),
-    'Face front, smile': ('a close-up of the head and shoulders, facing the camera directly, '
-                          'a slight smile, soft window light, a blurred home interior in the background'),
-    'Face 3/4 left, smile': 'a close-up of the head and shoulders, turned three-quarters to the left, smiling',
-    'Face 3/4 left, serious': 'a close-up of the head and shoulders, turned three-quarters to the left, a serious expression',
-    'Face 3/4 right, laugh': 'a close-up of the head and shoulders, turned three-quarters to the right, laughing',
-    'Face 3/4 right, gentle': 'a close-up of the head and shoulders, turned three-quarters to the right, a gentle soft expression',
-    'Profile left': 'a close-up of the head and shoulders, in full left profile, a neutral expression',
-    'Profile right': 'a close-up of the head and shoulders, in full right profile, a neutral expression',
-    'Profile left, smile': ('a close-up of the head and shoulders, in strict left profile, a slight smile, '
-                            'soft window light, a blurred background'),
-    'Profile right, smile': ('a close-up of the head and shoulders, in strict right profile, a slight smile, '
-                             'soft window light, a blurred background'),
-    'Profile left, serious': ('a close-up of the head and shoulders, in strict left profile, a serious '
-                              'expression, even studio light, a plain background'),
-    'Profile right, serious': ('a close-up of the head and shoulders, in strict right profile, a serious '
-                               'expression, even studio light, a plain background'),
-    'Profile left, looking up': ('a close-up of the head and shoulders, in strict left profile, head tilted '
-                                 'slightly upward, eyes looking up, a pensive expression, soft daylight, '
-                                 'a blurred outdoor background'),
-    'Profile right, looking up': ('a close-up of the head and shoulders, in strict right profile, head tilted '
+    # --- Face (close-up viewpoint stated — not otherwise inferable) ---
+    'Face front, neutral': ('in a close-up of the face, facing the camera directly, a calm neutral '
+                            'expression, soft even light, a plain neutral background'),
+    'Face front, smile': ('in a close-up of the face, facing the camera directly, a slight smile, '
+                          'soft window light, a blurred home interior in the background'),
+    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling',
+    'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression',
+    'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing',
+    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression',
+    'Profile left': 'in a close-up of the face, in full left profile, a neutral expression',
+    'Profile right': 'in a close-up of the face, in full right profile, a neutral expression',
+    'Profile left, smile': ('in a close-up of the face, in strict left profile, a slight smile, soft '
+                            'window light, a blurred background'),
+    'Profile right, smile': ('in a close-up of the face, in strict right profile, a slight smile, soft '
+                             'window light, a blurred background'),
+    'Profile left, serious': ('in a close-up of the face, in strict left profile, a serious expression, '
+                              'even studio light, a plain background'),
+    'Profile right, serious': ('in a close-up of the face, in strict right profile, a serious expression, '
+                               'even studio light, a plain background'),
+    'Profile left, looking up': ('in a close-up of the face, in strict left profile, head tilted slightly '
+                                 'upward, eyes looking up, a pensive expression, soft daylight, a blurred '
+                                 'outdoor background'),
+    'Profile right, looking up': ('in a close-up of the face, in strict right profile, head tilted '
                                   'slightly upward, eyes looking up, a pensive expression, soft daylight, '
                                   'a blurred outdoor background'),
-    'Profile left, rim light': ('a close-up of the head and shoulders, in strict left profile, a neutral '
-                                'expression, dramatic rim lighting from behind, a dark blurred background'),
-    'Profile right, rim light': ('a close-up of the head and shoulders, in strict right profile, a neutral '
+    'Profile left, rim light': ('in a close-up of the face, in strict left profile, a neutral expression, '
+                                'dramatic rim lighting from behind, a dark blurred background'),
+    'Profile right, rim light': ('in a close-up of the face, in strict right profile, a neutral '
                                  'expression, dramatic rim lighting from behind, a dark blurred background'),
-    'Face, window light': 'a close-up of the head and shoulders, facing the camera, soft window light, a blurred background',
-    'Face, studio': 'a close-up of the head and shoulders, facing the camera, even studio lighting, a plain background',
-    'Face, golden hour': 'a close-up of the head and shoulders, turned three-quarters, warm golden-hour sunlight, outdoors',
-    'Face, surprise': 'a close-up of the head and shoulders, facing the camera, a surprised expression',
-    'Face, looking up': 'a close-up of the head and shoulders, looking slightly upward, soft daylight, a blurred outdoor background',
-    'Face, looking down': 'a close-up of the head and shoulders, looking slightly downward, a pensive expression, a blurred indoor background',
-    'Face, landscape framing': ('a close-up of the head and shoulders placed to one side of a wide frame with '
-                                'the surrounding environment visible, turned three-quarters, outdoors'),
-    'Face, tall framing': ('a close-up of the head and shoulders within a tall vertical frame, facing the '
-                           'camera, soft natural light'),
-    'Face, cinematic framing': ('a close-up of the head and shoulders placed off-center within a wide frame, '
-                                'a blurred background'),
+    'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a blurred background',
+    'Face, studio': 'in a close-up of the face, facing the camera, even studio lighting, a plain background',
+    'Face, golden hour': 'in a close-up of the face, turned three-quarters, warm golden-hour sunlight, outdoors',
+    'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression',
+    'Face, looking up': 'in a close-up of the face, looking slightly upward, soft daylight, a blurred outdoor background',
+    'Face, looking down': 'in a close-up of the face, looking slightly downward, a pensive expression, a blurred indoor background',
+    'Face, landscape framing': ('in a close-up of the face placed to one side of a wide frame with the '
+                                'surrounding environment visible, turned three-quarters, outdoors'),
+    'Face, tall framing': ('in a close-up of the face within a tall vertical frame, facing the camera, '
+                           'soft natural light'),
+    'Face, cinematic framing': ('in a close-up of the face placed off-center within a wide frame, a '
+                                'blurred background'),
     # --- Bust ---
-    'Bust, front': ('a half-length portrait from the waist up, facing the camera, a neutral expression, '
-                    'wearing a different casual top than the reference'),
-    'Bust, three-quarter': ('a half-length portrait from the waist up, turned three-quarters, smiling, '
-                            'a different outfit than the reference, indoors'),
-    'Bust, outdoor': 'a half-length portrait from the waist up, facing the camera, an outdoor park in the background',
-    'Bust, studio': 'a half-length portrait from the waist up, turned three-quarters, a plain studio backdrop',
-    'Bust, jacket': ('a half-length portrait from the waist up, wearing a jacket different from the '
-                     'reference, an urban background'),
-    'Bust, evening outfit': ('a half-length portrait from the waist up, an elegant evening outfit different '
-                             'from the reference, dim ambient light'),
-    'Bust, landscape framing': ('a half-length portrait from the waist up with the surrounding environment '
-                                'visible on both sides, outdoors'),
-    'Bust, fitted top': ('a half-length portrait from the waist up, wearing a fitted ribbed knit top, a '
-                         'natural relaxed pose, soft indoor light'),
-    'Bust, summer dress': ('a half-length portrait from the waist up, wearing a fitted summer dress with '
-                           'thin straps, warm golden-hour light, outdoors'),
-    'Bust, swimsuit (beach)': ('a half-length portrait from the waist up, wearing a bikini top, a sunny beach '
-                               'in the background, bright daylight, a natural relaxed pose'),
-    # --- Body ---
-    'Body standing, front': ('a full-length shot, the entire body visible from head to toe, standing and '
-                             'facing the camera, casual clothes different from the reference, on a street'),
-    'Body standing, three-quarter': ('a full-length shot, standing, turned three-quarters, a different outfit '
-                                     'than the reference, outdoors'),
-    'Body sitting': 'a full-length shot, sitting on a chair, a relaxed pose, indoors',
-    'Body walking': 'a full-length shot, walking, a dynamic pose, a city street in the background',
-    'Body, café': 'a full-length shot, standing inside a café, warm ambient light',
-    'Body, beach (clothed)': ('a full-length shot, standing on a beach, summer casual clothes different from '
-                              'the reference, bright daylight'),
-    'Body, wide urban shot': ('a full-length shot with the figure placed off-center within a wide urban '
-                              'plaza, lots of background visible'),
-    'Body walking, wide shot': ('a full-length shot, walking across a wide street, a dynamic pose, a wide '
-                                'cinematic framing with lots of the street visible'),
-    'Body, outdoor landscape': ('a full-length shot, standing outdoors with a wide natural landscape filling '
-                                'the background'),
-    'Body sitting, wide terrace': ('a full-length shot, sitting on a café terrace with a wide view of the '
-                                   'surroundings, warm light'),
-    'Body, wide open field': ('a full-length shot, standing in an open field with a wide expanse of nature '
-                              'in the background, soft daylight'),
-    'Body, bodycon dress': ('a full-length shot, wearing a fitted bodycon evening dress, standing in an '
-                            'upscale hotel lobby, warm ambient light'),
-    'Body, sportswear': ('a full-length shot, wearing fitted athletic sportswear (leggings and a sports '
-                         'top), in a gym setting, a confident stance'),
-    'Body, bikini beach': ('a full-length shot, wearing a bikini, standing on a sunny beach, a natural '
-                           'relaxed pose, bright daylight'),
-    'Body, swimsuit pool': ('a full-length shot, wearing a one-piece swimsuit, standing at the edge of a '
-                            'swimming pool, summer daylight'),
-    'Body, fitted jeans': ('a full-length shot, wearing fitted high-waisted jeans and a tucked-in top, on '
-                           'an urban street, daylight'),
-    'Body, backlit silhouette': ('a full-length shot, backlit near a large window so the figure is outlined '
-                                 'by rim light, wearing an elegant fitted dress, a moody interior'),
-    # --- Back ---
-    'Back, three-quarter': ('a full-length shot seen from a three-quarter back angle, showing the '
-                            'hairstyle and silhouette'),
-    # --- NSFW (local Qwen Edit only) ---
-    'Bust, lingerie': ('a half-length portrait from the waist up, wearing delicate lace lingerie, a '
-                       'bedroom setting, soft window light'),
-    'Bust, topless': ('a half-length portrait from the waist up, topless with the bare chest visible, a '
-                      'neutral indoor background, natural light'),
-    'Bust, towel': ('a half-length portrait from the waist up, wrapped in a bath towel with bare '
-                    'shoulders, a bathroom setting, soft light'),
-    'Body, lingerie standing': ('a full-length shot, standing, wearing a matching lace lingerie set, a '
-                                'bedroom interior, soft light'),
-    'Body, nude standing': ('a full-length shot, standing fully nude with natural anatomy, a relaxed pose, '
-                            'a neutral studio background, soft even light'),
-    'Body, nude three-quarter': ('a full-length shot, turned three-quarters, fully nude with natural '
-                                 'anatomy, standing by a large window, soft daylight'),
-    'Body, nude sitting on bed': ('a full-length shot, sitting nude on the edge of a bed, a relaxed '
-                                  'natural pose, warm bedroom light'),
-    'Body, nude lying': ('a full-length shot, lying nude on a bed on her side, natural anatomy, soft '
-                         'morning light'),
-    'Body, nude shower': ('a full-length shot, nude in the shower, wet skin and hair with visible water '
-                          'droplets, a glass and tile background'),
-    'Back, nude': ('a full-length shot seen from behind, standing nude with the back and buttocks '
-                   'visible, natural anatomy, a neutral background'),
+    'Bust, front': 'seen from the waist up, facing the camera, a neutral expression, wearing a top distinct from image 1',
+    'Bust, three-quarter': ('seen from the waist up, turned three-quarters, smiling, wearing an outfit '
+                            'distinct from image 1, indoors'),
+    'Bust, outdoor': 'seen from the waist up, facing the camera, an outdoor park in the background',
+    'Bust, studio': 'seen from the waist up, turned three-quarters, a plain studio backdrop',
+    'Bust, jacket': 'seen from the waist up, wearing a jacket distinct from image 1, an urban background',
+    'Bust, evening outfit': ('seen from the waist up, wearing an elegant evening outfit distinct from '
+                             'image 1, dim ambient light'),
+    'Bust, landscape framing': 'seen from the waist up with the surrounding environment visible on both sides, outdoors',
+    'Bust, fitted top': 'seen from the waist up, wearing a fitted ribbed knit top, a natural relaxed pose, soft indoor light',
+    'Bust, summer dress': ('seen from the waist up, wearing a fitted summer dress with thin straps, warm '
+                           'golden-hour light, outdoors'),
+    'Bust, swimsuit (beach)': ('seen from the waist up, wearing a bikini top, a sunny beach in the '
+                               'background, bright daylight, a natural relaxed pose'),
+    # --- Body (no explicit framing cue — the tested winning prompt was a body
+    # shot with none, relying on the pose alone) ---
+    'Body standing, front': 'standing, facing the camera, wearing casual clothes distinct from image 1, on a street',
+    'Body standing, three-quarter': 'standing, turned three-quarters, a distinct outfit from image 1, outdoors',
+    'Body sitting': 'sitting on a chair, a relaxed pose, indoors',
+    'Body walking': 'walking, a dynamic pose, with a city street in the background',
+    'Body, café': 'standing inside a café, warm ambient light',
+    'Body, beach (clothed)': 'standing on a beach, wearing summer casual clothes distinct from image 1, bright daylight',
+    'Body, wide urban shot': 'standing off-center within a wide urban plaza, with lots of background visible',
+    'Body walking, wide shot': 'walking across a wide street, a dynamic pose, with a wide cinematic view of the street',
+    'Body, outdoor landscape': 'standing outdoors with a wide natural landscape filling the background',
+    'Body sitting, wide terrace': 'sitting on a café terrace with a wide view of the surroundings, warm light',
+    'Body, wide open field': 'standing in an open field with a wide expanse of nature in the background, soft daylight',
+    'Body, bodycon dress': 'standing in an upscale hotel lobby, wearing a fitted bodycon evening dress, warm ambient light',
+    'Body, sportswear': 'wearing fitted athletic sportswear (leggings and a sports top), in a gym setting, a confident stance',
+    'Body, bikini beach': 'standing on a sunny beach, wearing a bikini, a natural relaxed pose, bright daylight',
+    'Body, swimsuit pool': 'standing at the edge of a swimming pool, wearing a one-piece swimsuit, summer daylight',
+    'Body, fitted jeans': 'wearing fitted high-waisted jeans and a tucked-in top, on an urban street, daylight',
+    'Body, backlit silhouette': ('backlit near a large window so the figure is outlined by rim light, '
+                                 'wearing an elegant fitted dress, in a moody interior'),
+    # --- Back (viewpoint stated — not otherwise inferable) ---
+    'Back, three-quarter': 'seen from behind at a three-quarter angle, showing the hairstyle and silhouette',
+    # --- NSFW (local Qwen Edit only, Rapid-AIO checkpoint) ---
+    'Bust, lingerie': 'seen from the waist up, wearing delicate lace lingerie, a bedroom setting, soft window light',
+    'Bust, topless': 'seen from the waist up, topless with the bare chest visible, a neutral indoor background, natural light',
+    'Bust, towel': 'seen from the waist up, wrapped in a bath towel with bare shoulders, a bathroom setting, soft light',
+    'Body, lingerie standing': 'standing, wearing a matching lace lingerie set, in a bedroom interior, soft light',
+    'Body, nude standing': 'standing fully nude with natural anatomy, a relaxed pose, a neutral studio background, soft even light',
+    'Body, nude three-quarter': 'turned three-quarters, fully nude with natural anatomy, standing by a large window, soft daylight',
+    'Body, nude sitting on bed': 'sitting nude on the edge of a bed, a relaxed natural pose, warm bedroom light',
+    'Body, nude lying': 'lying nude on a bed on her side, natural anatomy, soft morning light',
+    'Body, nude shower': 'nude in the shower, wet skin and hair with visible water droplets, a glass and tile background',
+    'Back, nude': 'seen from behind, standing nude with the back and buttocks visible, natural anatomy, a neutral background',
 }
 
 

@@ -228,22 +228,31 @@ def test_generation_negative_for_never_empty():
         assert generation_negative_for(style)
 
 
-# --- wrap_variation_qwen_edit: edit-instruction shape + render_style + nsfw --
+# --- wrap_variation_qwen_edit: declarative shape (repo owner A/B test) ------
 
-def test_wrap_variation_qwen_edit_is_an_edit_instruction_not_a_creation(app):
+def test_wrap_variation_qwen_edit_is_declarative_not_imperative(app):
+    """A real head-to-head test (repo owner, same shot/reference) found a
+    short declarative sentence ("The character is X") more consistent than
+    an imperative "Restage the image as: X" command — this locks that shape."""
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
-        out = wrap_variation_qwen_edit('full body shot, standing, front view', framing='body')
-        assert out.startswith('Keep the same character identity. Restage the image as')
+        out = wrap_variation_qwen_edit(
+            'standing, turned three-quarters, a distinct outfit from image 1, outdoors',
+            framing='body')
+        assert out == (
+            'Keep the same character identity. The character is standing, turned '
+            'three-quarters, a distinct outfit from image 1, outdoors. Keep everything '
+            'else the same.')
+        assert 'Restage' not in out
         assert 'Create a new' not in out
 
 
 def test_wrap_variation_qwen_edit_has_no_camera_lens_jargon(app):
     """The framing-detail sentence this used to append (shared with Klein) had
-    photography-specific wording ("85mm/50mm/35mm lens look") that both fought
-    the VLM-driven edit paradigm and read as photoreal regardless of
-    render_style — the wrapper no longer appends any such sentence at all
-    (framing is described inline by the per-shot Qwen catalog instead)."""
+    photography-specific wording ("85mm/50mm/35mm lens look") that fought both
+    the VLM-driven edit paradigm and render_style flexibility — the wrapper
+    appends no such sentence at all (framing lives inline in the per-shot
+    Qwen catalog instead, see QWEN_EDIT_CATALOG_PROMPTS)."""
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         for framing in ('face', 'bust', 'body', 'back', None):
@@ -252,37 +261,42 @@ def test_wrap_variation_qwen_edit_has_no_camera_lens_jargon(app):
             assert 'mm ' not in out
 
 
-def test_wrap_variation_qwen_edit_identity_clause_present(app):
+def test_wrap_variation_qwen_edit_identity_clause_is_short_by_default(app):
+    """The identity lock used to be a multi-clause paragraph naming eye shape,
+    nose, jawline etc. — the winning test prompt replaced it with a single
+    short "keep everything else the same" clause; this is now the default
+    (still overridable via identity_prompts.qwen_edit_identity)."""
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
-        assert 'Do not change the facial identity' in out
-        assert 'eye shape and color' in out
+        assert 'Keep everything else the same.' in out
+        assert 'eye shape' not in out
 
 
-def test_wrap_variation_qwen_edit_non_photoreal_appends_style_tail(app):
+def test_wrap_variation_qwen_edit_photoreal_has_no_style_clause(app):
+    """photoreal is implicit (the reference photo already is one) — the
+    winning test prompt had NO trailing style/SFW clause at all for the
+    default case; only a non-photoreal render_style adds one."""
+    from app.services.face_variations import wrap_variation_qwen_edit
+    with app.app_context():
+        out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
+        assert out.rstrip().endswith('Keep everything else the same.')
+
+
+def test_wrap_variation_qwen_edit_non_photoreal_appends_short_style_note(app):
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust',
                                        render_style='anime_2d')
         assert 'cel-shaded 2D anime' in out
-        assert 'a realistic photograph' not in out
 
 
-def test_wrap_variation_qwen_edit_photoreal_default_mentions_photograph(app):
-    from app.services.face_variations import wrap_variation_qwen_edit
-    with app.app_context():
-        out = wrap_variation_qwen_edit('sitting at a cafe table', framing='bust')
-        assert 'a realistic photograph' in out
-        assert out.rstrip().endswith('SFW.')
-
-
-def test_wrap_variation_qwen_edit_nsfw_drops_sfw_clamp(app):
+def test_wrap_variation_qwen_edit_nsfw_adds_explicit_nudity_note(app):
     from app.services.face_variations import wrap_variation_qwen_edit
     with app.app_context():
         out = wrap_variation_qwen_edit('lying on a bed', framing='body', nsfw=True)
-        assert 'Explicit nudity is allowed' in out
-        assert not out.rstrip().endswith('SFW.')
+        assert 'Explicit nudity' in out
+        assert out.rstrip().endswith('are allowed.')
 
 
 # --- QWEN_EDIT_CATALOG_PROMPTS: instruction-style, jargon-free coverage -----
@@ -305,7 +319,7 @@ def test_qwen_edit_prompt_for_resolves_known_label():
     from app.services.face_variations import qwen_edit_prompt_for
     out = qwen_edit_prompt_for('Body standing, front', 'unused fallback')
     assert out != 'unused fallback'
-    assert 'full-length shot' in out
+    assert 'standing' in out and 'image 1' in out
 
 
 def test_qwen_edit_prompt_for_falls_back_for_unknown_label():
