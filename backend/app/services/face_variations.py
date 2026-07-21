@@ -64,6 +64,45 @@ _GUARD_BASE_BY_KIND = {
     'klein_identity': _IDENTITY_GUARD_KLEIN_BASE,
 }
 
+# Wave 3 follow-up: the tail swap alone left the identity-lock BODY itself
+# saying "person" and "skin tone and texture" — both read as photographic even
+# once the trailing clause names a style. For a non-photoreal render_style
+# (whenever generation_tail_for() returns something), these BASE variants swap
+# in instead: 'person' -> 'character' (Klein's own base never says the noun, so
+# it only loses the texture clause) and 'skin tone and texture' is dropped
+# entirely (a photo-specific concern — pores/texture — that doesn't describe a
+# drawn/rendered character well). Everything else (eye shape/color, nose,
+# jawline, lips, face proportions) stays: still valid for character/render
+# consistency, not exclusive to photos.
+_IDENTITY_GUARD_BASE_STYLED = (
+    "This is the SAME character as the reference image. Preserve their facial identity "
+    "EXACTLY: same eye shape and color, nose, jawline, lips, and face proportions. "
+    "Do NOT beautify, slim, age, or alter the face. Use the "
+    "reference ONLY to lock the facial identity: take the clothing/outfit and the "
+    "facial expression from the description below, and do NOT copy the outfit or the "
+    "expression shown in the reference image.")
+_IDENTITY_GUARD_MULTI_BASE_STYLED = (
+    "ALL the reference images show the SAME character (different angles, expressions or "
+    "framings). Use EVERY reference image together to lock the identity. Preserve their "
+    "facial identity EXACTLY: same eye shape and color, nose, jawline, lips, "
+    "and face proportions. Do NOT beautify, slim, age, or alter the face. "
+    "Use the reference images ONLY to lock the facial identity: take the clothing/outfit "
+    "and the facial expression from the description below, and do NOT copy the outfit or "
+    "the expression shown in the reference images.")
+_IDENTITY_GUARD_KLEIN_BASE_STYLED = (
+    "Restage the shot to match this description — change the pose, camera angle, "
+    "framing, clothing and facial expression accordingly; do not copy the "
+    "composition, the outfit or the facial expression of the reference image (use "
+    "it only for the facial identity). "
+    "Keep the facial identity exactly the same: same eye shape and color, nose, "
+    "jawline, lips, and face proportions. Do not beautify "
+    "or alter the face.")
+_GUARD_BASE_STYLED_BY_KIND = {
+    'face_single': _IDENTITY_GUARD_BASE_STYLED,
+    'face_multi': _IDENTITY_GUARD_MULTI_BASE_STYLED,
+    'klein_identity': _IDENTITY_GUARD_KLEIN_BASE_STYLED,
+}
+
 # Fixed instruction for the manual "Klein upscale & improve" action. Lives here
 # (not in face_dataset_service) so all four editable identity/quality prompts share
 # ONE default registry; face_dataset_service re-imports it under the same name so
@@ -126,16 +165,24 @@ def _style_aware_identity(kind: str, render_style: str, include_tail: bool = Tru
     by render_style) — only when the app is using its OWN shipped default does a
     non-photoreal render_style affect the wording (photoreal/'custom'/unrecognized
     -> no change, byte-identical to the shipped default).
+    A defined style tail also swaps the BASE wording itself, not just the
+    trailing clause: 'person' -> 'character' and the photo-specific 'skin tone
+    and texture' clause is dropped (see _GUARD_BASE_STYLED_BY_KIND) — eye
+    shape/color, nose, jawline, lips and face proportions stay, they describe
+    character/render consistency just as well as a photo.
     `include_tail=False` (klein's caller, when it will place the style descriptor
-    itself in its own trailing `ending` clamp) drops the block's own photographic
-    clause entirely instead of appending a second copy of the same tail."""
+    itself in its own trailing `ending` clamp — only ever passed when a tail
+    exists) drops the block's own photographic clause entirely instead of
+    appending a second copy of the same tail, but still uses the styled base."""
     resolved = get_identity_prompt(kind)
     if resolved != identity_prompt_default(kind):
         return resolved   # a real user override is active — honor it as-is
-    if not include_tail:
-        return _GUARD_BASE_BY_KIND[kind]
     tail = generation_tail_for(render_style)
-    return f"{_GUARD_BASE_BY_KIND[kind]} {tail}" if tail else resolved
+    if not include_tail:
+        return _GUARD_BASE_STYLED_BY_KIND[kind] if tail else _GUARD_BASE_BY_KIND[kind]
+    if not tail:
+        return resolved
+    return f"{_GUARD_BASE_STYLED_BY_KIND[kind]} {tail}"
 
 
 # --- Prompt suffixes (community feature request) -----------------------------
@@ -246,11 +293,11 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
     tail = generation_tail_for(render_style)
     detail = _KLEIN_FRAMING_DETAIL.get(framing or '', '')
     if tail:
-        subject = 'image'
+        subject, noun = 'image', 'character'
         ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {tail}"
                   if nsfw else f"{tail} SFW.")
     else:
-        subject = 'photograph'
+        subject, noun = 'photograph', 'person'
         ending = ("Explicit nudity is allowed; render natural, anatomically correct forms. "
                   "Professional realistic photograph.") if nsfw else \
                  "Professional realistic photograph, SFW."
@@ -259,7 +306,7 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
     # repeating the same wording twice.
     identity_block = _style_aware_identity('klein_identity', render_style, include_tail=not tail)
     return (
-        f"Create a new {subject} of the same person as the reference image: {_append_suffix(prompt, suffix)}. "
+        f"Create a new {subject} of the same {noun} as the reference image: {_append_suffix(prompt, suffix)}. "
         + (f"{detail} " if detail else "")
         + f"{identity_block} {ending}")
 

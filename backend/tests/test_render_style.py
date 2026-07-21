@@ -90,24 +90,32 @@ def test_wrap_variation_klein_default_is_byte_identical(monkeypatch):
 
 # --- non-photoreal presets swap the tail, keep the identity lock -------------
 
-def test_wrap_variation_anime_2d_swaps_tail_keeps_identity_lock(monkeypatch):
+def test_wrap_variation_anime_2d_swaps_tail_and_base_wording(monkeypatch):
     _patch_overrides(monkeypatch, {})
     out = fv.wrap_variation('p', render_style='anime_2d')
-    assert out.startswith(fv._IDENTITY_GUARD_BASE)
+    assert out.startswith(fv._IDENTITY_GUARD_BASE_STYLED)
     assert 'SFW, realistic photographic portrait.' not in out
     assert rsp.generation_tail_for('anime_2d') in out
+    # Photo-specific wording is gone; the rest of the identity lock (eye
+    # shape/color, nose, jawline, lips, face proportions) stays.
+    assert 'SAME person' not in out
+    assert 'SAME character' in out
+    assert 'skin tone and texture' not in out
+    assert 'same eye shape and color, nose, jawline, lips, and face proportions' in out
 
 
-def test_wrap_variation_klein_render_3d_swaps_subject_and_ending_no_duplication(monkeypatch):
+def test_wrap_variation_klein_render_3d_swaps_subject_noun_and_ending_no_duplication(monkeypatch):
     _patch_overrides(monkeypatch, {})
     out = fv.wrap_variation_klein('turn to profile', framing='bust', render_style='render_3d')
-    assert out.startswith('Create a new image of the same person')
+    assert out.startswith('Create a new image of the same character')
     assert 'Create a new photograph' not in out
+    assert 'same person' not in out
     tail = rsp.generation_tail_for('render_3d')
     # Exactly one occurrence — the identity block must NOT repeat the ending's tail.
     assert out.count(tail) == 1
     assert 'Sharp focus, natural skin texture with visible pores' not in out
     assert 'Professional realistic photograph' not in out
+    assert 'skin tone and texture' not in out
 
 
 def test_wrap_variation_klein_nsfw_non_photoreal_ending(monkeypatch):
