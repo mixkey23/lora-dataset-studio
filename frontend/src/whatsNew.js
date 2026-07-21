@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-shot-group-select-all',
+    date: '2026-07-21',
+    title: '☑ Select or deselect a whole shot group in one click',
+    blurb:
+      "Each framing group (Face / Bust / Body / Back) in Generate variations now has its own Select all / Deselect all toggle right in the group header — no more clicking through a dozen individual shots to grab a whole category.",
+    to: '/datasets?section=add',
+  },
+  {
     id: '2026-07-21-qwen-edit-prompt-rewrite',
     date: '2026-07-21',
     title: '🎨 Cleaner, less hallucination-prone prompts for Qwen Edit',

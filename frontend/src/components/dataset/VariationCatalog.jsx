@@ -700,6 +700,12 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
           const missing = Math.max(0, TARGET[fr] - have);
           const pct = Math.min(100, (have / TARGET[fr]) * 100);
           const selCount = byFraming[fr].filter((e) => selected.has(e.id)).length;
+          const groupAllSelected = byFraming[fr].length > 0 && selCount === byFraming[fr].length;
+          const toggleGroup = () => setSelected((s) => {
+            const n = new Set(s);
+            byFraming[fr].forEach((e) => (groupAllSelected ? n.delete(e.id) : n.add(e.id)));
+            return n;
+          });
           return (
             <div key={fr}>
               <div className="flex items-center gap-2 mb-1"
@@ -723,6 +729,13 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                 {selCount > 0 && (
                   <span className="ml-auto text-content-subtle text-[0.625rem]">{selCount} selected</span>
                 )}
+                <button type="button" onClick={toggleGroup} disabled={!byFraming[fr].length}
+                  className={`${selCount > 0 ? '' : 'ml-auto '}text-content-subtle text-[0.625rem] underline decoration-border hover:text-content disabled:opacity-40 disabled:no-underline`}
+                  title={groupAllSelected
+                    ? `Deselect all ${FRAMING_LABEL[fr]} shots`
+                    : `Select all ${FRAMING_LABEL[fr]} shots`}>
+                  {groupAllSelected ? '✕ Deselect all' : '☑ Select all'}
+                </button>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-1.5">
                 {byFraming[fr].map((e) => {
