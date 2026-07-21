@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-render-style',
+    date: '2026-07-21',
+    title: '🎨 Datasets aren\'t just for real photos anymore',
+    blurb:
+      "Every generated training image used to be locked to \"realistic photographic portrait\", no matter what you were building. A new Render style picker (⚙ Dataset settings) now lets a Character or Concept dataset target 3D render, 2D anime, a semi-realistic cartoon look, or general illustration instead — Nano Banana, ChatGPT and Klein all steer toward it, and Klein skips its photoreal-anchoring consistency LoRA automatically. Photoreal stays the default, nothing changes if you don't touch it.",
+    to: '/datasets',
+  },
+  {
     id: '2026-07-21-toggle-thumb-alignment',
     date: '2026-07-21',
     title: '🎚️ Toggle switches sit flush again',

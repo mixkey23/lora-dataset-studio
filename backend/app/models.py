@@ -55,6 +55,14 @@ class FaceDataset(db.Model):
     # import/caption (cf face_dataset_service : is_concept). Colonne ajoutée après coup
     # → migration additive idempotente dans create_app (db.create_all n'ALTER jamais).
     kind = db.Column(String(16), nullable=True)
+    # Target render aesthetic for GENERATED variations: NULL/'photoreal' (historical
+    # default, byte-identical wrapper output) or 'render_3d'/'anime_2d'/
+    # 'cartoon_semireal'/'illustration'/'custom'. Orthogonal to kind/train_type — any
+    # kind can target any aesthetic. Only affects generation prompt wrappers (see
+    # face_variations.wrap_variation/wrap_variation_klein) and whether Klein's
+    # consistency LoRA (anchors PHOTOGRAPHIC composition) is auto-skipped. Additive
+    # migration in create_app.
+    render_style = db.Column(String(16), nullable=True)
     # Cible de fidélité (datasets personnage) : NULL/'face' (historique) ou 'body'.
     # 'body' = le LoRA doit reproduire AUSSI la morphologie/les marques corporelles →
     # captions bannissent en plus tatouages/cicatrices/grains de beauté (ils se lient

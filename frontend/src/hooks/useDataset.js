@@ -246,11 +246,15 @@ export function useDataset() {
 
   const open = useCallback(async (id) => { setCurrentId(id); await refresh(id); }, [refresh]);
 
-  const create = useCallback(async (name, trigger, kind, conceptDesc, trainType, fidelity) => {
+  const create = useCallback(async (name, trigger, kind, conceptDesc, trainType, fidelity,
+                                    renderStyle) => {
     const d = await postJson('/api/dataset/create',
       { name, trigger_word: trigger, ...(kind ? { kind } : {}),
         ...(trainType ? { train_type: trainType } : {}),
         ...(fidelity ? { fidelity } : {}),
+        // Render style (Wave 3): omitted for the default -> server normalizes
+        // absent the same as 'photoreal'.
+        ...(renderStyle && renderStyle !== 'photoreal' ? { render_style: renderStyle } : {}),
         ...(kind === 'concept' && conceptDesc ? { concept_desc: conceptDesc } : {}) });
     if (d.ok) { await fetchList(); await open(d.id); toast.success('Dataset created'); }
     else toast.error(d.error || 'Unexpected error');

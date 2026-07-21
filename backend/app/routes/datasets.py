@@ -94,7 +94,8 @@ def dataset_create():
                                 train_type=data.get('train_type'),
                                 fidelity=data.get('fidelity'),
                                 prompt_suffix=data.get('prompt_suffix'),
-                                prompt_suffixes=data.get('prompt_suffixes'))
+                                prompt_suffixes=data.get('prompt_suffixes'),
+                                render_style=data.get('render_style'))
     except ValueError as e:
         # concept dataset without a concept description -> 400 (not a 500)
         return jsonify({'error': str(e)}), 400
@@ -132,7 +133,9 @@ def dataset_update_settings(dataset_id):
     or an in-flight generation is live on the dataset.
     Also edits the creative-direction prompt suffixes (global text +
     {face,bust,body,back} map) — applied to FUTURE generations at wrap time;
-    absent = untouched, '' / {} = cleared."""
+    absent = untouched, '' / {} = cleared. Also edits the **render_style** (Wave
+    3: the target aesthetic for future generations — photoreal/render_3d/anime_2d/
+    cartoon_semireal/illustration/custom) — not disruptive, no guard."""
     data = request.get_json(silent=True) or {}
     try:
         res = svc.update_dataset_settings(
@@ -140,7 +143,8 @@ def dataset_update_settings(dataset_id):
             trigger_word=data.get('trigger_word'), concept_desc=data.get('concept_desc'),
             kind=data.get('kind'),
             prompt_suffix=data.get('prompt_suffix'),
-            prompt_suffixes=data.get('prompt_suffixes'))
+            prompt_suffixes=data.get('prompt_suffixes'),
+            render_style=data.get('render_style'))
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except RuntimeError as e:

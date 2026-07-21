@@ -101,6 +101,14 @@ const TOPICS = [
       'convert', 'caption strategy', 'trigger'],
     guide: { chapter: 'settings-reference', anchor: 'per-dataset-settings' },
     app: { route: '/datasets' } },
+  // Render style (Wave 3): the target aesthetic for GENERATED variations. Shares
+  // the per-dataset-settings anchor, listed after kind-switch (both live in the
+  // same modal, kind's "Open this screen →" button stays the primary one).
+  { id: 'dataset-render-style', kind: 'setting', title: 'Render style (photoreal / 3D / anime / cartoon)',
+    keywords: ['render style', 'aesthetic', 'photoreal', '3d render', 'anime', 'cartoon',
+      'illustration', 'style', 'non-photoreal', 'consistency lora'],
+    guide: { chapter: 'settings-reference', anchor: 'per-dataset-settings' },
+    app: { route: '/datasets' } },
   // Same suffixes, second surface: the generation panel exposes them inline so
   // they can be tuned per batch. Listed AFTER dataset-settings-modal so the modal
   // keeps the anchor's "Open this screen →" button.

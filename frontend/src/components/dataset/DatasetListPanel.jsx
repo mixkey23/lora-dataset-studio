@@ -323,6 +323,9 @@ function NewDatasetForm({ onCreate, onClose }) {
   // Character only : fidélité visage seul (défaut) ou visage + corps (les marques
   // corporelles sont bannies des captions et la composition cible plus de corps).
   const [fidelity, setFidelity] = useState('face');
+  // Render style (Wave 3): the target aesthetic for GENERATED variations.
+  // 'photoreal' = historical default, byte-identical generation wrappers.
+  const [renderStyle, setRenderStyle] = useState('photoreal');
   const concept = kind === 'concept';
   // Style : esthétique globale absorbée par le LoRA — captions de contenu pur
   // obligatoires, aucun trigger d'activation, pas de fidélité visage.
@@ -401,6 +404,27 @@ function NewDatasetForm({ onCreate, onClose }) {
           <option value="qwen_image">Qwen-Image (prose captions)</option>
         </select>
       </label>
+      {/* Render style (Wave 3): the target aesthetic for GENERATED variations —
+          steers Nano Banana/ChatGPT/Klein prompts, skips Klein's photoreal-
+          anchoring consistency LoRA for non-photoreal styles. Changeable later
+          in Dataset settings. */}
+      <div className="flex flex-col gap-1 text-[0.6875rem] text-content-muted">
+        <span>Render style <span className="text-content-subtle normal-case">— target aesthetic for generated images (changeable later)</span></span>
+        <div className="flex flex-wrap gap-1.5">
+          {[['photoreal', 'Photoreal'], ['render_3d', '3D render'], ['anime_2d', '2D anime'],
+            ['cartoon_semireal', 'Semi-real cartoon'], ['illustration', 'Illustration'],
+            ['custom', 'Custom']].map(([val, label]) => (
+            <button key={val} type="button" onClick={() => setRenderStyle(val)}
+              aria-pressed={renderStyle === val}
+              className={`px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                renderStyle === val
+                  ? 'border-primary/60 bg-primary/15 text-content'
+                  : 'border-border bg-app/40 text-content-muted hover:bg-surface-raised'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
       {/* Fidélité (personnage) : visage seul (défaut) vs visage + corps. En mode corps,
           les marques corporelles permanentes sont bannies des captions (elles se lient
           au trigger) et la composition cible plus de bustes/corps. */}
@@ -442,7 +466,7 @@ function NewDatasetForm({ onCreate, onClose }) {
         </p>
         <button type="button"
           onClick={() => canCreate && onCreate(name.trim(), trigger.trim(), kind, conceptDesc.trim(), trainType,
-            (concept || style) ? undefined : fidelity)}
+            (concept || style) ? undefined : fidelity, renderStyle)}
           disabled={!canCreate}
           className="ml-auto px-4 py-1.5 rounded-lg bg-gradient-primary text-white text-sm font-semibold disabled:opacity-40">
           Create

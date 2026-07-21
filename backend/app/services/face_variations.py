@@ -8,44 +8,61 @@ from __future__ import annotations
 import json
 import re
 
+from .render_style_presets import generation_tail_for
+
 # Verrou d'identité renforcé (deep-research 2026-06-14, source primaire Google AI) :
 # nommer les traits + interdire l'embellissement améliore la cohérence du visage.
 # NB : la qualité de la photo de référence reste le facteur déterminant.
-IDENTITY_GUARD = (
+#
+# Wave 3 (render_style): each guard is split BASE + a trailing photographic-specific
+# clause so a non-photoreal dataset can swap just that clause (via
+# render_style_presets.generation_tail_for) without touching the identity-lock
+# language itself — the *_BASE constants are the single source of truth, the public
+# IDENTITY_GUARD* constants below stay byte-identical to their historical value
+# (still what a Settings "Restore default" resets to).
+_IDENTITY_GUARD_BASE = (
     "This is the SAME person as the reference image. Preserve their facial identity "
     "EXACTLY: same eye shape and color, nose, jawline, lips, skin tone and texture, "
     "and face proportions. Do NOT beautify, slim, age, or alter the face. Use the "
     "reference ONLY to lock the facial identity: take the clothing/outfit and the "
     "facial expression from the description below, and do NOT copy the outfit or the "
-    "expression shown in the reference image. "
-    "SFW, realistic photographic portrait.")
+    "expression shown in the reference image.")
+IDENTITY_GUARD = f"{_IDENTITY_GUARD_BASE} SFW, realistic photographic portrait."
 
 # Variante multi-références (Nano Banana) : avec un guard au singulier le modèle
 # peut s'ancrer sur une seule image ; on lui dit EXPLICITEMENT que toutes les refs
 # montrent la même personne et qu'il doit s'appuyer sur chacune d'elles.
-IDENTITY_GUARD_MULTI = (
+_IDENTITY_GUARD_MULTI_BASE = (
     "ALL the reference images show the SAME person (different angles, expressions or "
     "framings). Use EVERY reference image together to lock the identity. Preserve their "
     "facial identity EXACTLY: same eye shape and color, nose, jawline, lips, skin tone "
     "and texture, and face proportions. Do NOT beautify, slim, age, or alter the face. "
     "Use the reference images ONLY to lock the facial identity: take the clothing/outfit "
     "and the facial expression from the description below, and do NOT copy the outfit or "
-    "the expression shown in the reference images. "
-    "SFW, realistic photographic portrait.")
+    "the expression shown in the reference images.")
+IDENTITY_GUARD_MULTI = f"{_IDENTITY_GUARD_MULTI_BASE} SFW, realistic photographic portrait."
 
 # Klein restage + face-identity block (see wrap_variation_klein). Held as a named
 # constant so it can be the DEFAULT of the editable klein_identity override, byte
 # for byte what the wrapper used to inline. The nsfw-dependent tail ({ending}) is
 # NOT part of it — that stays a separate SFW/nudity clamp the wrapper appends.
-IDENTITY_GUARD_KLEIN = (
+_IDENTITY_GUARD_KLEIN_BASE = (
     "Restage the shot to match this description — change the pose, camera angle, "
     "framing, clothing and facial expression accordingly; do not copy the "
     "composition, the outfit or the facial expression of the reference image (use "
     "it only for the facial identity). "
     "Keep the facial identity exactly the same: same eye shape and color, nose, "
     "jawline, lips, skin tone and texture, and face proportions. Do not beautify "
-    "or alter the face. Sharp focus, natural skin texture with visible pores, "
-    "realistic lighting with soft shadows, high detail.")
+    "or alter the face.")
+IDENTITY_GUARD_KLEIN = (
+    f"{_IDENTITY_GUARD_KLEIN_BASE} Sharp focus, natural skin texture with visible "
+    "pores, realistic lighting with soft shadows, high detail.")
+
+_GUARD_BASE_BY_KIND = {
+    'face_single': _IDENTITY_GUARD_BASE,
+    'face_multi': _IDENTITY_GUARD_MULTI_BASE,
+    'klein_identity': _IDENTITY_GUARD_KLEIN_BASE,
+}
 
 # Fixed instruction for the manual "Klein upscale & improve" action. Lives here
 # (not in face_dataset_service) so all four editable identity/quality prompts share
@@ -103,6 +120,24 @@ def get_identity_prompt(kind: str) -> str:
     return default
 
 
+def _style_aware_identity(kind: str, render_style: str, include_tail: bool = True) -> str:
+    """Effective identity-lock text for `kind`, render_style-aware. The user's
+    global Settings override ALWAYS wins verbatim (highest precedence, untouched
+    by render_style) — only when the app is using its OWN shipped default does a
+    non-photoreal render_style affect the wording (photoreal/'custom'/unrecognized
+    -> no change, byte-identical to the shipped default).
+    `include_tail=False` (klein's caller, when it will place the style descriptor
+    itself in its own trailing `ending` clamp) drops the block's own photographic
+    clause entirely instead of appending a second copy of the same tail."""
+    resolved = get_identity_prompt(kind)
+    if resolved != identity_prompt_default(kind):
+        return resolved   # a real user override is active — honor it as-is
+    if not include_tail:
+        return _GUARD_BASE_BY_KIND[kind]
+    tail = generation_tail_for(render_style)
+    return f"{_GUARD_BASE_BY_KIND[kind]} {tail}" if tail else resolved
+
+
 # --- Prompt suffixes (community feature request) -----------------------------
 # A FREE creative direction the user attaches to the DATASET (global text and/or a
 # per-framing map {face,bust,body,back}) that rides on every generated variation.
@@ -147,11 +182,15 @@ def compose_prompt_suffix(global_suffix, framing_suffixes=None, framing=None) ->
     return ', '.join(parts)
 
 
-def wrap_variation(prompt: str, ref_count: int = 1, suffix: str = '') -> str:
+def wrap_variation(prompt: str, ref_count: int = 1, suffix: str = '',
+                   render_style: str = 'photoreal') -> str:
     """Guard-FIRST wrapper (API engines). The identity guard stays the very first
     thing the model reads; the dataset suffix extends the descriptive tail AFTER
-    it (appended to the creative prompt), so the lock is never diluted."""
-    guard = get_identity_prompt('face_multi' if ref_count > 1 else 'face_single')
+    it (appended to the creative prompt), so the lock is never diluted.
+    `render_style='photoreal'` (default) -> byte-identical to before this
+    parameter existed; any other value swaps the guard's trailing photographic
+    clause for the style's own wording (see _style_aware_identity)."""
+    guard = _style_aware_identity('face_multi' if ref_count > 1 else 'face_single', render_style)
     return f"{guard} {_append_suffix(prompt, suffix)}"
 
 
@@ -175,7 +214,7 @@ _KLEIN_FRAMING_DETAIL = {
 
 
 def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = None,
-                         suffix: str = '') -> str:
+                         suffix: str = '', render_style: str = 'photoreal') -> str:
     """Klein (FLUX.2, Kontext-lineage) is an INSTRUCTION-edit model: it follows
     imperative edit commands (the consistency LoRA's own usage example is "Turn
     this cat into a dog"). The API-engine wrapper above — preservation order
@@ -196,15 +235,33 @@ def wrap_variation_klein(prompt: str, nsfw: bool = False, framing: str | None = 
     to the creative prompt, before the framing detail): instruction-first means
     the description IS the command, so the suffix steers the intended result and
     never touches the restage/identity constraints that follow. Empty suffix ->
-    byte-identical output."""
+    byte-identical output.
+    `render_style='photoreal'` (default) -> byte-identical to before this
+    parameter existed. A non-photoreal style with a defined generation_tail (Wave
+    3) swaps "photograph" -> "image" in the command AND replaces the trailing
+    photographic clause (4.) with the style's own wording — Klein's own fine-tune
+    is still photoreal-biased regardless of prompt, this is best-effort steering,
+    not a guarantee. Note this `ending` clamp has NO identity_prompts override
+    (unlike the identity block below): it is purely render_style-conditional."""
+    tail = generation_tail_for(render_style)
     detail = _KLEIN_FRAMING_DETAIL.get(framing or '', '')
-    ending = ("Explicit nudity is allowed; render natural, anatomically correct forms. "
-              "Professional realistic photograph.") if nsfw else \
-             "Professional realistic photograph, SFW."
+    if tail:
+        subject = 'image'
+        ending = (f"Explicit nudity is allowed; render natural, anatomically correct forms. {tail}"
+                  if nsfw else f"{tail} SFW.")
+    else:
+        subject = 'photograph'
+        ending = ("Explicit nudity is allowed; render natural, anatomically correct forms. "
+                  "Professional realistic photograph.") if nsfw else \
+                 "Professional realistic photograph, SFW."
+    # The style descriptor lives in `ending` (below) — when there's a tail, the
+    # identity block drops its own trailing photographic clause instead of
+    # repeating the same wording twice.
+    identity_block = _style_aware_identity('klein_identity', render_style, include_tail=not tail)
     return (
-        f"Create a new photograph of the same person as the reference image: {_append_suffix(prompt, suffix)}. "
+        f"Create a new {subject} of the same person as the reference image: {_append_suffix(prompt, suffix)}. "
         + (f"{detail} " if detail else "")
-        + f"{get_identity_prompt('klein_identity')} {ending}")
+        + f"{identity_block} {ending}")
 
 
 # --- Anti-fuite tenue / expression (constat terrain 2026-07-14) ---------------

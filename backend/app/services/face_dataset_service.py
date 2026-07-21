@@ -266,6 +266,22 @@ def normalize_kind(kind) -> str | None:
     return k if k in ('concept', 'style') else None
 
 
+# Render-style axis (Wave 3): the target AESTHETIC of generated variations,
+# orthogonal to kind/train_type. 'photoreal' (the historical default) and
+# unrecognized values both normalize to None (stored NULL) so existing
+# datasets and their generation wrappers stay byte-identical — this is not a
+# disruptive switch like kind (no re-caption implications, no guard: captions
+# are already style-neutral).
+RENDER_STYLES = ('render_3d', 'anime_2d', 'cartoon_semireal', 'illustration', 'custom')
+
+
+def normalize_render_style(value) -> str | None:
+    """A recognized non-photoreal style -> as-is ; 'photoreal'/blank/unknown -> None
+    (stored NULL = photoreal, the historical default)."""
+    v = (value or '').strip().lower()
+    return v if v in RENDER_STYLES else None
+
+
 def _safe_json(text):
     """None-safe json.loads for TEXT columns holding JSON (never raises)."""
     if not text:
@@ -643,7 +659,8 @@ def dataset_prompt_suffix(ds, framing=None) -> str:
 
 
 def create_dataset(user_id, name, trigger_word, kind=None, concept_desc=None, train_type=None,
-                   fidelity=None, prompt_suffix=None, prompt_suffixes=None, *, commit=True):
+                   fidelity=None, prompt_suffix=None, prompt_suffixes=None, render_style=None,
+                   *, commit=True):
     """Create a dataset and return its row.
 
     ``commit=False`` is reserved for callers that need to coordinate the row with
@@ -672,7 +689,10 @@ def create_dataset(user_id, name, trigger_word, kind=None, concept_desc=None, tr
                      prompt_suffix=(_normalize_prompt_suffix(prompt_suffix)
                                     if prompt_suffix is not None else None),
                      prompt_suffixes=(_normalize_prompt_suffixes(prompt_suffixes)
-                                      if prompt_suffixes is not None else None))
+                                      if prompt_suffixes is not None else None),
+                     # Target render aesthetic for FUTURE generations (Wave 3) —
+                     # None/'photoreal' both normalize to NULL (historical default).
+                     render_style=normalize_render_style(render_style))
     db.session.add(ds)
     db.session.flush()
     if k == 'style' and not (trigger_word or '').strip():
@@ -711,9 +731,22 @@ def _guard_kind_switch(dataset_id):
             'pass). Wait for it to finish before changing the kind.')
 
 
+def _effective_klein_lora_strength(ds, lora_strength):
+    """None (no explicit user override) + a non-photoreal render_style -> force the
+    consistency LoRA off (it anchors PHOTOGRAPHIC composition/structure — actively
+    counter-productive for a stylized target). An explicit user value (even for a
+    non-photoreal dataset) always wins over this automatic default — same
+    "explicit wins" precedence the rest of the app uses (e.g. custom VAE/TE
+    overrides). Mirrors klein_edit_helper's own "degrade, don't fail" contract:
+    strength <= 0 already skips the LoRA node entirely, no workflow fork needed."""
+    if lora_strength is None and (getattr(ds, 'render_style', None) or 'photoreal') != 'photoreal':
+        return 0.0
+    return lora_strength
+
+
 def update_dataset_settings(user_id, dataset_id, *, name=None, trigger_word=None,
                             concept_desc=None, kind=None, prompt_suffix=None,
-                            prompt_suffixes=None):
+                            prompt_suffixes=None, render_style=None):
     """Edit a dataset's identity AFTER creation. Returns {'ok', 'concept_desc_changed'}
     (plus {'kind_changed', 'kind', 'previous_kind'} when the kind actually changed),
     or None if the dataset is absent; raises ValueError on invalid input and
@@ -738,7 +771,13 @@ def update_dataset_settings(user_id, dataset_id, *, name=None, trigger_word=None
 
     **prompt_suffix** (global text) / **prompt_suffixes** (map {face,bust,body,back}):
     None = untouched; '' / {} = cleared. Applied at generation time only, so editing
-    them changes FUTURE generations/regenerations — existing images are untouched."""
+    them changes FUTURE generations/regenerations — existing images are untouched.
+
+    **render_style** (Wave 3): the target aesthetic for FUTURE generations
+    (photoreal/render_3d/anime_2d/cartoon_semireal/illustration/custom). None =
+    untouched; any other value (including '' or an unrecognized string) normalizes
+    via normalize_render_style — never a 400, same tolerance as an unknown kind.
+    Not disruptive: no guard, no re-caption implications."""
     ds = get_dataset(user_id, dataset_id)
     if not ds:
         return None
@@ -791,6 +830,8 @@ def update_dataset_settings(user_id, dataset_id, *, name=None, trigger_word=None
         ds.prompt_suffix = _normalize_prompt_suffix(prompt_suffix)
     if prompt_suffixes is not None:
         ds.prompt_suffixes = _normalize_prompt_suffixes(prompt_suffixes)
+    if render_style is not None:
+        ds.render_style = normalize_render_style(render_style)
     db.session.commit()
     res = {'ok': True, 'concept_desc_changed': concept_changed}
     if kind_changed:
@@ -2030,6 +2071,9 @@ def dataset_payload(user_id, dataset_id):
         'id': ds.id, 'name': ds.name, 'trigger_word': ds.trigger_word,
         'train_type': (ds.train_type or 'zimage'),
         'kind': (ds.kind or 'character'),
+        # Target render aesthetic for FUTURE generations (Wave 3) → settings
+        # modal prefill. 'photoreal' = historical default, byte-identical wrappers.
+        'render_style': (ds.render_style or 'photoreal'),
         # Dual long+short captioning toggle (Advanced options) → the caption editor shows
         # the short field only when this is on.
         'dual_captions': dual_captions_enabled(ds),
@@ -4362,9 +4406,11 @@ def generate_variations(user_id, dataset_id, variations, multiplier, klein_model
                         # suffix exactly once (never a double application).
                         edit_prompt=wrap_variation_klein(
                             v['prompt'], nsfw=nsfw, framing=v.get('framing'),
-                            suffix=dataset_prompt_suffix(ds, v.get('framing'))),
+                            suffix=dataset_prompt_suffix(ds, v.get('framing')),
+                            render_style=getattr(ds, 'render_style', None) or 'photoreal'),
                         klein_model=klein_model,
-                        lora_strength=lora_strength, extra_ref_paths=extra_paths,
+                        lora_strength=_effective_klein_lora_strength(ds, lora_strength),
+                        extra_ref_paths=extra_paths,
                         generation_loras=run_loras,
                         extra_metadata={'is_dataset': True, 'dataset_id': dataset_id,
                                         'variation_label': v.get('label')})
@@ -4680,9 +4726,11 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
                 framing=img.framing,
                 # CURRENT dataset suffix, applied at wrap: `prompt` is the raw
                 # stored/edited creative prompt, so this is the ONLY application.
-                suffix=dataset_prompt_suffix(ds, img.framing)),
+                suffix=dataset_prompt_suffix(ds, img.framing),
+                render_style=getattr(ds, 'render_style', None) or 'photoreal'),
             klein_model=model,
-            lora_strength=lora_strength, extra_ref_paths=extra_paths,
+            lora_strength=_effective_klein_lora_strength(ds, lora_strength),
+            extra_ref_paths=extra_paths,
             generation_loras=resolve_generation_lora_preset(generation_lora_preset),
             extra_metadata={'is_dataset': True, 'dataset_id': img.dataset_id,
                             'variation_label': img.variation_label})
@@ -4748,7 +4796,8 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
             try:
                 threading.Thread(target=_run_nanobanana_batch,
                                  args=(app, [(img.id, prompt, aspect,
-                                              dataset_prompt_suffix(ds, img.framing))],
+                                              dataset_prompt_suffix(ds, img.framing),
+                                              getattr(ds, 'render_style', None) or 'photoreal')],
                                        ref_bytes, engine, img.dataset_id),
                                  daemon=True).start()
             except Exception as e:
@@ -4772,7 +4821,8 @@ def regenerate_image(user_id, image_id, lora_strength=None, prompt=None, app=Non
                 out = api_generate(
                     ref_bytes,
                     wrap_variation(prompt, ref_count=len(ref_bytes),
-                                   suffix=dataset_prompt_suffix(ds, img.framing)),
+                                   suffix=dataset_prompt_suffix(ds, img.framing),
+                                   render_style=getattr(ds, 'render_style', None) or 'photoreal'),
                     **gen_kwargs)
             except SubscriptionQuotaExceeded:
                 out = None
@@ -4873,12 +4923,14 @@ def _run_nanobanana_batch(app, items, ref_bytes, engine='nanobanana', dataset_id
         if dataset_id is not None else None
 
     def _run_one(item):
-        # item = (image_id, prompt, aspect, suffix) ; aspect optionnel (rétro-compat
-        # → '1:1'), suffix optionnel (direction créative du dataset, déjà composée
-        # par cadrage au call-site — rétro-compat → '').
+        # item = (image_id, prompt, aspect, suffix, render_style) ; aspect optionnel
+        # (rétro-compat → '1:1'), suffix optionnel (direction créative du dataset,
+        # déjà composée par cadrage au call-site — rétro-compat → ''), render_style
+        # optionnel (Wave 3, rétro-compat → 'photoreal').
         image_id, prompt = item[0], item[1]
         aspect = item[2] if len(item) > 2 else '1:1'
         suffix = item[3] if len(item) > 3 else ''
+        render_style = item[4] if len(item) > 4 else 'photoreal'
         # Stop AVANT l'appel API : cancel_pending supprime les lignes en vol — si
         # celle-ci a disparu, ne pas payer une génération qui sera jetée (le bouton
         # Stop doit économiser le RESTE du batch, pas seulement masquer les tuiles).
@@ -4907,7 +4959,8 @@ def _run_nanobanana_batch(app, items, ref_bytes, engine='nanobanana', dataset_id
             gen_kwargs['force_lane'] = force_lane
         try:
             out = api_generate(ref_bytes,
-                               wrap_variation(prompt, ref_count=n_refs, suffix=suffix),
+                               wrap_variation(prompt, ref_count=n_refs, suffix=suffix,
+                                              render_style=render_style),
                                **gen_kwargs)
             if not out:
                 # api_generate signale certains refus/vides par un retour falsy
@@ -5008,7 +5061,8 @@ def generate_variations_nanobanana(app, user_id, dataset_id, variations, multipl
             # row keeps the raw prompt, the batch worker applies it at wrap time.
             items.append((img.id, v['prompt'],
                           aspect_for_label(v.get('label'), v.get('framing')),
-                          dataset_prompt_suffix(ds, v.get('framing'))))
+                          dataset_prompt_suffix(ds, v.get('framing')),
+                          getattr(ds, 'render_style', None) or 'photoreal'))
 
     threading.Thread(target=_run_nanobanana_batch,
                      args=(app, items, ref_bytes, engine, dataset_id),

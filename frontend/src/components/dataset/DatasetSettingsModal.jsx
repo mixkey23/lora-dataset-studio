@@ -40,11 +40,26 @@ const KIND_OPTIONS = [
   ['style', KIND_LABELS.style, 'An always-on aesthetic: control its influence with the LoRA weight'],
 ];
 
+// Render style (Wave 3): the target AESTHETIC of GENERATED variations — orthogonal
+// to kind. 'photoreal' is the historical default (byte-identical generation
+// wrappers); every other value steers Nano Banana/ChatGPT/Klein prompts toward
+// that look and auto-skips Klein's consistency LoRA (it anchors photographic
+// composition, which fights a stylized target).
+const RENDER_STYLE_OPTIONS = [
+  ['photoreal', 'Photoreal', 'Real photography — the default, unchanged behavior'],
+  ['render_3d', '3D render', 'CGI / game-engine style rendering'],
+  ['anime_2d', '2D anime', 'Flat cel-shaded anime/manga'],
+  ['cartoon_semireal', 'Semi-real cartoon', 'Stylized, painterly proportions'],
+  ['illustration', 'Illustration', 'Digital painting / concept art'],
+  ['custom', 'Custom', "Write your own direction below (prompt suffix) — this app won't add one"],
+];
+
 export default function DatasetSettingsModal({ d, busy, onSave, onClose }) {
   const initialKind = normalizeKindLabel(d.kind);
   const [kind, setKind] = useState(initialKind);
   const concept = kind === 'concept';
   const style = kind === 'style';
+  const [renderStyle, setRenderStyle] = useState(d.render_style || 'photoreal');
   const [name, setName] = useState(d.name || '');
   const [trigger, setTrigger] = useState(d.trigger_word || '');
   const [desc, setDesc] = useState(d.concept_desc || '');
@@ -73,6 +88,9 @@ export default function DatasetSettingsModal({ d, busy, onSave, onClose }) {
       name: name.trim(),
       // The kind is sent every save; the server only acts on a real change.
       kind,
+      // Render style (Wave 3): sent every save, same as kind — not disruptive,
+      // the server just applies it to future generations.
+      render_style: renderStyle,
       trigger_word: style ? (d.trigger_word || '') : trigger.trim(),
       concept_desc: concept ? desc.trim() : undefined,
       // Always sent: '' / {} clear on the server (the map is replaced whole).
@@ -117,6 +135,35 @@ export default function DatasetSettingsModal({ d, busy, onSave, onClose }) {
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Render style selector (Wave 3) — the target aesthetic for GENERATED
+            variations. Orthogonal to kind: no disruptive-switch confirmation
+            needed, it never deletes/invalidates anything. */}
+        <div className="flex flex-col gap-1.5">
+          <span className="text-content-muted text-xs flex items-center gap-1">
+            Render style
+            <HelpBadge topic="dataset-render-style" />
+          </span>
+          <div className="flex flex-wrap gap-1.5">
+            {RENDER_STYLE_OPTIONS.map(([val, label, hint]) => (
+              <button key={val} type="button" onClick={() => setRenderStyle(val)} title={hint}
+                aria-pressed={renderStyle === val}
+                className={`px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${
+                  renderStyle === val
+                    ? 'border-primary/60 bg-primary/15 text-content'
+                    : 'border-border bg-app/40 text-content-muted hover:bg-surface-raised'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {renderStyle !== 'photoreal' && (
+            <span className="text-content-subtle text-[0.6875rem]">
+              Generated variations (Nano Banana / ChatGPT / Klein) are steered toward this look.
+              Klein&apos;s consistency LoRA (it anchors photographic composition) is skipped
+              automatically unless you set its strength by hand in Klein tuning.
+            </span>
+          )}
         </div>
 
         {style ? (

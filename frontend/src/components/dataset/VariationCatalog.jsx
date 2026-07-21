@@ -87,7 +87,7 @@ function GpuIcon({ className }) {
   );
 }
 
-export default function VariationCatalog({ onGenerate, busy, generating = null, hasRef, composition, images = [], bodyFidelity = false, promptSuffix = '', promptSuffixes = null, onSaveSuffixes = null }) {
+export default function VariationCatalog({ onGenerate, busy, generating = null, hasRef, composition, images = [], bodyFidelity = false, promptSuffix = '', promptSuffixes = null, onSaveSuffixes = null, renderStyle = 'photoreal' }) {
   const toast = useToast();
   const { caps } = useCapabilities();
   const [catalog, setCatalog] = useState([]);
@@ -912,6 +912,14 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                 ~0.5 balanced · 0.2–0.4 for big restagings · 0 = off. Face identity comes from the
                 reference photo(s); add extra references for a stronger identity lock.
               </p>
+              {renderStyle !== 'photoreal' && (
+                <p className="text-amber-300/90 text-[0.625rem]">
+                  This dataset targets a non-photoreal render style: the consistency LoRA is
+                  skipped automatically (it anchors photographic composition) unless you set a
+                  strength above by hand. Klein&apos;s own fine-tune is still photoreal-biased —
+                  Nano Banana/ChatGPT generally follow a style direction more reliably.
+                </p>
+              )}
             </div>
             {/* Optional generation-LoRA preset (Idea by @waltm) — pick one of
                 the named combinations from Settings; its chain (read-only
