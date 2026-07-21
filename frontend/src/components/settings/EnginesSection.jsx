@@ -255,6 +255,9 @@ const IDENTITY_PROMPTS = [
   { key: 'klein_identity', id: 'identity-prompt-klein-identity',
     label: 'Klein — restage & face-identity block',
     desc: 'The instruction block Klein (local) uses to restage the shot while keeping the face identical. Steers pose/framing/outfit changes without altering the person.' },
+  { key: 'qwen_edit_identity', id: 'identity-prompt-qwen-edit-identity',
+    label: 'Qwen Edit — restage & face-identity block',
+    desc: 'Same role as the Klein block above, for the local Qwen Edit engine. Steers pose/framing/outfit changes without altering the person.' },
 ]
 
 /* The default is real code text shipped in face_variations.py, delivered

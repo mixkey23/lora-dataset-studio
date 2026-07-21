@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-qwen-edit-model-picker',
+    date: '2026-07-21',
+    title: '🎨 Pick which Qwen Edit checkpoint to use',
+    blurb:
+      "If you keep several Qwen-Image-Edit-2511 checkpoints side by side (an SFW build and an uncensored fine-tune, say), the 🎨 Qwen Edit tuning panel in Generate variations now shows a base-model picker, same as Klein's. Its restage/face-identity prompt is also editable now, in Settings ▸ Image engines ▸ Identity & Klein prompts.",
+    to: '/datasets',
+  },
+  {
     id: '2026-07-21-qwen-edit-engine',
     date: '2026-07-21',
     title: '🎨 A second local engine for Generate variations',

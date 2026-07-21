@@ -555,6 +555,10 @@ def _scan_models() -> dict:
 
     result['klein'] = sorted(set(result['klein']))
     result['qwen_multiangle'] = sorted(set(result['qwen_multiangle']))
+    # Qwen Edit (Wave 4) shares its checkpoint pool with Qwen Multi-angle — same
+    # 'qwen' + 'edit' folder-name scan, exposed under its own key so the picker
+    # doesn't read a bucket named after an unrelated feature.
+    result['qwen_edit'] = result['qwen_multiangle']
     sdxl = []
     for root in comfy_model_paths.search_roots('checkpoints'):
         sdxl.extend(_model_files(Path(root)))

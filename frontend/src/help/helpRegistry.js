@@ -265,6 +265,8 @@ const TOPICS = [
     ['identity', 'prompt', 'guard', 'lock', 'face', 'reference', 'beautify', 'preserve', 'consistency', 'edit prompt']),
   setting('identity_prompts.klein_identity', 'engines', 'identity-prompts', 'Klein identity prompt',
     ['identity', 'klein', 'restage', 'face', 'prompt', 'preserve', 'pose']),
+  setting('identity_prompts.qwen_edit_identity', 'engines', 'identity-prompts', 'Qwen Edit identity prompt',
+    ['identity', 'qwen', 'qwen edit', 'restage', 'face', 'prompt', 'preserve', 'pose']),
   setting('identity_prompts.klein_improve', 'engines', 'identity-prompt-klein-improve', 'Klein improve prompt & toggle',
     ['klein', 'improve', 'upscale', 'enhance', 'prompt', 'texture', 'detail', 'toggle', 'disable']),
   setting('GEMINI_API_KEY', 'engines', 'GEMINI_API_KEY', 'Gemini API key',

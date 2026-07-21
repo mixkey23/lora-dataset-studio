@@ -1,6 +1,7 @@
 /** Variation catalog: presets + per-entry toggles + multiplier + Klein picker. */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Flux2KleinModelPicker from '../shared/Flux2KleinModelPicker';
+import QwenEditModelPicker from '../shared/QwenEditModelPicker';
 import { useToast } from '../common/Toast';
 import { useCapabilities } from '../../context/CapabilitiesContext';
 import { apiFetch } from '../../api/fetchClient';
@@ -96,6 +97,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const [selected, setSelected] = useState(new Set());
   const [multiplier, setMultiplier] = useState(1);
   const [klein, setKlein] = useState(null);
+  const [qwenModel, setQwenModel] = useState(null);
   // 🔞 NSFW mode — local Klein ONLY (the backend refuses NSFW on API engines).
   // Unlocks the uncensored body catalog + a free-prompt custom variation.
   const [nsfwMode, setNsfwMode] = useState(() => {
@@ -464,8 +466,10 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       if (!res?.ok) return;   // save failed → don't generate with a stale suffix
     }
     // Optional generation-LoRA preset (Klein only): only the NAME rides — the
-    // backend resolves the chain from its own config (fail-closed).
-    onGenerate(toGen, multiplier, klein, loraStrength, generator,
+    // backend resolves the chain from its own config (fail-closed). The model
+    // override rides on the same wire field for either local engine — only
+    // ONE can be active at a time, so picking by isQwenEdit is unambiguous.
+    onGenerate(toGen, multiplier, isQwenEdit ? qwenModel : klein, loraStrength, generator,
       generationLoraPresetPayload({ isKlein, presetName: loraPresetName, presets: loraPresets }));
   };
 
@@ -1023,12 +1027,13 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         </details>
       )}
 
-      {/* Qwen Edit-only tuning: consistency-LoRA strength (shares the same
-          slider state Klein's panel uses — both engines take the identical
-          `lora_strength` field on the wire). No model picker: the UNET/VAE/TE
-          are auto-resolved by filename scan (Wave 1's Qwen Multi-angle already
-          established that pattern). The Lightning speed toggle is Settings-only
-          (config.qwen_edit.lightning_enabled) — no per-run override yet. */}
+      {/* Qwen Edit-only tuning: model picker (only rendered when 2+ Qwen-Image-
+          Edit-2511 checkpoints are on disk — e.g. an SFW build alongside a
+          community NSFW fine-tune) + consistency-LoRA strength (shares the
+          same slider state Klein's panel uses — both engines take the
+          identical `lora_strength` field on the wire). The Lightning speed
+          toggle is Settings-only (config.qwen_edit.lightning_enabled) — no
+          per-run override yet. */}
       {isQwenEdit && qeAvailable && (
         <details className="rounded-lg border border-border bg-app/30 open:pb-2">
           <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
@@ -1038,6 +1043,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
             </span>
           </summary>
           <div className="px-2.5 pt-1 flex flex-col gap-2">
+            <div className="max-w-sm"><QwenEditModelPicker onChange={setQwenModel} /></div>
             <div className="flex flex-col gap-0.5">
               <label className="flex items-center gap-2 text-content-muted text-[0.6875rem]">
                 <span className="whitespace-nowrap">
@@ -1059,7 +1065,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
                 </p>
               )}
               <p className="text-content-subtle text-[0.625rem]">
-                Lightning (speed) LoRA and the exact model file are configured in{' '}
+                Lightning (speed) LoRA is configured in{' '}
                 <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
                   Settings › Image engines
                 </a>.
