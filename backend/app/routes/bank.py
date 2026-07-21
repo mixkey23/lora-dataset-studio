@@ -188,10 +188,12 @@ def bank_coverage(bank_id):
 def bank_caption(bank_id):
     """Caption a selection (image_ids) or every non-rejected image, reusing the
     dataset caption engines. {force:true} re-captions already-captioned rows.
-    202/409/503/400."""
+    {vocabulary} picks the register ('explicit'|'clinical'|'safe') — same lane as
+    the dataset caption; invalid → 400. 202/409/503/400."""
     data = request.get_json(silent=True) or {}
     return _start(banks.start_caption, _app(), LOCAL_USER, bank_id,
-                  ids=data.get('image_ids') or None, force=bool(data.get('force')))
+                  ids=data.get('image_ids') or None, force=bool(data.get('force')),
+                  vocabulary=data.get('vocabulary') or None)
 
 
 @bp.post('/bank/<int:bank_id>/pipeline')
@@ -216,6 +218,21 @@ def bank_promote(bank_id):
         return jsonify({'error': 'dataset_id is required'}), 400
     return _start(banks.start_promote, _app(), LOCAL_USER, bank_id,
                   data.get('image_ids') or [], dataset_id)
+
+
+@bp.get('/bank/<int:bank_id>/promotable')
+def bank_promotable(bank_id):
+    """How many kept images 'promote all' would copy into ?dataset_id right now
+    — the honest count for the promote modal (per-target: images already on
+    OTHER datasets still count)."""
+    try:
+        dataset_id = int(request.args.get('dataset_id'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'dataset_id is required'}), 400
+    n = banks.promotable_count(LOCAL_USER, bank_id, dataset_id)
+    if n is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'count': n})
 
 
 @bp.post('/bank/<int:bank_id>/cancel')
@@ -246,7 +263,8 @@ def bank_dups_resolve(bank_id):
     try:
         out = banks.resolve_dups(LOCAL_USER, bank_id, strategy=strategy,
                                  group=data.get('group'),
-                                 keep_ids=data.get('keep_ids'))
+                                 keep_ids=data.get('keep_ids'),
+                                 respect_existing_keep=False)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'ok': True, **out})
@@ -275,7 +293,8 @@ def bank_semantic_dups_resolve(bank_id):
     try:
         out = banks.resolve_semantic_dups(LOCAL_USER, bank_id, strategy=strategy,
                                           group=data.get('group'),
-                                          keep_ids=data.get('keep_ids'))
+                                          keep_ids=data.get('keep_ids'),
+                                          respect_existing_keep=False)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'ok': True, **out})

@@ -202,6 +202,10 @@ export default function CloudRunsPage() {
   const [data, setData] = useState(null);
   const [stopping, setStopping] = useState({});     // run_id -> bool
   const [stoppingLocal, setStoppingLocal] = useState(false);
+  // Recent-history depth. The 5 s poll stays light by default (15); "Load older
+  // runs" bumps this on demand (backend caps the history at 100), so a long
+  // history is opt-in rather than paid on every tick.
+  const [historyLimit, setHistoryLimit] = useState(15);
   // React disables the button on the next render. The ref also closes the tiny
   // gap before that render, so a fast double-click cannot send two kill calls.
   const stoppingLocalRef = useRef(false);
@@ -269,10 +273,10 @@ export default function CloudRunsPage() {
 
   const poll = useCallback(async () => {
     try {
-      const r = await fetch('/api/dataset/train/cloud/runs?limit=15', { credentials: 'include' });
+      const r = await fetch(`/api/dataset/train/cloud/runs?limit=${historyLimit}`, { credentials: 'include' });
       if (r.ok) setData(await r.json());
     } catch { /* transient — next tick retries */ }
-  }, []);
+  }, [historyLimit]);
 
   useEffect(() => {
     let alive = true;
@@ -615,8 +619,11 @@ export default function CloudRunsPage() {
                 aria-expanded={!!lineageOpen[run.record_id]}
                 title={run.lineage
                   ? "Show this run's lineage — the runs it continued from or that branched off it"
-                  : "Show this run's checkpoints as a graph — download or continue from any of them"}
-                className="rounded-lg border border-transparent px-2 py-1 text-content-muted hover:border-border hover:text-content text-xs font-medium">
+                  : "Show this run's checkpoints as a graph — import / generate / download / continue from any of them"}
+                className={'rounded-lg border px-2 py-1 text-xs font-semibold transition-colors '
+                  + (lineageOpen[run.record_id]
+                    ? 'border-indigo-400/60 bg-indigo-500/20 text-indigo-100 '
+                    : 'border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 ')}>
                 {lineageOpen[run.record_id]
                   ? (run.lineage ? '🌳 Hide lineage' : '◉ Hide graph')
                   : (run.lineage ? '🌳 Lineage' : '◉ Graph')}
@@ -636,7 +643,14 @@ export default function CloudRunsPage() {
               loading={lineageData[run.record_id]?.loading}
               error={lineageData[run.record_id]?.error}
               onSelect={jumpToRun}
-              onContinueCheckpoint={continueFromCheckpoint} />
+              onContinueCheckpoint={continueFromCheckpoint}
+              refetchTree={async () => {
+                const r = await fetch(`/api/dataset/train/runs/${run.record_id}/lineage`, { credentials: 'include' });
+                if (!r.ok) throw new Error('unavailable');
+                const tree = await r.json();
+                setLineageData((m) => ({ ...m, [run.record_id]: { tree } }));
+                return tree;
+              }} />
           )}
         </div>
       </div>
@@ -897,6 +911,14 @@ export default function CloudRunsPage() {
                 </section>
               );
             })}
+            {recent.length >= historyLimit && historyLimit < 100 && (
+              <button type="button"
+                onClick={() => setHistoryLimit((n) => Math.min(n + 25, 100))}
+                title="The list keeps only the most recent runs to stay light; load older ones on demand."
+                className="self-center mt-1 rounded-lg border border-border bg-surface px-3 py-1.5 text-content-muted hover:text-content text-xs font-semibold">
+                Load older runs
+              </button>
+            )}
           </div>
           )}
         </div>

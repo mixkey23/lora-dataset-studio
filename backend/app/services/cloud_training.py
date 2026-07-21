@@ -383,8 +383,8 @@ def _merge_resume_overrides(snapshot, patch):
 
 def continue_cloud_run(user_id, run_id, extra_steps=1000, from_step=None,
                        overrides=None) -> dict:
-    """Reprend un run cloud TERMINÉ (done) depuis un checkpoint harvesté et vise
-    step_de_reprise + extra_steps — le pendant cloud de
+    """Reprend un run cloud TERMINAL (done OU en échec) depuis un checkpoint
+    harvesté et vise step_de_reprise + extra_steps — le pendant cloud de
     lora_training.continue_training. C'est un VRAI launch_cloud_training (pod
     frais, mêmes garde-fous : limite de runs actifs, budget, unicité par
     famille) avec les paramètres persistés du run source (variante/famille/
@@ -402,8 +402,14 @@ def continue_cloud_run(user_id, run_id, extra_steps=1000, from_step=None,
     run = db.session.get(CloudTrainingRun, int(run_id))
     if not run:
         raise ValueError('unknown cloud run')
-    if run.status != 'done':
-        raise ValueError('only a finished (done) run can be continued')
+    # Continue from any TERMINAL run — a run that failed at pod teardown
+    # ('pod did not become ready in time') can still have harvested, complete
+    # checkpoints in its staging, and resuming from one is valid. Only a run
+    # that is STILL RUNNING is blocked; the `no harvested checkpoint` check
+    # below is the real gate for a terminal run whose staging was cleaned.
+    if run.status in ACTIVE_STATES:
+        raise ValueError('a run that is still running cannot be continued — '
+                         'wait for it to finish or fail')
     try:
         p = json.loads(run.train_params or '{}')
     except ValueError:
@@ -744,6 +750,18 @@ def _is_retryable_pod_failure(error) -> bool:
     return any(marker in text for marker in _AUTO_RETRY_MARKERS)
 
 
+_TRANSIENT_CREATE_CODES = ('400', '408', '409', '429', '500', '502', '503', '504')
+
+
+def _is_transient_create_error(err) -> bool:
+    """A vast create_instance refusal worth retrying with a FRESH offer: the
+    offer was just taken (vast answers 400/409 — run #80's 'HTTP 400 {}'), a
+    rate limit (429), or a vast-side hiccup (5xx). NOT an auth/quota rejection
+    (401/403) or a genuinely-missing offer (404) that a retry cannot fix."""
+    m = re.search(r'HTTP\s+(\d{3})', str(err or ''))
+    return bool(m and m.group(1) in _TRANSIENT_CREATE_CODES)
+
+
 def _auto_retry_child(parent_id):
     """Existing child, including the crash window before its id reached parent."""
     for child in CloudTrainingRun.query.order_by(CloudTrainingRun.id.desc()).all():
@@ -1032,49 +1050,72 @@ def _provision(run):
     params = json.loads(run.train_params or '{}')
     fam = params.get('train_type') or 'zimage'
     min_vram = (c.get('min_vram_gb') or {}).get(fam, 24)
-    offers = vast_client.search_offers(
-        min_vram_gb=min_vram, max_dph=c.get('max_price_per_hour', 0.80),
-        min_inet_down_mbps=int(c.get('min_inet_down_mbps') or 0),
-        min_reliability=float(c.get('min_reliability') or 0.98),
-        min_disk_bw_mbps=int(c.get('min_disk_bw_mbps') or 0),
-        verified_only=bool(c.get('verified_only', True)),
-        secure_cloud_only=bool(c.get('secure_cloud_only', False)))
-    if not offers:
-        raise RuntimeError(
-            f'no vast.ai offer matches (>= {min_vram} GB VRAM, '
-            f'<= ${c.get("max_price_per_hour", 0.80)}/h) — raise the price cap in Settings')
-    offer = _pick_offer(_filter_offers(offers), params.get('requested_gpu'),
-                        strict=bool(params.get('strict_gpu')))
-    # Stamp the host identity so a boot failure can blacklist THIS machine.
-    if offer.get('machine_id') is not None:
-        params['machine_id'] = offer['machine_id']
-        _set(run, train_params=json.dumps(params))
     disk_gb = _disk_gb_for(c, params)
     template_hash = (c.get('template_hash') or '').strip()
-    if template_hash:
-        # Preferred path (smoke-validated 2026-07-12): the official template
-        # publishes the UI behind the pod's Caddy proxy on ui_port and vast
-        # generates the per-instance auth token (picked up from the instance
-        # record during boot-wait). HF_TOKEN reaches the pod later via
-        # ensure_settings(), not env.
-        token = ''
-        instance_id = vast_client.create_instance(
-            offer['offer_id'], disk_gb=disk_gb,
-            label=run.vast_label, template_hash=template_hash,
-            image=(c.get('image') or None))
-    else:
-        # Raw-image fallback (config escape hatch): direct port publish +
-        # our own bearer token on the UI itself.
-        token = pysecrets.token_urlsafe(24)
-        port = int(c.get('ui_port') or 18675)
-        env = {'AI_TOOLKIT_AUTH': token, f'-p {port}:{port}': '1'}
-        hf = cfg.secret('HF_TOKEN')
-        if hf:
-            env['HF_TOKEN'] = hf
-        instance_id = vast_client.create_instance(
-            offer['offer_id'], disk_gb=disk_gb,
-            label=run.vast_label, image=c.get('image'), env=env,
-            onstart=(c.get('onstart') or None))
+    # A transient create refusal (offer just taken -> HTTP 400/409, rate limit,
+    # vast 5xx — run #80's 'HTTP 400 {}' died here with no retry) gets a bounded
+    # re-search: the failed offer is likely gone, so each attempt excludes the
+    # offers already tried and picks a fresh one. A non-transient refusal (auth,
+    # 404) or an exhausted budget raises immediately.
+    tried_offers = set()
+    offer = instance_id = None
+    token = ''
+    for attempt in range(1, _CREATE_INSTANCE_ATTEMPTS + 1):
+        offers = vast_client.search_offers(
+            min_vram_gb=min_vram, max_dph=c.get('max_price_per_hour', 0.80),
+            min_inet_down_mbps=int(c.get('min_inet_down_mbps') or 0),
+            min_reliability=float(c.get('min_reliability') or 0.98),
+            min_disk_bw_mbps=int(c.get('min_disk_bw_mbps') or 0),
+            verified_only=bool(c.get('verified_only', True)),
+            secure_cloud_only=bool(c.get('secure_cloud_only', False)))
+        pool = [o for o in offers if o.get('offer_id') not in tried_offers]
+        if not pool:
+            if tried_offers:
+                raise RuntimeError(
+                    'no fresh vast.ai offer left after a transient create refusal '
+                    f'(tried {len(tried_offers)})')
+            raise RuntimeError(
+                f'no vast.ai offer matches (>= {min_vram} GB VRAM, '
+                f'<= ${c.get("max_price_per_hour", 0.80)}/h) — raise the price cap in Settings')
+        offer = _pick_offer(_filter_offers(pool), params.get('requested_gpu'),
+                            strict=bool(params.get('strict_gpu')))
+        tried_offers.add(offer['offer_id'])
+        # Stamp the host identity so a boot failure can blacklist THIS machine.
+        if offer.get('machine_id') is not None:
+            params['machine_id'] = offer['machine_id']
+            _set(run, train_params=json.dumps(params))
+        try:
+            if template_hash:
+                # Preferred path (smoke-validated 2026-07-12): the official
+                # template publishes the UI behind the pod's Caddy proxy on
+                # ui_port and vast generates the per-instance auth token (picked
+                # up from the instance record during boot-wait). HF_TOKEN reaches
+                # the pod later via ensure_settings(), not env.
+                token = ''
+                instance_id = vast_client.create_instance(
+                    offer['offer_id'], disk_gb=disk_gb,
+                    label=run.vast_label, template_hash=template_hash,
+                    image=(c.get('image') or None))
+            else:
+                # Raw-image fallback (config escape hatch): direct port publish +
+                # our own bearer token on the UI itself.
+                token = pysecrets.token_urlsafe(24)
+                port = int(c.get('ui_port') or 18675)
+                env = {'AI_TOOLKIT_AUTH': token, f'-p {port}:{port}': '1'}
+                hf = cfg.secret('HF_TOKEN')
+                if hf:
+                    env['HF_TOKEN'] = hf
+                instance_id = vast_client.create_instance(
+                    offer['offer_id'], disk_gb=disk_gb,
+                    label=run.vast_label, image=c.get('image'), env=env,
+                    onstart=(c.get('onstart') or None))
+            break
+        except vast_client.VastError as e:
+            if attempt >= _CREATE_INSTANCE_ATTEMPTS or not _is_transient_create_error(e):
+                raise
+            logger.warning('create_instance attempt %s/%s failed (%s) — retrying '
+                           'with a fresh offer', attempt, _CREATE_INSTANCE_ATTEMPTS, e)
+            _sleep(_CREATE_INSTANCE_BACKOFF)
     try:
         _register_instance(run, instance_id, offer, token)
     except Exception:
@@ -1216,7 +1257,10 @@ def boot_recover(app):
 POLL_SECONDS = 10
 _CKPT_SYNC_EVERY_POLLS = 12          # mid-run checkpoint mirror every ~2 min
 READY_TIMEOUT_SECONDS = 900          # 15 min: boot + image pull
-UNREACHABLE_GRACE_SECONDS = 180      # tolerated mid-run network blackout
+UNREACHABLE_GRACE_SECONDS = 360      # default tolerated mid-run network blackout
+                                     # (overridable: cloud.unreachable_grace_minutes)
+_CREATE_INSTANCE_ATTEMPTS = 3        # bounded retry on a transient vast create refusal
+_CREATE_INSTANCE_BACKOFF = 5         # seconds between create attempts
 _sleep = time.sleep
 
 
@@ -1483,9 +1527,18 @@ def _monitor(app, run_id):
             #    generous enough to survive an honestly slow download.
             stall_seconds = int(c.get('stall_timeout_minutes') or 30) * 60
             first_step_seconds = int(c.get('first_step_timeout_minutes') or 45) * 60
+            grace_seconds = (int(c.get('unreachable_grace_minutes') or 0) * 60
+                             or UNREACHABLE_GRACE_SECONDS)
             last_step = -1
             last_progress_ts = _now()
-            last_ok = _now()
+            # Time of the FIRST failure of the current unreachable streak (None
+            # while the pod answers). The grace must measure CONSECUTIVE get_job
+            # failure time, not time-since-last-success: the per-poll log/sample
+            # mirror and checkpoint sync can each block for tens of seconds on a
+            # degrading vast proxy, and anchoring to the last success would let
+            # that non-probe time silently eat the grace and declare a still-live
+            # pod 'unreachable' on its very first failed probe.
+            unreachable_since = None
             polls = 0
             while True:
                 if _now() - cap_anchor > max_seconds:
@@ -1510,9 +1563,12 @@ def _monitor(app, run_id):
                     return
                 try:
                     job = remote.get_job(job_id)
-                    last_ok = _now()
+                    unreachable_since = None
                 except Exception as e:
-                    if _now() - last_ok > UNREACHABLE_GRACE_SECONDS:
+                    now = _now()
+                    if unreachable_since is None:
+                        unreachable_since = now
+                    if now - unreachable_since > grace_seconds:
                         raise RuntimeError(f'pod unreachable: {e}')
                     _sleep(POLL_SECONDS)
                     continue
@@ -2291,6 +2347,214 @@ def checkpoint_notes_for(record_id):
             if r.note}
 
 
+def training_in_progress() -> bool:
+    """True while a LoRA training holds the GPU — the Lab's inline generation is
+    refused with a 409 in that window (a training and a generation must never
+    share the GPU). Reads the same persisted flag the queue and the vision window
+    check, so all three agree on 'GPU held by training'."""
+    from ..job_queue import queue_manager
+    return bool(queue_manager._get_system_state('training_in_progress', False))
+
+
+# --- Lab inline previews (D) -------------------------------------------------
+# The flagship: render ONE same-prompt/same-seed image per selected lineage
+# checkpoint, reusing the EXISTING Test-Studio ComfyUI engine pinned to those
+# checkpoints at strength 1.0 (not a checkpoint×strength grid). A checkpoint is
+# "testable" only when its step has a matching DEPLOYED LoRA in the family pool
+# (the same pool the Studio tests) — otherwise there is nothing ComfyUI can load,
+# so we say "not deployed" instead of launching a silent no-op.
+
+def _step_of_testable(filename) -> int | None:
+    """The training step embedded in a deployed testable LoRA filename, so a
+    lineage pill (which carries its own step) can be joined to the deployed LoRA
+    of the same step. ai-toolkit deploys the step ZERO-PADDED IN THE MIDDLE, e.g.
+    'lora_morgot_cv_000001500_Krea-2-Raw_rc74_v3' (step 1500) — not at the end, so
+    an end-anchored match misses every real checkpoint. Match the zero-padded run
+    first (unambiguous: base/rc/version tokens aren't zero-padded), then fall back
+    to a plain step at the very end ('<trigger>-<step>' / 'lora_<trigger>_<step>').
+    A final save with no number yields None (matched by step only)."""
+    stem = os.path.basename(str(filename or '')).rsplit('.', 1)[0]
+    if stem.lower().startswith('lora_'):
+        stem = stem[5:]
+    # Zero-padded step anywhere in the name (leading 0, ≥4 digits) — this is the
+    # ai-toolkit convention and never collides with 'Krea-2-Raw'/'rc74'/'v3'.
+    m = re.search(r'[-_](0\d{3,})(?=[-_]|$)', stem)
+    if not m:
+        m = re.search(r'[-_](\d+)$', stem)   # legacy: plain step at the end
+    return int(m.group(1)) if m else None
+
+
+def _testable_by_step(dataset_id, family) -> dict:
+    """{step: deployed_lora_filename} for this dataset+family — the checkpoints
+    the Lab can actually generate a preview for. Best-effort: no dataset / no
+    deployed LoRA → {} (every pill reads as not-testable, the Generate button
+    stays disabled with the app's usual 'needs setup' hint)."""
+    ds = fds.get_dataset(cfg.LOCAL_USER, dataset_id)
+    if not ds:
+        return {}
+    from . import lora_test_studio as studio
+    out = {}
+    try:
+        cands = studio.list_test_checkpoints(ds, family)
+    except Exception:
+        return {}
+    for c in cands:
+        s = _step_of_testable(c.get('filename'))
+        if s is not None:
+            out[s] = c['filename']
+    return out
+
+
+def checkpoint_previews_for(record_id) -> dict:
+    """{step: {status, url, seed}} for a run's inline-generated previews. Each
+    stored pointer resolves LIVE to its reused LoraTestImage: 'done' with a served
+    url once the file exists, 'failed' if the cell failed, else 'pending' (the job
+    is still in the serial queue). A dangling pointer (image row gone) is dropped
+    so the node never claims a preview it can't show."""
+    from ..models import CheckpointPreview, LoraTestImage
+    rows = CheckpointPreview.query.filter_by(record_id=record_id).all()
+    if not rows:
+        return {}
+    img_ids = [r.lora_test_image_id for r in rows if r.lora_test_image_id]
+    imgs = ({i.id: i for i in LoraTestImage.query
+             .filter(LoraTestImage.id.in_(img_ids)).all()} if img_ids else {})
+    out = {}
+    for r in rows:
+        img = imgs.get(r.lora_test_image_id)
+        if img is None:
+            continue
+        status = img.status if img.status in ('pending', 'done', 'failed') else 'pending'
+        url = (f'/api/dataset/{r.dataset_id}/img/{img.filename}'
+               if status == 'done' and img.filename else None)
+        out[r.step] = {'status': status, 'url': url, 'seed': r.seed}
+    return out
+
+
+def generate_checkpoint_previews(user_id, dataset_id, checkpoints, prompt=None,
+                                 seed=None, family=None) -> dict:
+    """Point the EXISTING Test-Studio engine at the selected lineage checkpoints,
+    each at strength 1.0, with ONE shared prompt+seed — a same-conditions look at
+    how the LoRA evolves epoch by epoch. `checkpoints` = [{record_id, step}].
+
+    Each is resolved to the deployed LoRA of its step; checkpoints with no deployed
+    LoRA are SKIPPED (reported, never a silent no-op). None resolvable → needs_setup
+    True so the route answers an actionable 409 instead of launching an empty run.
+    GPU serialization is the engine's own (each cell rides the serial image queue,
+    which the queue leaves pending while a training/vision pass holds the GPU); the
+    training→409 guard sits in the route. Stores/refreshes a CheckpointPreview per
+    rendered checkpoint pointing at the reused LoraTestImage row (regeneration just
+    re-points it). Returns {queued, skipped:[{record_id,step,reason}], needs_setup,
+    seed}."""
+    from ..models import CheckpointPreview
+    fam = (family or '').strip().lower() or None
+    if fam is None:
+        ds = fds.get_dataset(cfg.LOCAL_USER, dataset_id)
+        fam = (getattr(ds, 'train_type', None) or 'zimage').lower() if ds else 'zimage'
+    by_step = _testable_by_step(dataset_id, fam)
+    resolved, skipped = [], []
+    for c in (checkpoints or []):
+        try:
+            rid, step = int(c['record_id']), int(c['step'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        fn = by_step.get(step)
+        if not fn:
+            skipped.append({'record_id': rid, 'step': step, 'reason': 'not_deployed'})
+            continue
+        resolved.append((rid, step, fn))
+    if not resolved:
+        return {'queued': 0, 'skipped': skipped, 'needs_setup': True, 'seed': None}
+
+    from . import lora_test_studio as studio
+    # Pin the engine to EXACTLY these checkpoints at strength 1.0, one image each
+    # (count=1). The Studio validates/preflights + enqueues; a GpuBusyError (vision
+    # holding the GPU) or a StudioAssetsMissing (ComfyUI not set up) propagates and
+    # the route maps it to the same structured error the Studio already returns.
+    result = studio.create_run(
+        user_id, dataset_id, checkpoints=[fn for _, _, fn in resolved],
+        strengths=[1.0], seed=seed, prompt=prompt, family=fam, count=1)
+    ids = result.get('ids') or []
+    run_seed = result.get('seed', seed)
+    # Single base model × single strength × count=1 → cells are 1:1 with `resolved`
+    # in order; zip guards against any engine-side short count (never a wrong link).
+    for (rid, step, _fn), img_id in zip(resolved, ids):
+        row = CheckpointPreview.query.filter_by(record_id=rid, step=step).first()
+        if row is None:
+            row = CheckpointPreview(record_id=rid, step=step, dataset_id=dataset_id)
+            db.session.add(row)
+        row.lora_test_image_id = img_id
+        row.prompt = prompt or ''
+        row.seed = run_seed
+    db.session.commit()
+    return {'queued': len(resolved), 'skipped': skipped, 'needs_setup': False,
+            'seed': run_seed}
+
+
+def _record_checkpoints_on_disk(rec) -> int:
+    """How many of this run's checkpoints are still on disk RIGHT NOW — the guard
+    the "remove a gone run" action checks. Mirrors the graph badge: a cloud run
+    counts its staging saves (plus a harvested final LoRA), a local run counts the
+    run-dir files the checkpoint scan attributes to this record. Best-effort: a
+    scan we can't run reports 0 — an unprovable presence must never block removing
+    a run the graph already shows as gone, and never raise (no 500)."""
+    try:
+        if rec.source == 'cloud':
+            crun = (db.session.get(CloudTrainingRun, rec.cloud_run_id)
+                    if rec.cloud_run_id else None)
+            if crun is None:
+                return 0
+            n = _staging_save_count(crun)
+            if not n and crun.checkpoint_local_path \
+                    and os.path.isfile(crun.checkpoint_local_path):
+                n = 1
+            return n
+        return len(_node_checkpoints(rec, None))
+    except Exception:
+        return 0
+
+
+def delete_run_record(record_id) -> str:
+    """Remove a GONE run (no checkpoints on disk) from the lineage graph — its
+    TrainingRunRecord, its checkpoint notes, and (by detaching) its lineage edge.
+    METADATA ONLY: the checkpoints are already gone, so nothing on disk is touched.
+
+    Guards instead of deleting silently:
+      • a run whose checkpoints are still on disk is REFUSED ('has_saves') so a
+        recoverable run is never discarded from under the user;
+      • children that resumed FROM this run are DETACHED (parent_record_id → NULL),
+        keeping them in the graph as honest "origin unknown" roots rather than
+        breaking the tree on a dangling edge.
+
+    Returns 'not_found' | 'has_saves' | 'deleted' | 'conflict'. The FK children
+    (CheckpointNote — no relationship cascade in this schema) are deleted and
+    FLUSHED before the parent row so SQLite never raises the repo's "delete 500"
+    IntegrityError; a stray one is caught and reported as 'conflict', never a 500."""
+    from ..models import TrainingRunRecord, CheckpointNote
+    from sqlalchemy.exc import IntegrityError
+    rec = db.session.get(TrainingRunRecord, int(record_id))
+    if rec is None:
+        return 'not_found'
+    if _record_checkpoints_on_disk(rec) > 0:
+        return 'has_saves'
+    try:
+        # Detach any run that resumed from this one BEFORE deleting it: the child
+        # stays displayed (as a root), the parent edge just disappears.
+        (TrainingRunRecord.query
+         .filter_by(parent_record_id=rec.id)
+         .update({'parent_record_id': None}, synchronize_session=False))
+        # Delete FK children first and flush, so deleting the parent row can't hit
+        # an IntegrityError (the "delete 500" trap — no cascade on these tables).
+        CheckpointNote.query.filter_by(record_id=rec.id).delete(
+            synchronize_session=False)
+        db.session.flush()
+        db.session.delete(rec)
+        db.session.commit()
+        return 'deleted'
+    except IntegrityError:
+        db.session.rollback()
+        return 'conflict'
+
+
 def _lineage_node(rec, crun, requested_id, failed_local_id):
     """One genealogy-tree node from a provenance record, enriched with what the
     card badge shows: family/variant/base/version/date, run status, and whether
@@ -2343,8 +2607,20 @@ def _lineage_node(rec, crun, requested_id, failed_local_id):
             node['saves'] = None
             node['checkpoint_ready'] = None
     _cnotes = checkpoint_notes_for(rec.id)
+    _cprev = checkpoint_previews_for(rec.id)
+    # A pill is `testable` when its step maps to a deployed LoRA the Studio engine
+    # can load — the front enables Generate only for testable selections and shows
+    # the app's usual 'needs setup' hint otherwise. `preview_*` render the inline
+    # thumbnail (or its pending/failed state) in the node card.
+    _testable = _testable_by_step(rec.dataset_id, rec.family)
     for _ck in (node.get('checkpoints') or []):
-        _ck['note'] = _cnotes.get(_ck.get('step'), '')
+        _step = _ck.get('step')
+        _ck['note'] = _cnotes.get(_step, '')
+        _ck['testable'] = _step in _testable
+        _pv = _cprev.get(_step)
+        if _pv:
+            _ck['preview_url'] = _pv.get('url')
+            _ck['preview_status'] = _pv.get('status')
     return node
 
 

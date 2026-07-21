@@ -94,6 +94,19 @@ Unlike Klein's assets, **none of the three model files below are downloaded by t
 
 The engine only lights up (`caps.engines.qwen_multiangle`) once the UNET, VAE, text-encoder **and** the multi-angle LoRA are all found on disk — the two extra LoRAs above are quality-only and degrade gracefully when absent.
 
+### Identity & Klein prompts (advanced)
+
+*Feature request by @bbsorry (雨田壹).* Every generated variation is prefixed by a hidden **identity lock** — a block of text that tells the engine to keep the subject's exact face and take the outfit and expression from the description, not the reference photo. These used to be baked in and invisible; now you can read and edit them. All are **global** (they apply to every dataset) and stored under `identity_prompts.*`.
+
+**Reproducibility guarantee:** every field **defaults to blank**, and blank means *use the shipped default*. With nothing overridden, generation is **byte-identical** to before this setting existed — so you only change behaviour if you deliberately type an override. **Restore default** simply clears the field back to blank.
+
+- **API engine — identity lock (single reference)** → `identity_prompts.face_single`. Prepended to Nano Banana / ChatGPT variations built from **one** reference photo.
+- **API engine — identity lock (multiple references)** → `identity_prompts.face_multi`. The same, for variations built from **several** reference photos — it tells the model every reference is the same person and to use them together.
+- **Klein — restage & face-identity block** → `identity_prompts.klein_identity`. The instruction block the local **Klein** engine uses to restage the shot (pose, framing, outfit, expression) while keeping the face identical.
+- **Klein upscale & improve prompt** → `identity_prompts.klein_improve`, with an on/off toggle `identity_prompts.klein_improve_enabled` (default **on**). The fixed instruction the manual **Klein upscale & improve** action sends to add texture and detail. **Turn the toggle off** to run that action with **no prompt at all** — a pure upscale with no added styling.
+
+Each field is a plain textarea; there's no Test button — you see the effect on your next generation. If an override ever makes results worse, hit **Restore default**.
+
 ## Scraping & sources
 
 Credentials for the built-in web scraper. **All of these apply immediately — no restart** — because sources read their key at request time.
@@ -106,9 +119,9 @@ None of these has a Test button; you find out they work on your next scan.
 - **Civitai API key** → `CIVITAI_API_KEY` (secret). Optional. Without it, Civitai scans return **SFW results only**; add a key to reach adult content you're entitled to use.
 - **Pexels API key (required for Pexels)** → `PEXELS_API_KEY` (secret). **Required** for any Pexels search — there's no shared fallback. The free quota is **200 requests/hour and 20,000/month**. [Create one here](https://www.pexels.com/api/key/). Note the standing warning: an API key alone does **not** authorize dataset or machine-learning use — configure this only if Pexels has explicitly authorized your use case.
 
-### Klein image improvement
+### Klein rescue — small scraped images
 
-- **Klein instruction** → `klein.small_image_prompt`. An optional free-text instruction shared by two flows: the automatic Klein **rescue** of scraped images under 768 px, and the manual **single/bulk 2 MP improvement**. Default **empty** — and empty is intentional: with nothing here the app improves from the reference image alone rather than inventing a restoration prompt on your behalf. Add an instruction only if you want to steer that improvement (e.g. "sharpen skin texture, keep natural tones").
+- **Small-image rescue instruction** → `klein.small_image_prompt`. An optional free-text instruction for **one flow only**: the automatic Klein **rescue** of scraped images under 768 px. Default **empty** — and empty is intentional: with nothing here the app improves from the reference image alone rather than inventing a restoration prompt on your behalf. Add an instruction only if you want to steer that rescue (e.g. "sharpen skin texture, keep natural tones"). The manual **"Klein upscale & improve"** action in the lightbox does **not** use this field — it has its own editable prompt under Settings ▸ Engines ▸ **Identity & Klein prompts** (`identity_prompts.klein_improve`), which can also be turned off for a pure upscale.
 
 ## Local tools
 
@@ -230,6 +243,7 @@ Guard-rails on cost and host quality for rented pods. The card also shows a live
 | **Max price per hour ($)** | `cloud.max_price_per_hour` | `0.80` | 0.1–5 | A safety cap on the hourly offer price; pricier hosts are skipped before launch. |
 | **Monthly budget ($, 0 = unlimited)** | `cloud.monthly_budget_usd` | `0` | ≥0 | A hard spend ceiling for the month; new launches are **blocked** once you pass it. `0` means no limit. |
 | **Stall timeout (minutes)** | `cloud.stall_timeout_minutes` | `30` | 5–240 | If no training step progresses for this long, the watchdog rescues the logs and kills the pod. |
+| **Unreachable grace (minutes)** | `cloud.unreachable_grace_minutes` | `6` | 1–60 | How long a running pod may stay unreachable (a vast.ai network blackout) before the run is given up and auto-retried on a fresh host. Raise it if healthy runs die with *pod unreachable*. |
 | **Min host reliability** | `cloud.min_reliability` | `0.98` | 0.9–0.999 | vast.ai reliability floor. Lowering toward 0.95 surfaces cheaper hosts at a higher boot-failure risk. |
 | **Verified hosts only** | `cloud.verified_only` | **on** | toggle | Restrict to vast.ai's verified hosts (the historical, safer behaviour). |
 | **Secure Cloud only** | `cloud.secure_cloud_only` | **off** | toggle | Restrict to vast.ai's *datacenter* (Secure Cloud) tier — usually narrows the market and raises the price, so it's opt-in. |
@@ -341,3 +355,55 @@ These have no UI control — they're for advanced users editing `config.json` by
 | Key | Default | Role |
 |---|---|---|
 | `updates.repo` | `perfectgf/lora-dataset-studio` | The GitHub repo the update checker reads its release feed from. |
+
+## config.json key reference (all keys)
+
+A flat cheat-sheet of the main `config.json` keys, for quick lookup or hand-editing (copy `config.example.json` to `config.json` first — it's git-ignored, in your data directory). Every key here is documented in full, with defaults and traps, in the sections above; this table is the index. **Secrets** (`GEMINI_API_KEY`, `OPENAI_API_KEY`, `HF_TOKEN`, `VAST_API_KEY`, optional scraper credentials) live in `.env`, not here.
+
+| Key | Meaning |
+|---|---|
+| `server.host` | Interface the Flask server binds to (default `127.0.0.1`, local-only). |
+| `server.port` | Port the server listens on (default `5050`). |
+| `server.require_token` | On a non-loopback bind, require remote clients to present an access token (default `false` — a trusted LAN needs none). Toggle and token also live in Settings → Server & access. |
+| `paths.dataset_images_root` | Where dataset images are stored. Empty string defaults to `<data dir>/datasets`. |
+| `comfyui.api_url` | Base URL of your ComfyUI instance (default `http://127.0.0.1:8188`). |
+| `comfyui.base_dir` | ComfyUI install directory, used to derive `output`/`input`/`models`/`loras` dirs if those aren't set explicitly. |
+| `comfyui.output_dir` | Explicit override for ComfyUI's output folder. |
+| `comfyui.input_dir` | Explicit override for ComfyUI's input folder. |
+| `comfyui.models_dir` | Explicit override for ComfyUI's models folder (used to scan available checkpoints/UNETs). |
+| `comfyui.loras_dir` | Explicit override for ComfyUI's LoRA folder. |
+| `ollama.url` | Base URL of your Ollama instance (default `http://127.0.0.1:11434`). |
+| `ollama.vision_model` | Ollama vision model used for auto-classify and auto head-crop (default `huihui_ai/qwen3-vl-abliterated:8b-instruct`, the uncensored **abliterated** build — use the Instruct, not Thinking, variant). |
+| `aitoolkit.dir` | ai-toolkit install directory. |
+| `aitoolkit.datasets_dir` | Override for ai-toolkit's datasets folder (defaults to `<aitoolkit.dir>/datasets`). |
+| `aitoolkit.output_dir` | Override for ai-toolkit's output folder (defaults to `<aitoolkit.dir>/output`). |
+| `aitoolkit.hf_home` | Override for the Hugging Face cache directory ai-toolkit uses. |
+| `aitoolkit.python` | Full path to the Python interpreter to run ai-toolkit with. Empty = auto-detect a `venv/`/`.venv/` next to `run.py`; set it for conda/uv/system-Python installs that have no venv folder. |
+| `engines.default` | Default image-generation engine selected in the UI (`nanobanana`, `chatgpt`, or `klein`). |
+| `engines.enabled` | List of engines shown as options in the UI. |
+| `engines.chatgpt_auth` | Which credential the ChatGPT engine uses: `auto` (subscription when connected, else API key), `api`, or `subscription`. |
+| `engines.chatgpt_subscription_model` | Codex **router** model for the subscription lane (default `gpt-5.4-mini`); the image model stays `gpt-image-2` regardless. |
+| `captioning.backend` | Caption backend: `auto` (prefer JoyCaption, fall back to Ollama), `joycaption`, `ollama`, or `none`. |
+| `training.default_family` | Default model family preselected for new training runs (`zimage`, `sdxl`, `krea`, `flux`, or `flux2klein`). |
+| `cloud.max_concurrent_runs` | Simultaneous cloud pods allowed (default `1`, 1–10). Also in Settings → Training. |
+| `cloud.max_price_per_hour` | Safety cap on the hourly offer price in $ (default `0.80`); pricier hosts are skipped before launch. |
+| `cloud.monthly_budget_usd` | Hard monthly spend ceiling in $ (default `0` = unlimited); launches are blocked past it. |
+| `cloud.stall_timeout_minutes` | Kill + rescue a cloud run after this many minutes without step progress (default `30`, 5–240). |
+| `cloud.min_reliability` | vast.ai host-reliability floor (default `0.98`, 0.9–0.999); lower surfaces cheaper, riskier hosts. |
+| `cloud.verified_only` | Restrict to vast.ai verified hosts (default `true`). |
+| `cloud.secure_cloud_only` | Restrict to vast.ai's Secure Cloud (datacenter) tier (default `false`; narrows the market, raises price). |
+| `face_scoring.python` | Python interpreter used to run the InsightFace subprocess (empty = current interpreter). |
+| `face_scoring.models_root` | Directory where InsightFace model weights are stored/downloaded. |
+| `face_scoring.green` | Similarity score threshold (0–1) above which an image is flagged "green" (strong match). |
+| `face_scoring.orange` | Similarity score threshold (0–1) above which an image is flagged "orange" (borderline match). |
+| `masks.python` | Python interpreter used to run the rembg subprocess (empty = current interpreter). |
+| `watermark.python` | Python interpreter used to run the LaMa watermark-inpainting subprocess (empty = reuse `masks.python`, then the current interpreter). |
+| `watermark.device` | LaMa processing device: `auto` (CUDA when available, otherwise CPU), `cuda`, or `cpu`. |
+| `watermark.allow_crop` | When `true` (default), a border watermark is cropped off; when `false`, it is repainted instead. Also editable in the Clean bar. |
+| `klein.consistency_lora` | Filename of the Klein consistency LoRA, relative to ComfyUI's LoRA folder. |
+| `klein.consistency_strength` | Strength (0–1) applied to the Klein consistency LoRA. |
+| `klein.generation_lora_presets` | Named generation-LoRA stacks (default empty) picked per run in Klein tuning; each has a name and up to 8 `{file, strength}` rows. Managed in Settings → Image engines. |
+| `klein.small_image_prompt` | Optional shared instruction for scraper rescue and single/bulk image improvement (empty = reference image only). |
+| `updates.repo` | GitHub repo the update checker reads its release feed from (default `perfectgf/lora-dataset-studio`). |
+
+Additional config-file-only keys (ComfyUI folder overrides, cloud internals, quality-tool interpreters, Klein consistency LoRA) are documented in [Config-file-only settings](#config-file-only-settings) above.

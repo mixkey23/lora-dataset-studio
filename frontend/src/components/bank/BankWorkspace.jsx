@@ -7,6 +7,10 @@ import PromoteDialog from './PromoteDialog'
 import DeleteRejectedDialog from './DeleteRejectedDialog'
 import LaunchAllDialog from './LaunchAllDialog'
 import PipelineReport from './PipelineReport'
+// Reuse the dataset's register list so the Bank lane never drifts from it.
+import { VOCABULARY_OPTIONS } from '../dataset/CaptionOptionsPopover'
+// Ordered zone model + the "what's next" accent, both pure/testable.
+import { BANK_ZONES, nextBankStep } from './bankGuide.js'
 
 const PAGE_SIZE = 120
 
@@ -165,6 +169,31 @@ function PassButton({ onClick, disabled, title, children }) {
   )
 }
 
+// One numbered workflow zone: a labelled, collapsible section grouping the
+// controls of one step (① Analyser … ④ Promouvoir). `accented` draws a discreet
+// amber ring + "Next step" pill on the ONE zone nextBankStep recommends — purely
+// advisory: every zone stays open and clickable. Default expanded (nothing hidden).
+function ZoneSection({ zone, accented, children }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <section className={`rounded-xl border bg-surface ${accented
+      ? 'border-amber-400/60 ring-1 ring-amber-400/40' : 'border-border'}`}>
+      <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}
+        className="flex w-full items-center gap-2 px-4 py-2 text-left">
+        <span aria-hidden className="text-base tabular-nums">{zone.emoji}</span>
+        <span className="text-sm font-semibold text-content">{zone.label}</span>
+        {accented && (
+          <span className="rounded-full border border-amber-400/50 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+            Next step
+          </span>
+        )}
+        <span aria-hidden className="ml-auto text-xs text-content-subtle">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && <div className="space-y-3 px-4 pb-3">{children}</div>}
+    </section>
+  )
+}
+
 // 📊 Coverage advice (idea by @antonp) — a read-only, collapsible panel. Reads
 // what the passes already computed (framing, person/style clusters, resolution)
 // and says, in plain sentences, what the kept set leans on and what's thin for a
@@ -297,6 +326,9 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
   const [showSelected, setShowSelected] = useState(false)
   const [selectedOrder, setSelectedOrder] = useState(null)
   const [tileSize, setTileSize] = useState('M')
+  // Caption register for the 🏷️ Caption pass ('' = model's own wording). Explicit is
+  // the NSFW lane — same registers as the dataset caption, passed per-run.
+  const [captionVocab, setCaptionVocab] = useState('')
   // Coverage advice (idea by @antonp) — a collapsible read-only panel, fetched
   // on demand (and refreshed whenever it's open and the bank changes).
   const [coverageOpen, setCoverageOpen] = useState(false)
@@ -451,8 +483,10 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
   const startWatermark = () => act(() => postJson(`/api/bank/${bankId}/watermark`, {}), null)
   const startFraming = () => act(() => postJson(`/api/bank/${bankId}/framing`, {}), null)
   const startCaption = () => act(
-    () => postJson(`/api/bank/${bankId}/caption`,
-      selected.size ? { image_ids: [...selected] } : {}), null)
+    () => postJson(`/api/bank/${bankId}/caption`, {
+      ...(selected.size ? { image_ids: [...selected] } : {}),
+      ...(captionVocab ? { vocabulary: captionVocab } : {}),
+    }), null)
   const cancelJob = () => act(() => postJson(`/api/bank/${bankId}/cancel`, {}), null)
   const startPipeline = async (config) => {
     setLaunchOpen(false)
@@ -556,6 +590,12 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
   const shownFramings = FRAMING_BUCKETS.filter(
     (b) => (framingCounts[b.id] || 0) > 0 || filter.framing === b.id)
   const visionReady = !!caps.ollama?.vision_model_ready
+  // The explicit lane only spells acts out with an uncensored (abliterated) vision
+  // model. We can't prove abliteration, but the common builds name themselves — a soft
+  // heuristic drives an honest "may soften" hint (never a hard block: a differently
+  // named abliterated model still works).
+  const visionModel = caps.ollama?.vision_model || ''
+  const visionModelLooksUncensored = /abliterat|uncensor|huihui|nsfw/i.test(visionModel)
   const scored = counts?.scored || 0
   const watermarkScanned = counts?.watermark_scanned || 0
   // Score flags only make sense once their pass ran; watermark is its own pass.
@@ -566,6 +606,19 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
   const isFiltered = !!(filter.status || filter.flag || filter.cluster != null
     || filter.style != null || filter.subfolder != null || filter.search
     || filter.resBucket || filter.framing)
+
+  // The ONE recommended next step, from the counters the header strip already
+  // reads. Advisory only — draws an amber "Next step" accent on that zone.
+  const activeStep = nextBankStep({
+    scanned: counts?.scanned || 0,
+    scored: scored || 0,
+    keep: counts?.keep || 0,
+    scoringAvailable: !!caps?.bank_scoring,
+  })
+  const analyzeZone = BANK_ZONES.find((z) => z.id === 'analyze')
+  const triageZone = BANK_ZONES.find((z) => z.id === 'triage')
+  const curateZone = BANK_ZONES.find((z) => z.id === 'curate')
+  const promoteZone = BANK_ZONES.find((z) => z.id === 'promote')
 
   return (
     <div className="space-y-4">
@@ -605,7 +658,9 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
           onDismiss={() => setDismissedReportAt(payload.pipeline_report.finished_at)} />
       )}
 
-      {/* Primary actions — the two outcomes stand out; the passes sit below. */}
+      {/* ① Analyser — run the analysis passes (or 🚀 Launch all) on the dump.
+          Grouping + accent only; every pass keeps its own endpoint/behaviour. */}
+      <ZoneSection zone={analyzeZone} accented={activeStep === 'analyze'}>
       <div className="flex flex-wrap items-center gap-2">
         <button type="button" onClick={() => setLaunchOpen(true)} disabled={live || !(counts?.total > 0)}
           title="Run the whole triage in one go — scan, auto-reject, score, watermarks, group by person and (optionally) caption. Start it and walk away."
@@ -615,55 +670,6 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
         <p className="hidden text-xs text-content-subtle md:block">
           One-click funnel — or step through the passes below.
         </p>
-        <div className="ml-auto flex items-center gap-2">
-          <div className="relative">
-            <button type="button" onClick={() => setShowAutoReject((v) => !v)} disabled={live}
-              aria-expanded={showAutoReject}
-              title="Bulk-reject the still-undecided images carrying the chosen quality flags"
-              className="rounded-md border border-border bg-surface-raised px-3 py-1.5 text-sm text-content disabled:opacity-50 hover:bg-surface">
-              🧹 Auto-reject…
-            </button>
-            {showAutoReject && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowAutoReject(false)} aria-hidden />
-                <div className="absolute right-0 z-50 mt-1 w-72 rounded-lg border border-border bg-surface-overlay p-3 shadow-xl space-y-2">
-                  <p className="text-xs text-content-muted">
-                    Rejects the UNDECIDED images with these flags. Your manual ✓/✕ are never changed;
-                    everything stays reversible (nothing is deleted from disk).
-                  </p>
-                  {[...QUALITY_REJECT_FLAGS, ...availableScoreFlags].map((f) => (
-                    <label key={f} className="flex items-center gap-2 text-sm text-content">
-                      <input type="checkbox" checked={rejectFlags.has(f)}
-                        onChange={(e) => setRejectFlags((prev) => {
-                          const next = new Set(prev)
-                          if (e.target.checked) next.add(f); else next.delete(f)
-                          return next
-                        })} />
-                      {FLAG_LABEL[f]} <span className="text-content-subtle">({flags[f] ?? 0} flagged)</span>
-                    </label>
-                  ))}
-                  <button type="button" onClick={applyAutoReject} disabled={!rejectFlags.size}
-                    className="w-full rounded-md bg-gradient-primary px-3 py-1 text-xs font-semibold text-white disabled:opacity-50">
-                    Reject them
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-          <button type="button" onClick={() => setDeleteRejectedOpen(true)}
-            disabled={live || !(counts?.reject > 0)}
-            title={(counts?.reject > 0)
-              ? 'Delete the rejected images from your disk (OS trash when available). Irreversible — asks you to type DELETE first. Kept images are untouched.'
-              : 'No rejected images to delete'}
-            className="rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 disabled:opacity-40 hover:bg-rose-500/10">
-            🗑 Delete rejected from disk{(counts?.reject > 0) ? ` (${counts.reject})` : ''}
-          </button>
-          <button type="button" onClick={() => setPromoteOpen(true)} disabled={live || !canPromote}
-            title={canPromote ? 'Copy the kept selection into a dataset' : 'Keep some images first'}
-            className="rounded-md bg-gradient-primary px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50">
-            ⬆ Promote to dataset…
-          </button>
-        </div>
       </div>
 
       {/* Analysis passes — individual, quieter than the primary actions. */}
@@ -716,8 +722,29 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
               : 'Caption every not-yet-captioned image (skips rejected) with your caption engine. Captions become searchable tags and follow the images when you promote them to a dataset. Select images first to caption just those.'}>
             🏷️ Caption{selected.size ? ` ${selected.size} selected` : ' all'}
           </PassButton>
+          <label className="flex items-center gap-1 text-xs text-content-subtle">
+            <span className="sr-only">Caption vocabulary register</span>
+            <select value={captionVocab} onChange={(e) => setCaptionVocab(e.target.value)}
+              disabled={live} aria-label="Caption vocabulary register"
+              title="How captions name nude or sexual content. Explicit needs an uncensored (abliterated) Ollama vision model. Richer, more explicit captions also make the 🔍 search find more."
+              className="px-2 py-1 rounded-lg bg-app/60 border border-border text-content text-xs disabled:opacity-40">
+              {VOCABULARY_OPTIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+            </select>
+          </label>
         </div>
+        {captionVocab === 'explicit' && !visionModelLooksUncensored && (
+          <p className="text-xs text-amber-400/90">
+            ⚠️ Explicit captions need an uncensored (abliterated) Ollama vision model
+            {visionModel ? ` — “${visionModel}” may refuse or soften explicit terms` : ''}.
+            Pull one in Settings ▸ Captioning &amp; quality. Richer captions also feed the 🔍 search.
+          </p>
+        )}
       </div>
+      </ZoneSection>
+
+      {/* ② Trier — browse by facet/cluster and Keep/Reject to decide what stays.
+          Stays fully visible; density was never the complaint. */}
+      <ZoneSection zone={triageZone} accented={activeStep === 'triage'}>
 
       {/* Person clusters (after the face pass) */}
       {clusters.length > 0 && (
@@ -923,6 +950,42 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
           className="rounded-md border border-border px-2 py-0.5 text-xs text-content-muted hover:text-content hover:bg-surface-raised">
           Select all in filter
         </button>
+        {/* Bulk-reject undecided images by quality flag — a triage shortcut that
+            leaves your manual ✓/✕ untouched and deletes nothing off disk. */}
+        <div className="relative">
+          <button type="button" onClick={() => setShowAutoReject((v) => !v)} disabled={live}
+            aria-expanded={showAutoReject}
+            title="Bulk-reject the still-undecided images carrying the chosen quality flags"
+            className="rounded-md border border-border bg-surface-raised px-2 py-0.5 text-xs text-content disabled:opacity-50 hover:bg-surface">
+            🧹 Auto-reject…
+          </button>
+          {showAutoReject && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setShowAutoReject(false)} aria-hidden />
+              <div className="absolute left-0 z-50 mt-1 w-72 rounded-lg border border-border bg-surface-overlay p-3 shadow-xl space-y-2">
+                <p className="text-xs text-content-muted">
+                  Rejects the UNDECIDED images with these flags. Your manual ✓/✕ are never changed;
+                  everything stays reversible (nothing is deleted from disk).
+                </p>
+                {[...QUALITY_REJECT_FLAGS, ...availableScoreFlags].map((f) => (
+                  <label key={f} className="flex items-center gap-2 text-sm text-content">
+                    <input type="checkbox" checked={rejectFlags.has(f)}
+                      onChange={(e) => setRejectFlags((prev) => {
+                        const next = new Set(prev)
+                        if (e.target.checked) next.add(f); else next.delete(f)
+                        return next
+                      })} />
+                    {FLAG_LABEL[f]} <span className="text-content-subtle">({flags[f] ?? 0} flagged)</span>
+                  </label>
+                ))}
+                <button type="button" onClick={applyAutoReject} disabled={!rejectFlags.size}
+                  className="w-full rounded-md bg-gradient-primary px-3 py-1 text-xs font-semibold text-white disabled:opacity-50">
+                  Reject them
+                </button>
+              </div>
+            </>
+          )}
+        </div>
         {(selected.size > 0 || showSelected) && (
           <button type="button" onClick={toggleSelectionView}
             aria-pressed={showSelected}
@@ -948,6 +1011,11 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
           </>
         )}
       </div>
+      </ZoneSection>
+
+      {/* ③ Curer — optional refinement (diverse/similar/coverage). Always
+          accessible, but never the accented "next step". */}
+      <ZoneSection zone={curateZone} accented={false}>
 
       {/* Curation — build a good LoRA subset out of a big dump (reuses ✨ Score
           embeddings, no GPU). Diversity coverage + reference similarity, both
@@ -1036,6 +1104,27 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
       {coverageOpen && (
         <CoveragePanel coverage={coverage} onClose={() => setCoverageOpen(false)} />
       )}
+      </ZoneSection>
+
+      {/* ④ Promouvoir — ship the kept set into a dataset, or clear rejects off
+          disk. Same actions/handlers as before — just grouped as the last step. */}
+      <ZoneSection zone={promoteZone} accented={activeStep === 'promote'}>
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" onClick={() => setPromoteOpen(true)} disabled={live || !canPromote}
+          title={canPromote ? 'Copy the kept selection into a dataset' : 'Keep some images first'}
+          className="rounded-md bg-gradient-primary px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50">
+          ⬆ Promote to dataset…
+        </button>
+        <button type="button" onClick={() => setDeleteRejectedOpen(true)}
+          disabled={live || !(counts?.reject > 0)}
+          title={(counts?.reject > 0)
+            ? 'Delete the rejected images from your disk (OS trash when available). Irreversible — asks you to type DELETE first. Kept images are untouched.'
+            : 'No rejected images to delete'}
+          className="rounded-md border border-rose-500/50 px-3 py-1.5 text-sm text-rose-300 disabled:opacity-40 hover:bg-rose-500/10">
+          🗑 Delete rejected from disk{(counts?.reject > 0) ? ` (${counts.reject})` : ''}
+        </button>
+      </div>
+      </ZoneSection>
 
       {filter.flag === 'dups' ? (
         <DupGroupsPanel bankId={bankId} live={live} kind="exact"
@@ -1077,7 +1166,7 @@ export default function BankWorkspace({ bankId, onBack, onGone }) {
       )}
 
       {promoteOpen && (
-        <PromoteDialog bankId={bankId} keepCount={counts?.keep || 0}
+        <PromoteDialog bankId={bankId}
           selectedIds={[...selected]}
           onClose={() => setPromoteOpen(false)}
           onStarted={() => { setPromoteOpen(false); refreshPayload() }} />

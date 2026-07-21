@@ -1405,6 +1405,25 @@ def dataset_train_run_lineage(record_id):
     return jsonify(tree)
 
 
+@bp.delete('/dataset/train/runs/<int:record_id>')
+def dataset_train_run_delete(record_id):
+    """Remove a GONE run (no checkpoints on disk) from the lineage graph — metadata
+    only: the record, its checkpoint notes, and its lineage edge (disk untouched;
+    the checkpoints are already gone). A run whose checkpoints are still on disk is
+    refused with 409 (delete those first) — never a silent erase. Children that
+    resumed from it are detached, not deleted. Unknown id → 404."""
+    status = ct.delete_run_record(record_id)
+    if status == 'not_found':
+        return jsonify({'error': 'unknown run'}), 404
+    if status == 'has_saves':
+        return jsonify({'error': 'This run still has checkpoints on disk. Delete '
+                                 'its checkpoints first, then remove the run.'}), 409
+    if status == 'conflict':
+        return jsonify({'error': 'This run is still referenced and could not be '
+                                 'removed. Refresh and try again.'}), 409
+    return jsonify({'ok': True})
+
+
 @bp.put('/dataset/train/runs/<int:record_id>/note')
 def dataset_train_run_note(record_id):
     """Save the Lab's free-form note on a run. Unknown run → 404."""
@@ -1421,6 +1440,44 @@ def dataset_train_checkpoint_note(record_id, step):
     if not ct.set_checkpoint_note(record_id, step, text):
         return jsonify({'error': 'not found'}), 404
     return jsonify({'ok': True})
+
+
+@bp.post('/dataset/<int:dataset_id>/lineage/previews')
+def dataset_lineage_generate_previews(dataset_id):
+    """🎨 Lab inline generation: render a same-prompt/same-seed preview for each
+    selected checkpoint by reusing the Test-Studio engine pinned to those
+    checkpoints at strength 1.0. Body: {prompt, seed, family,
+    checkpoints:[{record_id, step}]}.
+
+    A training holding the GPU → 409 (a training and a generation never share the
+    GPU) — never a silent no-op. No checkpoint deployed for the family → 409
+    needs_setup (the same 'set it up first' honesty the rest of the app uses). A
+    vision pass holding the GPU, or a ComfyUI that isn't set up, surface through
+    the engine as the Studio's usual 503 / structured-409. Unknown dataset → 404."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    if ct.training_in_progress():
+        return jsonify({'error': 'GPU busy',
+                        'detail': 'A LoRA training is running — previews share the '
+                                  'GPU with training, so try again once it finishes.'
+                        }), 409
+    d = request.get_json(silent=True) or {}
+    cks = d.get('checkpoints') or []
+    if not isinstance(cks, list) or not cks:
+        return jsonify({'error': 'no checkpoints selected'}), 400
+    try:
+        out = ct.generate_checkpoint_previews(
+            LOCAL_USER, dataset_id, cks, prompt=d.get('prompt'),
+            seed=d.get('seed'), family=d.get('family'))
+    except Exception as e:
+        return _map_error(e)
+    if out.get('needs_setup'):
+        return jsonify({'error': 'No deployed checkpoint to preview',
+                        'detail': 'None of the selected checkpoints has a deployed '
+                                  'LoRA for this family yet — import/deploy it first, '
+                                  'then generate a preview.',
+                        'needs_setup': True, 'skipped': out.get('skipped', [])}), 409
+    return jsonify(out)
 
 
 @bp.get('/dataset/train/runs/<run_key>/preview')

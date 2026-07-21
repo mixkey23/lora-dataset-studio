@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildLineageGraph, CARD_W, CARD_H, PAD, PILL_H, PILLS_PER_ROW,
+  buildLineageGraph, graphMetrics, CARD_W, CARD_H, PAD, PILL_W, PILL_H,
+  PILL_W_BIG, PILL_H_BIG, PILLS_PER_ROW,
 } from './lineageGraph.js';
 
 const ck = (step, extra = {}) => ({ step, present: true,
@@ -35,6 +36,34 @@ test('a chain lays out left-to-right: depth increases, x increases, one row', ()
   // first card sits at the padding origin
   assert.equal(m.get(1).x, PAD);
   assert.equal(m.get(1).y, PAD);
+});
+
+test('a parent with a tall pill block is not overlapped by the next root (#76-over-#81 bug)', () => {
+  // #76 had 12 checkpoints (3 pill rows) but its child continued far to the right;
+  // the next root (#81) was placed in the same column and landed INSIDE #76's pills.
+  const many = Array.from({ length: 12 }, (_, i) => ck((i + 1) * 250));
+  const tree = {
+    root_id: 1,
+    nodes: [
+      { record_id: 1, parent_record_id: null, created_at: '2026-07-01T00:00:00', checkpoints: many },
+      { record_id: 2, parent_record_id: 1, resumed_from: 3000, created_at: '2026-07-02T00:00:00',
+        checkpoints: [ck(500), ck(1000)] },
+      { record_id: 3, parent_record_id: null, created_at: '2026-07-03T00:00:00',
+        checkpoints: [ck(500), ck(1000)] },
+    ],
+    edges: [{ parent: 1, child: 2, resumed_from: 3000 }],
+  };
+  const g = buildLineageGraph(tree);
+  const m = byId(g);
+  // #1 (parent, 12 pills) and #3 (second root) share the left column
+  assert.equal(m.get(1).x, m.get(3).x);
+  // #3's card must start below #1's WHOLE cell (card + tall pill block)
+  assert.ok(m.get(3).y >= m.get(1).y + m.get(1).cellH,
+    `#3 (y=${m.get(3).y}) overlaps #1's cell (y=${m.get(1).y}, cellH=${m.get(1).cellH})`);
+  // concretely: #1's lowest pill sits above #3's card top — no visual collision
+  const lowestPill = Math.max(...m.get(1).checkpoints.map((p) => p.y + p.h));
+  assert.ok(lowestPill <= m.get(3).y,
+    `#1 pills (bottom ${lowestPill}) overlap #3 card (top ${m.get(3).y})`);
 });
 
 test('every edge carries a bezier path and the whole chain is on the spine', () => {
@@ -202,6 +231,39 @@ test('edge falls back to the card edge when no pill matches the resume step', ()
   assert.equal(parent.checkpoints.every((p) => !p.isResumeSource), true);
   const start = g.edges[0].d.match(/^M([\d.]+),/);
   assert.ok(Math.abs(Number(start[1]) - (parent.x + CARD_W)) < 0.01); // card right edge
+});
+
+// --- 🔍 big-preview mode (adaptive geometry) --------------------------------
+
+test('graphMetrics: compact is the default, big enlarges the tiles', () => {
+  const compact = graphMetrics(false);
+  assert.equal(compact.pillW, PILL_W);
+  assert.equal(compact.pillH, PILL_H);
+  assert.equal(compact.perRow, PILLS_PER_ROW);
+  const big = graphMetrics(true);
+  assert.equal(big.pillW, PILL_W_BIG);
+  assert.equal(big.pillH, PILL_H_BIG);
+  assert.ok(big.pillW > compact.pillW && big.pillH > compact.pillH);
+  // fewer, bigger tiles per row — but always at least one
+  assert.ok(big.perRow >= 1 && big.perRow < compact.perRow);
+});
+
+test('big-preview mode sizes the pills up and grows the cell height', () => {
+  const nodes = [{ record_id: 1, parent_record_id: null, is_current: true,
+    checkpoints: [ck(500), ck(1000, { final: true }), ck(1500)] }];
+  const tree = { root_id: 1, current_id: 1, single: true, nodes, edges: [] };
+  const compact = buildLineageGraph(tree);
+  const big = buildLineageGraph(tree, { bigPreviews: true });
+  // Each pill carries the big geometry...
+  for (const p of big.nodes[0].checkpoints) {
+    assert.equal(p.w, PILL_W_BIG);
+    assert.equal(p.h, PILL_H_BIG);
+    // ...and still never spills past the card width.
+    assert.ok(p.x + p.w <= big.nodes[0].x + CARD_W + 0.01);
+  }
+  // The taller tiles make the cell (and the whole graph) taller than compact.
+  assert.ok(big.nodes[0].cellH > compact.nodes[0].cellH);
+  assert.ok(big.height > compact.height);
 });
 
 test('empty / missing payloads return a safe empty shape', () => {

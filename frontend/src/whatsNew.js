@@ -47,6 +47,28 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-21-toggle-thumb-alignment',
+    date: '2026-07-21',
+    title: '🎚️ Toggle switches sit flush again',
+    blurb:
+      "The little sliding knob on on/off switches now rests with an even 1-2px gap on both ends instead of floating short of the right edge when on. Purely cosmetic, but it looks right now. Thanks to bbsorry for the pixel-perfect report.",
+  },
+  {
+    id: '2026-07-21-zimage-convert-cross-drive',
+    date: '2026-07-21',
+    title: '🗜️ Convert a custom Z-Image base even when your models live on another drive',
+    blurb:
+      "Clicking \"Convert the base\" no longer fails with a red \"Paths don't have the same drive\" toast when your ComfyUI models folder is a junction to a second drive (a common setup — big weights rarely fit the system disk). The conversion now follows the junction across drives while still refusing any base path that tries to escape your models folder.",
+  },
+  {
+    id: '2026-07-21-cloud-unreachable-grace',
+    date: '2026-07-21',
+    title: '☁️ Fewer cloud runs lost to a passing network blip',
+    blurb:
+      "A rented pod that briefly drops off the network (a vast.ai proxy hiccup mid-training) is no longer given up so quickly: the grace before a run is declared \"pod unreachable\" is now measured as real consecutive silence, not polluted by slow log/checkpoint mirroring — and it defaults to a more forgiving 6 minutes. Too twitchy or too patient for your hosts? Tune it under Settings ▸ Training ▸ Unreachable grace. Also: a transient rental refusal at pod creation now retries on a fresh offer instead of failing the launch outright.",
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-20-musubi-tuner-engine',
     date: '2026-07-20',
     title: '⚙️ musubi-tuner joins as a second Qwen-Image training engine',
@@ -69,6 +91,102 @@ export const WHATS_NEW = [
     blurb:
       "Qwen-Image joins Z-Image, SDXL, Krea 2, FLUX.1 and FLUX.2 Klein as a training family — pick it as the LoRA type and choose base Qwen-Image (text-to-image) or Qwen-Image-Edit-2511 (instruction editing) next to the base selector. Local training only for now. Building a multi-angle camera LoRA? The new Qwen-Image · Concept preset documents the per-shot angle captioning convention.",
     to: '/settings/training',
+  },
+  {
+    id: '2026-07-20-bank-guided-zones',
+    date: '2026-07-20',
+    title: '🧭 The Bank top is now a guided path, not a wall of buttons',
+    blurb:
+      "The 🗃️ Bank's controls are now grouped into four ordered, labeled zones — ① Analyser, ② Trier, ③ Curer, ④ Promouvoir — that follow the natural workflow, and a subtle amber marker points at the recommended next step based on where your bank is (nothing scanned → Analyse; scored with images kept → Promote). Nothing is hidden — every control stays where you can reach it — it just finally reads as a path instead of a pile.",
+    to: '/bank',
+  },
+  {
+    id: '2026-07-20-bank-explicit-caption',
+    date: '2026-07-20',
+    title: '🏷️ Caption your bank crude — explicit lane, right at triage',
+    blurb:
+      "The 🏷️ Caption pass in the Bank now has a vocabulary picker, the same one the datasets use: Explicit, Clinical or Safe. Pick Explicit (paired with an uncensored/abliterated Ollama vision model) and captions name nude and sexual content plainly instead of tip-toeing around it — so you capture what's really there the moment you triage. Bonus: richer, more explicit captions also give the 🔍 Bank search far more to match on. Leave it on default and nothing changes.",
+    to: '/bank',
+  },
+  {
+    id: '2026-07-20-graph-hub',
+    date: '2026-07-20',
+    title: '◉ The lineage graph is now home for your checkpoints',
+    blurb:
+      "Open Checkpoints & LoRAs and you now land on the ◉ Graph — your dataset's runs and every checkpoint they made, at a glance (the flat ☰ List is one click away). Deploy any checkpoint straight from its pill with 📦 Import → loras/…, generate a preview per checkpoint, then click a preview thumbnail to see it LARGE and compare epochs like in ComfyUI. See it, deploy it, judge it — all without leaving the graph.",
+    to: '/datasets?section=checkpoints',
+  },
+  {
+    id: '2026-07-20-graph-big-previews',
+    date: '2026-07-20',
+    title: '🔍 Big-preview mode — compare checkpoints like a ComfyUI grid',
+    blurb:
+      "The lineage graph gets a 🔍 Big previews toggle: the generated thumbnails on each checkpoint blow up into large tiles laid out like a ComfyUI grid, so you can eyeball several epochs side by side and pick the sweet spot without clicking into each one. It's remembered between visits; leave it off for the compact pill view. Click any tile to still open it full-screen.",
+    to: '/datasets?section=checkpoints',
+  },
+  {
+    id: '2026-07-20-lineage-inline-generation',
+    date: '2026-07-20',
+    title: '🎨 Generate a preview per checkpoint, right in the lineage graph',
+    blurb:
+      "Turn the ◉ Graph into an experiment lab: tick the checkpoints you want (across any runs), type ONE shared prompt and seed, and hit Generate. Each selected checkpoint renders a strength-1.0 image under the exact same conditions — reusing the Test Studio engine — so you can see at a glance how a LoRA evolves epoch by epoch and pick the sweet spot before it overcooks. The thumbnail lands on its checkpoint pill (◌ while it renders, ⚠ if it fails). It shares the GPU politely: a checkpoint that isn't deployed yet can't be picked (with a clear hint), and while a training is running the previews wait rather than fight it.",
+    to: '/cloud',
+  },
+  {
+    id: '2026-07-20-identity-prompts-show-defaults',
+    date: '2026-07-20',
+    title: '👁️ See the built-in identity prompts, not just an empty box',
+    blurb:
+      "The editable identity & Klein prompts used to show a blank field with a generic \"leave blank\" note, so you could never see the actual default text that was being applied. Each field now displays its real built-in default, and a \"Load default to edit\" button drops that exact text into the box so you can tweak it instead of writing one from scratch. Leaving a field blank still uses the shipped default, byte-for-byte. Completes @bbsorry (雨田壹)'s request to see and adjust these prompts.",
+    to: '/settings/engines',
+  },
+  {
+    id: '2026-07-20-runs-history-load-more',
+    date: '2026-07-20',
+    title: '📜 See more than the last 15 runs — “Load older runs”',
+    blurb:
+      "The Runs page only kept the 15 most recent runs in its history, so anything older dropped off the list. The live view still refreshes lightly on those recent runs, but a new “Load older runs” button now pulls the rest on demand (up to 100), so a long training history stays reachable without slowing the page down.",
+    to: '/cloud',
+  },
+  {
+    id: '2026-07-20-lineage-diff',
+    date: '2026-07-20',
+    title: '⚖️ Compare two runs and see exactly what changed',
+    blurb:
+      "Shift-click two runs in the ◉ Graph and a side-by-side panel shows their settings, with the ones that DIFFER highlighted (and the identical ones dimmed and foldable). Stop eyeballing two panels to answer \"what did I change between v2 and v3\" — the diff spells it out: rank, learning rate, optimizer, steps and the rest. Older runs that never recorded their settings say so honestly instead of faking a comparison.",
+    to: '/cloud',
+  },
+  {
+    id: '2026-07-20-delete-gone-runs',
+    date: '2026-07-20',
+    title: '🗑 Tidy up the lineage graph — remove runs whose checkpoints are gone',
+    blurb:
+      "Runs whose checkpoints are no longer on disk used to pile up in the ◉ Graph as \"gone\" cards you couldn't clear. Click a gone run and the inspector now offers “Remove this run” — it clears the leftover entry and its notes (no files are touched, they're already gone). A run that still has checkpoints on disk is protected: it shows no remove button, and the server refuses to delete it. A removed run that others continued from doesn't break the tree — its children stay, re-rooted.",
+    to: '/cloud',
+  },
+  {
+    id: '2026-07-20-bank-promote-per-target',
+    date: '2026-07-20',
+    title: '⬆ Promote the same Bank picks into more than one dataset',
+    blurb:
+      "Promoting kept images into a dataset used to lock them out of every OTHER dataset — a second promote showed \"nothing to promote\" even though the dialog had just offered to copy them. Now “promote all kept” is per-target: images already sitting in another dataset stay promotable to a new one, and the dialog’s count reflects exactly what will be copied into the dataset you picked. Near-duplicates already in the target are still skipped on import.",
+    to: '/bank',
+  },
+  {
+    id: '2026-07-20-resolve-rejects-losers',
+    date: '2026-07-20',
+    title: '✂ “Keep best” on same-shot groups now actually rejects the extras',
+    blurb:
+      "Resolving a duplicate or same-shot group with “Keep best”, “Keep first” or “Resolve ALL” used to report “0 duplicate(s) rejected” whenever the group’s images were already kept — so the near-identical shots you meant to thin all stayed in. Now an explicit resolve keeps the chosen one and rejects the rest, kept or not. The automatic pipeline pass is unchanged: a mass auto-reject still never un-keeps an image you picked by hand.",
+    to: '/bank',
+  },
+  {
+    id: '2026-07-20-editable-identity-prompts',
+    date: '2026-07-20',
+    title: '🪪 Edit the hidden identity prompts that keep a face consistent',
+    blurb:
+      "The prompts that lock a subject's facial identity across every generated variation used to be baked in and invisible. They're now editable in Settings → Image engines: the API-engine identity locks, the Klein restage block, and the “Klein upscale & improve” instruction — each with a one-line explanation and a Restore default. You can also switch the improve prompt off entirely for a pure upscale. Leave everything blank and generation is exactly as before. Feature request by @bbsorry (雨田壹).",
+    to: '/settings/engines',
   },
   {
     id: '2026-07-20-lineage-inspect-notes',
@@ -116,6 +234,9 @@ export const WHATS_NEW = [
     title: '🗃️ A calmer, clearer Bank workspace',
     blurb:
       "The 🗃️ Bank toolbar is reorganized around what you actually do: Launch all and Promote stand out as the two outcomes, the individual analysis passes (Scan, Score, Watermarks, Person, Crops, Caption) sit together below them, and the flag filters are now grouped by Status, Quality, Score, Groups and 📐 Resolution with a live \"N shown of total\" count. Same tools, nothing removed — just far easier to read on a wide screen or a phone.",
+    to: '/bank',
+  },
+  {
     id: '2026-07-20-bank-delete-rejected',
     date: '2026-07-20',
     title: '🗑 Delete rejected images from your disk',
