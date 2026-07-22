@@ -354,6 +354,24 @@ def test_qwen_edit_catalog_every_entry_states_a_background_or_scene():
             f'{label!r} has no background/scene cue — will inherit the reference photo\'s own'
 
 
+def test_qwen_edit_catalog_backgrounds_are_not_vague_plain_neutral():
+    """A SECOND real ComfyUI test still reproduced the reference's own plain
+    white background on every shot even after every entry named SOME
+    background — because ~20 entries said "a plain background"/"a plain
+    neutral background"/"indoors" with no further detail, which is already
+    TRUE of a blank white studio reference and gives the edit model no
+    reason to change anything. Every entry must name a CONCRETE location,
+    color, or furnishing, not just "plain"/"neutral" filler."""
+    from app.services.face_variations import QWEN_EDIT_CATALOG_PROMPTS
+    vague = ('plain background', 'plain neutral background', 'plain studio background',
+            'plain studio backdrop', 'neutral background', 'neutral indoor background',
+            'neutral studio background')
+    for label, text in QWEN_EDIT_CATALOG_PROMPTS.items():
+        low = text.lower()
+        assert not any(v in low for v in vague), f'{label!r} still has a vague "plain/neutral" background'
+        assert not low.rstrip().endswith(', indoors'), f'{label!r} says bare "indoors" with no detail'
+
+
 def test_qwen_edit_prompt_for_resolves_known_label():
     from app.services.face_variations import qwen_edit_prompt_for
     out = qwen_edit_prompt_for('Body standing, front', 'unused fallback')

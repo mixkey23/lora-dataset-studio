@@ -647,6 +647,22 @@ _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
 # owner, real ComfyUI test: consistent character/pose/expression, but the
 # background never varied). Klein/API engines don't have this failure mode
 # (their own generative bias fills unstated gaps with plausible variety).
+# Two follow-up rounds, both from further real ComfyUI testing:
+# (1) "blurred (background)"/bokeh/depth-of-field wording was removed —
+# it's a camera-only optical effect that biases output toward photoreal
+# even when render_style targets a non-photoreal aesthetic (this catalog
+# is shared across every render_style). (2) vague phrasing like "a plain
+# background"/"a plain neutral background"/"indoors" turned out to be a
+# NO-OP against an already-neutral/white reference photo — it satisfies
+# "states a background" in words but gives the edit model nothing to
+# actually change, so shots kept coming back with the same white
+# background (repo owner: "Siguen generandose shots con fondo blanco").
+# Every such entry now names a CONCRETE color/location/furnishing
+# instead (e.g. "a charcoal-grey backdrop", "a cozy living room in the
+# background") so there's always a real, actionable difference from a
+# neutral reference — this repo trains LoRAs from these datasets, so
+# scene/background/lighting variety is a real dataset-quality goal, not
+# just cosmetic.
 # "distinct from image 1" (not "the reference") names
 # TextEncodeQwenImageEditPlusCustom_lrzjason's own reference-image input slot,
 # which read more reliably in testing than a generic "the reference" phrase.
@@ -657,23 +673,23 @@ _NSFW_LABELS = {e['label'] for e in NSFW_VARIATION_CATALOG}
 QWEN_EDIT_CATALOG_PROMPTS = {
     # --- Face (close-up viewpoint stated — not otherwise inferable) ---
     'Face front, neutral': ('in a close-up of the face, facing the camera directly, a calm neutral '
-                            'expression, soft even light, a plain neutral background'),
+                            'expression, soft even light, a warm beige wall in the background'),
     'Face front, smile': ('in a close-up of the face, facing the camera directly, a slight smile, '
                           'soft window light, a home interior in the background'),
-    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling, soft indoor light, a plain background',
-    'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression, even studio light, a plain background',
+    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling, soft indoor light, a cozy living room in the background',
+    'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression, even studio light, a charcoal-grey backdrop',
     'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing, soft daylight, an outdoor setting',
-    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression, warm indoor light, a plain background',
-    'Profile left': 'in a close-up of the face, in full left profile, a neutral expression, a plain studio background',
+    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression, warm indoor light, a bookshelf-lined room in the background',
+    'Profile left': 'in a close-up of the face, in full left profile, a neutral expression, a soft grey studio backdrop',
     'Profile right': 'in a close-up of the face, in full right profile, a neutral expression, an outdoor setting',
     'Profile left, smile': ('in a close-up of the face, in strict left profile, a slight smile, soft '
-                            'window light, a plain background'),
+                            'window light, a plant-filled sunroom in the background'),
     'Profile right, smile': ('in a close-up of the face, in strict right profile, a slight smile, soft '
-                             'window light, a plain background'),
+                             'window light, a cozy café interior in the background'),
     'Profile left, serious': ('in a close-up of the face, in strict left profile, a serious expression, '
-                              'even studio light, a plain background'),
+                              'even studio light, a dark charcoal backdrop'),
     'Profile right, serious': ('in a close-up of the face, in strict right profile, a serious expression, '
-                               'even studio light, a plain background'),
+                               'even studio light, a deep navy backdrop'),
     'Profile left, looking up': ('in a close-up of the face, in strict left profile, head tilted slightly '
                                  'upward, eyes looking up, a pensive expression, soft daylight, an outdoor '
                                  'setting'),
@@ -684,24 +700,24 @@ QWEN_EDIT_CATALOG_PROMPTS = {
                                 'dramatic rim lighting from behind, a dark background'),
     'Profile right, rim light': ('in a close-up of the face, in strict right profile, a neutral '
                                  'expression, dramatic rim lighting from behind, a dark background'),
-    'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a plain background',
-    'Face, studio': 'in a close-up of the face, facing the camera, even studio lighting, a plain background',
+    'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a curtained bedroom in the background',
+    'Face, studio': 'in a close-up of the face, facing the camera, even studio lighting, a warm terracotta-colored backdrop',
     'Face, golden hour': 'in a close-up of the face, turned three-quarters, warm golden-hour sunlight, outdoors',
-    'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression, a plain neutral background',
+    'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression, a brightly lit kitchen in the background',
     'Face, looking up': 'in a close-up of the face, looking slightly upward, soft daylight, an outdoor setting',
     'Face, looking down': 'in a close-up of the face, looking slightly downward, a pensive expression, an indoor setting',
     'Face, landscape framing': ('in a close-up of the face placed to one side of a wide frame with the '
                                 'surrounding environment visible, turned three-quarters, outdoors'),
     'Face, tall framing': ('in a close-up of the face within a tall vertical frame, facing the camera, '
                            'soft natural light, an outdoor setting'),
-    'Face, cinematic framing': 'in a close-up of the face placed off-center within a wide frame, a plain background',
+    'Face, cinematic framing': 'in a close-up of the face placed off-center within a wide frame, city lights at night in the background',
     # --- Bust ---
     'Bust, front': ('seen from the waist up, facing the camera, a neutral expression, wearing a top '
-                    'distinct from image 1, a plain studio background'),
+                    'distinct from image 1, a soft sage-green studio backdrop'),
     'Bust, three-quarter': ('seen from the waist up, turned three-quarters, smiling, wearing an outfit '
-                            'distinct from image 1, indoors'),
+                            'distinct from image 1, in a bright modern living room'),
     'Bust, outdoor': 'seen from the waist up, facing the camera, an outdoor park in the background',
-    'Bust, studio': 'seen from the waist up, turned three-quarters, a plain studio backdrop',
+    'Bust, studio': 'seen from the waist up, turned three-quarters, a warm terracotta studio backdrop',
     'Bust, jacket': 'seen from the waist up, wearing a jacket distinct from image 1, an urban background',
     'Bust, evening outfit': ('seen from the waist up, wearing an elegant evening outfit distinct from '
                              'image 1, at a dim evening venue, ambient light'),
@@ -718,7 +734,7 @@ QWEN_EDIT_CATALOG_PROMPTS = {
     # every framing states its camera angle explicitly, same as face/bust/back) ---
     'Body standing, front': 'in a full-body view, standing, facing the camera, wearing casual clothes distinct from image 1, on a street',
     'Body standing, three-quarter': 'in a full-body view, standing, turned three-quarters, a distinct outfit from image 1, outdoors',
-    'Body sitting': 'in a full-body view, sitting on a chair, a relaxed pose, indoors',
+    'Body sitting': 'in a full-body view, sitting on a chair, a relaxed pose, in a sunlit living room',
     'Body walking': 'in a full-body view, walking, a dynamic pose, with a city street in the background',
     'Body, café': 'in a full-body view, standing inside a café, warm ambient light',
     'Body, beach (clothed)': 'in a full-body view, standing on a beach, wearing summer casual clothes distinct from image 1, bright daylight',
@@ -736,19 +752,19 @@ QWEN_EDIT_CATALOG_PROMPTS = {
                                  'by rim light, wearing an elegant fitted dress, in a moody interior'),
     # --- Back (viewpoint stated — not otherwise inferable) ---
     'Back, three-quarter': ('in a full-body view, seen from behind at a three-quarter angle, showing the '
-                            'hairstyle and silhouette, a plain neutral background'),
+                            'hairstyle and silhouette, a softly lit hallway in the background'),
     # --- NSFW (local Qwen Edit only, Rapid-AIO checkpoint) ---
     'Bust, lingerie': 'seen from the waist up, wearing delicate lace lingerie, a bedroom setting, soft window light',
-    'Bust, topless': 'seen from the waist up, topless with the bare chest visible, a neutral indoor background, natural light',
+    'Bust, topless': 'seen from the waist up, topless with the bare chest visible, a dim bedroom in the background, natural light',
     'Bust, towel': 'seen from the waist up, wrapped in a bath towel with bare shoulders, a bathroom setting, soft light',
     'Body, lingerie standing': 'in a full-body view, standing, wearing a matching lace lingerie set, in a bedroom interior, soft light',
-    'Body, nude standing': 'in a full-body view, standing fully nude with natural anatomy, a relaxed pose, a neutral studio background, soft even light',
+    'Body, nude standing': 'in a full-body view, standing fully nude with natural anatomy, a relaxed pose, a softly lit studio with a warm grey backdrop, soft even light',
     'Body, nude three-quarter': 'in a full-body view, turned three-quarters, fully nude with natural anatomy, standing by a large window, soft daylight',
     'Body, nude sitting on bed': 'in a full-body view, sitting nude on the edge of a bed, a relaxed natural pose, warm bedroom light',
     'Body, nude lying': ('in a full-body view, lying nude on a bed on her side, natural anatomy, soft '
                          'morning light, a cozy bedroom interior'),
     'Body, nude shower': 'in a full-body view, nude in the shower, wet skin and hair with visible water droplets, a glass and tile background',
-    'Back, nude': 'in a full-body view, seen from behind, standing nude with the back and buttocks visible, natural anatomy, a neutral background',
+    'Back, nude': 'in a full-body view, seen from behind, standing nude with the back and buttocks visible, natural anatomy, a dim studio with a soft grey backdrop',
 }
 
 
