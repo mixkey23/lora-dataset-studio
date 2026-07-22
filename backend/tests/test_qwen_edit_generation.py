@@ -322,6 +322,21 @@ def test_qwen_edit_catalog_has_no_camera_lens_jargon():
         assert 'mm ' not in text, f'{label!r} still has a focal-length reference'
 
 
+def test_qwen_edit_catalog_has_no_camera_specific_effects():
+    """"blurred (background)" is a camera/lens artifact (bokeh, depth of
+    field) — the catalog is SHARED across every render_style (Qwen Edit's
+    positive prompt carries no style clause, see wrap_variation_qwen_edit),
+    so a photography-specific effect baked into a background description
+    would bias every non-photoreal render_style too. Repo owner feedback:
+    background phrasing must be neutral, describing WHAT is there, not a
+    camera effect."""
+    from app.services.face_variations import QWEN_EDIT_CATALOG_PROMPTS
+    for label, text in QWEN_EDIT_CATALOG_PROMPTS.items():
+        assert 'blur' not in text.lower(), f'{label!r} still has a camera-blur (bokeh) effect'
+        assert 'bokeh' not in text.lower(), f'{label!r} still has a camera-blur (bokeh) effect'
+        assert 'depth of field' not in text.lower(), f'{label!r} still has a camera-blur (bokeh) effect'
+
+
 def test_qwen_edit_catalog_every_entry_states_a_background_or_scene():
     """Real ComfyUI test (repo owner): a shot with no background/scene cue
     inherited the reference photo's own background verbatim (a plain white

@@ -659,43 +659,42 @@ QWEN_EDIT_CATALOG_PROMPTS = {
     'Face front, neutral': ('in a close-up of the face, facing the camera directly, a calm neutral '
                             'expression, soft even light, a plain neutral background'),
     'Face front, smile': ('in a close-up of the face, facing the camera directly, a slight smile, '
-                          'soft window light, a blurred home interior in the background'),
-    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling, soft indoor light, a blurred background',
+                          'soft window light, a home interior in the background'),
+    'Face 3/4 left, smile': 'in a close-up of the face, turned three-quarters to the left, smiling, soft indoor light, a plain background',
     'Face 3/4 left, serious': 'in a close-up of the face, turned three-quarters to the left, a serious expression, even studio light, a plain background',
-    'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing, soft daylight, a blurred outdoor background',
-    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression, warm indoor light, a blurred background',
+    'Face 3/4 right, laugh': 'in a close-up of the face, turned three-quarters to the right, laughing, soft daylight, an outdoor setting',
+    'Face 3/4 right, gentle': 'in a close-up of the face, turned three-quarters to the right, a gentle soft expression, warm indoor light, a plain background',
     'Profile left': 'in a close-up of the face, in full left profile, a neutral expression, a plain studio background',
-    'Profile right': 'in a close-up of the face, in full right profile, a neutral expression, a blurred outdoor background',
+    'Profile right': 'in a close-up of the face, in full right profile, a neutral expression, an outdoor setting',
     'Profile left, smile': ('in a close-up of the face, in strict left profile, a slight smile, soft '
-                            'window light, a blurred background'),
+                            'window light, a plain background'),
     'Profile right, smile': ('in a close-up of the face, in strict right profile, a slight smile, soft '
-                             'window light, a blurred background'),
+                             'window light, a plain background'),
     'Profile left, serious': ('in a close-up of the face, in strict left profile, a serious expression, '
                               'even studio light, a plain background'),
     'Profile right, serious': ('in a close-up of the face, in strict right profile, a serious expression, '
                                'even studio light, a plain background'),
     'Profile left, looking up': ('in a close-up of the face, in strict left profile, head tilted slightly '
-                                 'upward, eyes looking up, a pensive expression, soft daylight, a blurred '
-                                 'outdoor background'),
+                                 'upward, eyes looking up, a pensive expression, soft daylight, an outdoor '
+                                 'setting'),
     'Profile right, looking up': ('in a close-up of the face, in strict right profile, head tilted '
                                   'slightly upward, eyes looking up, a pensive expression, soft daylight, '
-                                  'a blurred outdoor background'),
+                                  'an outdoor setting'),
     'Profile left, rim light': ('in a close-up of the face, in strict left profile, a neutral expression, '
-                                'dramatic rim lighting from behind, a dark blurred background'),
+                                'dramatic rim lighting from behind, a dark background'),
     'Profile right, rim light': ('in a close-up of the face, in strict right profile, a neutral '
-                                 'expression, dramatic rim lighting from behind, a dark blurred background'),
-    'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a blurred background',
+                                 'expression, dramatic rim lighting from behind, a dark background'),
+    'Face, window light': 'in a close-up of the face, facing the camera, soft window light, a plain background',
     'Face, studio': 'in a close-up of the face, facing the camera, even studio lighting, a plain background',
     'Face, golden hour': 'in a close-up of the face, turned three-quarters, warm golden-hour sunlight, outdoors',
     'Face, surprise': 'in a close-up of the face, facing the camera, a surprised expression, a plain neutral background',
-    'Face, looking up': 'in a close-up of the face, looking slightly upward, soft daylight, a blurred outdoor background',
-    'Face, looking down': 'in a close-up of the face, looking slightly downward, a pensive expression, a blurred indoor background',
+    'Face, looking up': 'in a close-up of the face, looking slightly upward, soft daylight, an outdoor setting',
+    'Face, looking down': 'in a close-up of the face, looking slightly downward, a pensive expression, an indoor setting',
     'Face, landscape framing': ('in a close-up of the face placed to one side of a wide frame with the '
                                 'surrounding environment visible, turned three-quarters, outdoors'),
     'Face, tall framing': ('in a close-up of the face within a tall vertical frame, facing the camera, '
-                           'soft natural light, a blurred outdoor background'),
-    'Face, cinematic framing': ('in a close-up of the face placed off-center within a wide frame, a '
-                                'blurred background'),
+                           'soft natural light, an outdoor setting'),
+    'Face, cinematic framing': 'in a close-up of the face placed off-center within a wide frame, a plain background',
     # --- Bust ---
     'Bust, front': ('seen from the waist up, facing the camera, a neutral expression, wearing a top '
                     'distinct from image 1, a plain studio background'),
