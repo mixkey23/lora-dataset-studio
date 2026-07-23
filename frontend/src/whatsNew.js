@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-23-qwen-image-defaults-musubi-edit',
+    date: '2026-07-23',
+    title: '🎯 Qwen-Image now defaults to musubi-tuner + Edit-2511',
+    blurb:
+      "A new Qwen-Image dataset (with no engine/target chosen yet) now starts on the musubi-tuner engine and the Edit-2511 target, with the built-in 'Qwen-Image · Character' preset pre-picked in the dropdown — one less round of clicking before your first run. Any explicit choice you've already made (persisted or picked this session) always wins; every other family is unaffected.",
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-23-musubi-gpu-profiles',
     date: '2026-07-23',
     title: '🎛️ musubi-tuner: 6 ready-made GPU profiles, field-tested per tier',

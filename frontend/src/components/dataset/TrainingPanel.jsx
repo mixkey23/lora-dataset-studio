@@ -24,6 +24,7 @@ import {
 } from '../../utils/zimageTrainingRecipe';
 import {
   compatibleTrainingPresetSelection,
+  defaultTrainingPresetId,
   filterTrainingPresets,
   trainingPresetApplyPayload,
   trainingPresetDatasetKind,
@@ -69,7 +70,7 @@ const DEFAULT_CUSTOM_FAMILIES = ['sdxl', 'krea', 'flux', 'flux2klein', 'qwen_ima
 const defaultTrainingVariant = (family) => (
   family === 'krea' ? 'base'
     : family === 'flux2klein' ? '4b'
-    : family === 'qwen_image' ? 'image'
+    : family === 'qwen_image' ? 'edit'
     : 'turbo'
 );
 // Absolute path = the persisted custom-weights path (never a ComfyUI-relative
@@ -360,7 +361,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     setVariant(nextVariant);
     // musubi-tuner is qwen_image-only — leaving that family drops back to
     // ai-toolkit rather than carry an engine choice that's invalid elsewhere.
-    if (t !== 'qwen_image') setEngine('aitoolkit');
+    // Entering it defaults to musubi (product default; base-info's own
+    // resolved value overwrites this once it loads, same as variant above).
+    setEngine(t === 'qwen_image' ? 'musubi' : 'aitoolkit');
     let saved;
     try {
       saved = await ds.setDatasetTrainType?.(t);
@@ -513,7 +516,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
           preferredSelection === undefined ? current : preferredSelection,
           list,
           presetContext,
-        ));
+        ) || defaultTrainingPresetId(list, presetContext));
         return list;
       }
     } catch { /* list is best-effort */ }
@@ -523,9 +526,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const visiblePresets = filterTrainingPresets(presets, presetContext);
   const selPreset = visiblePresets.find((p) => String(p.id) === presetSel) || null;
   useEffect(() => {
-    setPresetSel((current) => compatibleTrainingPresetSelection(
-      current, presets, { trainType, datasetKind: kind, variant },
-    ));
+    const ctx = { trainType, datasetKind: kind, variant };
+    setPresetSel((current) => compatibleTrainingPresetSelection(current, presets, ctx)
+      || defaultTrainingPresetId(presets, ctx));
   }, [presets, trainType, kind, variant]);
   const savePreset = async () => {
     const name = window.prompt('Preset name (an existing name is overwritten):');
@@ -1598,16 +1601,17 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   <option value="9b">9B (cloud, 32-48 GB)</option>
                 </select>
               )}
-              {/* Qwen-Image : deux CIBLES (pas une taille comme FLUX.2 Klein) — base
-                  T2I (défaut) ou Edit-2511 (édition par instruction). Local-only
-                  cette vague, les deux bases sont officielles Hugging Face. */}
+              {/* Qwen-Image : deux CIBLES (pas une taille comme FLUX.2 Klein) — Edit-2511
+                  (édition par instruction, défaut — la voie musubi-tuner cible celle-ci)
+                  ou base T2I. Local-only cette vague, les deux bases sont officielles
+                  Hugging Face. */}
               {trainType === 'qwen_image' && (
                 <select value={variant} onChange={(e) => setVariant(e.target.value)}
                   aria-label="Qwen-Image training target"
-                  title="Qwen-Image training target — base is the text-to-image model (recommended for most LoRAs); Edit-2511 is the instruction-based image-edit model. Local-only for now."
+                  title="Qwen-Image training target — Edit-2511 is the instruction-based image-edit model (default); base is the plain text-to-image model. Local-only for now."
                   className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
-                  <option value="image">Base (text-to-image)</option>
                   <option value="edit">Edit-2511 (instruction edit)</option>
+                  <option value="image">Base (text-to-image)</option>
                 </select>
               )}
             </div>

@@ -393,6 +393,23 @@ def test_base_info_returns_bases_by_type(client, monkeypatch):
     assert body['train_type'] == 'zimage'
 
 
+def test_base_info_qwen_image_defaults_to_musubi_engine_and_edit_variant(client, app, monkeypatch):
+    """Repo owner's product default: an unset qwen_image dataset starts on
+    musubi/Edit-2511, not ai-toolkit/base — every other family is unaffected."""
+    from app.models import FaceDataset
+    from app.services import face_dataset_service as svc
+    _valid(monkeypatch, True)
+    ds_id = _create(client)
+    with app.app_context():
+        ds = FaceDataset.query.get(ds_id)
+        ds.train_type = 'qwen_image'
+        svc.db.session.commit()
+    body = client.get(f'/api/dataset/{ds_id}/train/base-info').get_json()
+    assert body['engine'] == 'musubi'
+    assert body['variant'] == 'edit'
+    assert body['valid_engines'] == ['aitoolkit', 'musubi']
+
+
 def test_base_info_unknown_dataset_404(client, monkeypatch):
     _valid(monkeypatch, True)
     resp = client.get('/api/dataset/999999/train/base-info')

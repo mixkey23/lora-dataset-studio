@@ -500,8 +500,10 @@ def dataset_train_base_info(dataset_id):
                     'variant': ds.train_variant or lt._default_variant_for(ds.train_type or 'zimage'),
                     # Second local training engine (Wave 2) — 'aitoolkit' (every
                     # family) or 'musubi' (qwen_image only). valid_engines lets the
-                    # UI show the selector only where it means something.
-                    'engine': ds.train_engine or 'aitoolkit',
+                    # UI show the selector only where it means something. qwen_image
+                    # DEFAULTS to musubi when unset (_default_engine_for) — an
+                    # explicit persisted choice always wins.
+                    'engine': ds.train_engine or lt._default_engine_for(ds.train_type or 'zimage'),
                     'valid_engines': list(lt._valid_engines_for(ds.train_type or 'zimage')),
                     'converted': converted,
                     'convert': zc.convert_status(),

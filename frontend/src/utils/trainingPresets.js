@@ -42,6 +42,20 @@ export function compatibleTrainingPresetSelection(selection, presets, context) {
     .some((preset) => String(preset.id) === wanted) ? wanted : ''
 }
 
+/** Pre-select (not auto-apply) a sensible starting preset for a family that
+ * has no selection yet — today just qwen_image, whose musubi-tuner default
+ * (see _default_engine_for) benefits from starting on its own built-in
+ * preset rather than an unrelated family's leftover Advanced options. Picks
+ * the first BUILT-IN compatible preset (already kind/variant-filtered by
+ * filterTrainingPresets) — never a user's own saved preset, and never when
+ * a selection already exists (the caller only calls this as a fallback). */
+export function defaultTrainingPresetId(presets, context) {
+  if (context?.trainType !== 'qwen_image') return ''
+  const builtin = filterTrainingPresets(presets, context)
+    .find((preset) => String(preset.id || '').startsWith('builtin-'))
+  return builtin ? String(builtin.id) : ''
+}
+
 /** Build the only payload the UI may send to the apply endpoint.
  *
  * Returning null is the last client-side mismatch guard: the caller performs

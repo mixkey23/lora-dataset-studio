@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   compatibleTrainingPresetSelection,
+  defaultTrainingPresetId,
   filterTrainingPresets,
   isTrainingPresetCompatible,
   trainingPresetApplyPayload,
@@ -15,6 +16,9 @@ const presets = [
   { id: 'krea-character', train_type: 'krea', dataset_kind: 'character', variants: ['base'] },
   { id: 'z-style', train_type: 'zimage', kind: 'style', variants: ['base'] },
   { id: 7, train_type: 'krea', settings: {} }, // legacy DB preset: no kind metadata
+  { id: 'builtin-character-qwen_image', train_type: 'qwen_image', dataset_kind: 'character',
+    variants: ['image', 'edit'] },
+  { id: 42, train_type: 'qwen_image', dataset_kind: 'character', settings: {} }, // user's own saved preset
 ]
 
 test('preset scope reads dataset_kind and only dataset-kind values from legacy kind', () => {
@@ -67,6 +71,20 @@ test('mismatch produces no payload, so the caller performs no request', () => {
   if (payload) requests += 1
   assert.equal(payload, null)
   assert.equal(requests, 0)
+})
+
+test('default preset pre-selection only fires for qwen_image with no existing selection', () => {
+  const ctx = { trainType: 'qwen_image', datasetKind: 'character', variant: 'edit' }
+  assert.equal(defaultTrainingPresetId(presets, ctx), 'builtin-character-qwen_image')
+  // Never for any other family — leaves their "no selection yet" behaviour unchanged.
+  assert.equal(defaultTrainingPresetId(presets, { trainType: 'krea', datasetKind: 'style' }), '')
+  assert.equal(defaultTrainingPresetId(presets, { trainType: 'zimage', datasetKind: 'style' }), '')
+})
+
+test('default preset pre-selection never picks a user-saved (non built-in) preset', () => {
+  const onlyUserPreset = [{ id: 42, train_type: 'qwen_image', dataset_kind: 'character', settings: {} }]
+  assert.equal(defaultTrainingPresetId(onlyUserPreset,
+    { trainType: 'qwen_image', datasetKind: 'character' }), '')
 })
 
 test('save-current scope omits synthetic variants for single-recipe families', () => {

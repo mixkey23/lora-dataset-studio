@@ -68,6 +68,40 @@ def test_valid_engines_for_qwen_image_vs_other_families():
     assert lt._valid_engines_for('sdxl') == ('aitoolkit',)
 
 
+# --- _default_engine_for / _train_engine family-aware default --------------
+
+def test_default_engine_for_qwen_image_is_musubi_others_aitoolkit():
+    from app.services import lora_training as lt
+    assert lt._default_engine_for('qwen_image') == 'musubi'
+    assert lt._default_engine_for('zimage') == 'aitoolkit'
+    assert lt._default_engine_for('sdxl') == 'aitoolkit'
+    assert lt._default_engine_for(None) == 'aitoolkit'
+
+
+def test_train_engine_defaults_to_musubi_for_unset_qwen_image_dataset(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QE1', 'zchar_qe1', train_type='qwen_image')
+        assert lt._train_engine(ds) == 'musubi'
+        # Every other family still defaults to aitoolkit.
+        ds2 = svc.create_dataset(LOCAL_USER, 'QE2', 'zchar_qe2', train_type='zimage')
+        assert lt._train_engine(ds2) == 'aitoolkit'
+
+
+def test_train_engine_explicit_persisted_choice_wins_over_default(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QE3', 'zchar_qe3', train_type='qwen_image')
+        ds.train_engine = 'aitoolkit'
+        svc.db.session.commit()
+        assert lt._train_engine(ds) == 'aitoolkit'   # persisted choice, not the default
+        assert lt._train_engine(ds, engine='musubi') == 'musubi'   # override wins over persisted
+
+
 # --- launch_training: engine validation guards ------------------------------
 
 def test_launch_refuses_musubi_engine_for_non_qwen_image_family(app, tmp_path, monkeypatch):

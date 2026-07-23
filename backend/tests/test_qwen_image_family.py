@@ -86,9 +86,10 @@ def test_launch_refuses_qwen_image_when_arch_missing(app, tmp_path, monkeypatch)
 
 # --- 3) job config: base default / Edit-2511 opt-in -----------------------------
 
-def test_build_job_config_qwen_image_base_default_and_edit_optin(app, tmp_path):
-    """'image' (base T2I) is the default; 'edit' swaps arch model target AND
-    name_or_path. Non-distilled base -> real CFG previews."""
+def test_build_job_config_qwen_image_edit_default_and_base_optin(app, tmp_path):
+    """'edit' (Qwen-Image-Edit-2511) is the default (repo owner's product call,
+    since musubi's Qwen-Image tooling here targets Edit-2511); 'image' (base
+    T2I) is the opt-out. Non-distilled base -> real CFG previews."""
     from app.services import lora_training as lt
     from app.services import face_dataset_service as svc
     from app.config import LOCAL_USER
@@ -98,11 +99,11 @@ def test_build_job_config_qwen_image_base_default_and_edit_optin(app, tmp_path):
         ds = svc.create_dataset(LOCAL_USER, 'Qee', 'zchar_qee', train_type='qwen_image')
         folder = tmp_path / 'ds'; folder.mkdir()
 
-        assert lt._qwen_image_is_edit(ds) is False          # no variant -> base
+        assert lt._qwen_image_is_edit(ds) is True           # no variant -> edit (default)
         p = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
         m = p['model']
         assert m['arch'] == 'qwen_image'
-        assert m['name_or_path'] == 'Qwen/Qwen-Image'
+        assert m['name_or_path'] == 'Qwen/Qwen-Image-Edit-2511'
         assert m['quantize'] is True and m['quantize_te'] is True
         assert m['low_vram'] is True and m['qtype'] == 'qfloat8'
         assert p['train']['timestep_type'] == 'sigmoid'
@@ -112,12 +113,12 @@ def test_build_job_config_qwen_image_base_default_and_edit_optin(app, tmp_path):
         assert p['datasets'][0]['caption_ext'] == 'txt'
         assert p['network'] == {'type': 'lora', 'linear': 32, 'linear_alpha': 32}
 
-        ds.train_variant = 'edit'
+        ds.train_variant = 'image'
         svc.db.session.commit()
-        assert lt._qwen_image_is_edit(ds) is True
-        pe = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
-        assert pe['model']['arch'] == 'qwen_image'
-        assert pe['model']['name_or_path'] == 'Qwen/Qwen-Image-Edit-2511'
+        assert lt._qwen_image_is_edit(ds) is False
+        pi = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
+        assert pi['model']['arch'] == 'qwen_image'
+        assert pi['model']['name_or_path'] == 'Qwen/Qwen-Image'
 
 
 def test_qwen_image_expects_prose_captions(app):
@@ -152,13 +153,13 @@ def test_dest_base_tag_distinct_for_image_and_edit(app):
     from app.config import LOCAL_USER
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'QT', 'zchar_qt', train_type='qwen_image')
-        tag_image = lt._dest_base_tag(ds)                      # default variant -> base
-        assert tag_image == '_Qwen-Image'
-        assert lt._run_name(ds).endswith('_Qwen-Image')
-        ds.train_variant = 'edit'
-        svc.db.session.commit()
-        tag_edit = lt._dest_base_tag(ds)
+        tag_edit = lt._dest_base_tag(ds)                       # default variant -> edit
         assert tag_edit == '_Qwen-Image-Edit-2511'
+        assert lt._run_name(ds).endswith('_Qwen-Image-Edit-2511')
+        ds.train_variant = 'image'
+        svc.db.session.commit()
+        tag_image = lt._dest_base_tag(ds)
+        assert tag_image == '_Qwen-Image'
         assert tag_image != tag_edit
         # ... and both are distinct from a zimage official run (empty tag).
         ds.train_type = 'zimage'
@@ -167,12 +168,13 @@ def test_dest_base_tag_distinct_for_image_and_edit(app):
 
 
 def test_default_and_valid_variants_for_qwen_image():
-    """'image' is the family default everywhere no variant is given; the
-    accepted enum is per-family ('image'/'edit' only — a leftover
-    'turbo'/'base' from another family must fall back to base, not leak into
-    the config)."""
+    """'edit' (Qwen-Image-Edit-2511) is the family default everywhere no
+    variant is given (repo owner's product call — musubi's Qwen-Image
+    tooling here targets Edit-2511); the accepted enum is per-family
+    ('image'/'edit' only — a leftover 'turbo'/'base' from another family
+    must fall back to base, not leak into the config)."""
     from app.services import lora_training as lt
-    assert lt._default_variant_for('qwen_image') == 'image'
+    assert lt._default_variant_for('qwen_image') == 'edit'
     assert lt._valid_variants_for('qwen_image') == ('image', 'edit')
     # historical families keep their enum untouched
     assert lt._valid_variants_for('krea') == ('turbo', 'base', 'deturbo')

@@ -281,11 +281,27 @@ def _train_type(ds, family=None) -> str:
 _VALID_ENGINES = ('aitoolkit', 'musubi')
 
 
-def _train_engine(ds, engine=None) -> str:
-    """'aitoolkit' (default/every other family) or 'musubi' (qwen_image only,
-    opt-in). `engine` override wins over the persisted value when given."""
-    e = ((engine or None) or getattr(ds, 'train_engine', None) or 'aitoolkit').lower()
-    return e if e in _VALID_ENGINES else 'aitoolkit'
+def _default_engine_for(family) -> str:
+    """qwen_image defaults to musubi-tuner (dedicated GPU-tier profiles, a
+    real per-VRAM recipe — repo owner's own product call) when NEITHER an
+    explicit override NOR a persisted train_engine exists yet. Every other
+    family stays ai-toolkit-only regardless (mirrors _valid_engines_for) —
+    this only changes what an UNSET qwen_image dataset starts on; an
+    explicit choice (override or persisted) always wins."""
+    return 'musubi' if family == 'qwen_image' else 'aitoolkit'
+
+
+def _train_engine(ds, engine=None, family=None) -> str:
+    """'aitoolkit' (default/every other family) or 'musubi' (qwen_image
+    default — see _default_engine_for). `engine` override wins over the
+    persisted value when given. `family` lets a caller that already resolved
+    the launch's family (accounting for a train_type override in the SAME
+    call) pass it explicitly instead of re-deriving from `ds` — falls back
+    to `_train_type(ds)` when omitted."""
+    fam = family if family is not None else _train_type(ds)
+    e = ((engine or None) or getattr(ds, 'train_engine', None)
+        or _default_engine_for(fam)).lower()
+    return e if e in _VALID_ENGINES else _default_engine_for(fam)
 
 
 def _valid_engines_for(family) -> tuple:
@@ -798,19 +814,20 @@ def _flux2klein_is_9b(ds, variant=_PERSISTED) -> bool:
 def _qwen_image_is_edit(ds, variant=_PERSISTED) -> bool:
     """Qwen-Image model target. `train_variant` 'edit' → Qwen-Image-Edit-2511
     (instruction-based editing); anything else → base Qwen-Image (T2I). Default
-    'image' when unset — the chosen product default (mirrors _default_variant_for),
-    so the run tag and the job-config never disagree even if train_variant was
-    never persisted."""
+    'edit' when unset — the chosen product default (mirrors _default_variant_for;
+    repo owner's own call, since musubi's Qwen-Image tooling here targets
+    Edit-2511), so the run tag and the job-config never disagree even if
+    train_variant was never persisted."""
     selected = (getattr(ds, 'train_variant', None)
                 if variant is _PERSISTED else variant)
-    return str(selected or 'image').lower() == 'edit'
+    return str(selected or 'edit').lower() == 'edit'
 
 
 def _default_variant_for(family) -> str:
     """Variante par défaut d'une famille quand aucune n'est fournie NI persistée :
     Krea → 'base' (Raw, reco officielle), FLUX.2 Klein → '4b' (la voie locale
-    16-24 Go ; le 9B est la voie cloud), Qwen-Image → 'image' (base T2I ; 'edit'
-    est l'opt-in Qwen-Image-Edit-2511), sinon 'turbo'. Utilisé par tous les
+    16-24 Go ; le 9B est la voie cloud), Qwen-Image → 'edit' (Qwen-Image-Edit-2511 ;
+    'image' — base T2I — reste choisissable), sinon 'turbo'. Utilisé par tous les
     chemins de lancement (direct / file / reprise / cloud) pour que le défaut
     tienne de bout en bout, pas seulement quand l'UI envoie explicitement la variante."""
     fam = family or 'zimage'
@@ -819,7 +836,7 @@ def _default_variant_for(family) -> str:
     if fam == 'flux2klein':
         return '4b'
     if fam == 'qwen_image':
-        return 'image'
+        return 'edit'
     return 'turbo'
 
 
@@ -2964,8 +2981,8 @@ def _build_job_config_flux2klein(ds, dataset_folder: str, steps: int, training_f
 
 def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_folder=None) -> dict:
     """Job-config ai-toolkit pour Qwen-Image (arch='qwen_image'). Deux cibles selon
-    `train_variant` (cf. _qwen_image_is_edit) : base Qwen-Image (T2I, défaut) ou
-    Qwen-Image-Edit-2511 (instruction-edit). Modelé sur _build_job_config_flux2klein
+    `train_variant` (cf. _qwen_image_is_edit) : Qwen-Image-Edit-2511 (instruction-
+    edit, défaut) ou base Qwen-Image (T2I). Modelé sur _build_job_config_flux2klein
     (même stratégie basse-VRAM quantize+low_vram+qfloat8, même CFG réel non distillé)
     faute de recette Qwen-Image dédiée dans ce repo — TOUTES les valeurs ci-dessous
     sont EXTRAPOLÉES (jamais mesurées sur un run réel) : rank/timestep (cf.
@@ -4385,7 +4402,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     # selon la version ai-toolkit installée, cf. _aitoolkit_supports_qwen_image).
     # Only applies to the ai-toolkit engine — musubi-tuner doesn't touch
     # ai-toolkit's arch registry at all, so this guard is meaningless for it.
-    launch_engine = _train_engine(ds, engine)
+    launch_engine = _train_engine(ds, engine, family=launch_fam)
     if (_train_type(ds) == 'qwen_image' and launch_engine == 'aitoolkit'
             and not _aitoolkit_supports_qwen_image()):
         raise ValueError(
@@ -5352,7 +5369,7 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
     # Qwen-Image via ai-toolkit : même garde qu'au lancement (n'applique que si
     # l'engine choisi est ai-toolkit — musubi-tuner n'a rien à voir avec le
     # registre d'archs ai-toolkit).
-    eng = _train_engine(ds, engine)
+    eng = _train_engine(ds, engine, family=ttype)
     if (ttype == 'qwen_image' and eng == 'aitoolkit'
             and not _aitoolkit_supports_qwen_image()):
         raise ValueError(
