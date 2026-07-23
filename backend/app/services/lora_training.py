@@ -4403,7 +4403,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
                 "musubi-tuner is not configured (folder/venv missing or its "
                 "Qwen-Image scripts aren't found) - set it up in Settings → "
                 "Local tools before training with it.")
-        _missing_weights = musubi_tuner.missing_qwen_image_weights()
+        _missing_weights = musubi_tuner.describe_missing_qwen_image_weights()
         if _missing_weights:
             raise ValueError(
                 "musubi-tuner is missing Qwen-Image weight path(s): "
@@ -5371,7 +5371,7 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
                 "musubi-tuner is not configured (folder/venv missing or its "
                 "Qwen-Image scripts aren't found) - set it up in Settings → "
                 "Local tools before queuing a run with it.")
-        _q_missing_weights = musubi_tuner.missing_qwen_image_weights()
+        _q_missing_weights = musubi_tuner.describe_missing_qwen_image_weights()
         if _q_missing_weights:
             raise ValueError(
                 "musubi-tuner is missing Qwen-Image weight path(s): "

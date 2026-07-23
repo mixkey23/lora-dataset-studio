@@ -85,6 +85,73 @@ def test_missing_qwen_image_weights_lists_each_unset_or_missing_key(app, tmp_pat
     assert 'vae' in missing and 'text_encoder' in missing
 
 
+# --- _sanitize_path() / quote-wrapped paths ("Copy as path" footgun) -------
+
+def test_sanitize_path_strips_surrounding_double_quotes():
+    from app.services import musubi_tuner as mt
+    assert mt._sanitize_path('"C:\\models\\file.safetensors"') == 'C:\\models\\file.safetensors'
+
+
+def test_sanitize_path_strips_surrounding_single_quotes():
+    from app.services import musubi_tuner as mt
+    assert mt._sanitize_path("'/models/file.safetensors'") == '/models/file.safetensors'
+
+
+def test_sanitize_path_strips_whitespace():
+    from app.services import musubi_tuner as mt
+    assert mt._sanitize_path('  /models/file.safetensors  ') == '/models/file.safetensors'
+
+
+def test_sanitize_path_leaves_a_normal_path_untouched():
+    from app.services import musubi_tuner as mt
+    assert mt._sanitize_path('/models/file.safetensors') == '/models/file.safetensors'
+
+
+def test_sanitize_path_none_or_empty_returns_empty_string():
+    from app.services import musubi_tuner as mt
+    assert mt._sanitize_path(None) == ''
+    assert mt._sanitize_path('') == ''
+
+
+def test_qwen_image_weights_resolves_a_quote_wrapped_configured_path(app, tmp_path):
+    """A path pasted from Windows Explorer's "Copy as path" (wrapped in
+    literal quotes) must still resolve to a real, existing file."""
+    from app.services import musubi_tuner as mt
+    from app import config as cfg
+    weights_dir = tmp_path / 'weights'
+    weights_dir.mkdir()
+    te = weights_dir / 'te.safetensors'
+    te.write_text('fake')
+    with app.app_context():
+        cfg.save_config({'musubi_tuner': {'qwen_image_text_encoder': f'"{te}"'}})
+        assert mt.qwen_image_weights()['text_encoder'] == str(te)
+        assert 'text_encoder' not in mt.missing_qwen_image_weights()
+
+
+# --- describe_missing_qwen_image_weights() ----------------------------------
+
+def test_describe_missing_qwen_image_weights_unset_vs_not_found(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    from app import config as cfg
+    _configure_musubi(tmp_path, app, with_weights=False)
+    with app.app_context():
+        cfg.save_config({'musubi_tuner': {
+            'qwen_image_dit': str(tmp_path / 'nope.safetensors')}})
+        described = mt.describe_missing_qwen_image_weights()
+    by_key = {d.split(' ', 1)[0]: d for d in described}
+    assert 'not set' in by_key['vae']
+    assert 'not set' in by_key['text_encoder']
+    assert 'file not found' in by_key['dit']
+    assert str(tmp_path / 'nope.safetensors') in by_key['dit']
+
+
+def test_describe_missing_qwen_image_weights_empty_when_all_configured(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        assert mt.describe_missing_qwen_image_weights() == []
+
+
 # --- write_dataset_toml() ---------------------------------------------------
 
 def test_write_dataset_toml_exact_content(tmp_path):

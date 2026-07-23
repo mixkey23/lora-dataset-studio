@@ -110,6 +110,26 @@ def test_launch_refuses_musubi_when_weight_missing(app, tmp_path, monkeypatch):
             lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
 
 
+def test_launch_refuses_musubi_weight_error_names_the_configured_path(app, tmp_path, monkeypatch):
+    """The error must show WHAT path was read, not just the bare key name —
+    "text_encoder" alone gives a user nothing to check their Settings against."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app import config as cfg
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    bogus = str(tmp_path / 'weights' / 'not_really_there.safetensors')
+    with app.app_context():
+        cfg.save_config({'musubi_tuner': {'qwen_image_text_encoder': bogus}})
+        ds = svc.create_dataset(LOCAL_USER, 'QI2B', 'zchar_qi2b', train_type='qwen_image')
+        with pytest.raises(ValueError, match=r'text_encoder .*not found') as exc:
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+    assert bogus in str(exc.value)
+
+
 # --- launch_training: full success path (mocked subprocess boundary) -------
 
 def test_launch_musubi_success_calls_write_precache_spawn_in_order(app, tmp_path, monkeypatch):

@@ -203,12 +203,27 @@ def is_installed() -> bool:
     return all((d / rel).is_file() for rel in QWEN_IMAGE_SCRIPTS.values())
 
 
+def _sanitize_path(v: str) -> str:
+    """Strips surrounding whitespace AND a single matching pair of quote
+    chars — Windows Explorer's "Copy as path" wraps the result in double
+    quotes (e.g. `"C:\\models\\file.safetensors"`), which a user pasting
+    straight into a settings field turns into a literal, never-real path
+    (`os.path.isfile('"C:\\...\\"')` is always False). Every other path
+    field in this app has the same footgun; sanitizing here is scoped to
+    musubi-tuner's 3 weight fields, the ones reported to fix now."""
+    v = (v or '').strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        v = v[1:-1].strip()
+    return v
+
+
 def qwen_image_weights() -> dict:
-    """{'dit', 'vae', 'text_encoder'} -> configured path (possibly empty)."""
+    """{'dit', 'vae', 'text_encoder'} -> configured path (possibly empty),
+    sanitized (see _sanitize_path)."""
     return {
-        'dit': cfg.get('musubi_tuner.qwen_image_dit') or '',
-        'vae': cfg.get('musubi_tuner.qwen_image_vae') or '',
-        'text_encoder': cfg.get('musubi_tuner.qwen_image_text_encoder') or '',
+        'dit': _sanitize_path(cfg.get('musubi_tuner.qwen_image_dit')),
+        'vae': _sanitize_path(cfg.get('musubi_tuner.qwen_image_vae')),
+        'text_encoder': _sanitize_path(cfg.get('musubi_tuner.qwen_image_text_encoder')),
     }
 
 
@@ -216,6 +231,22 @@ def missing_qwen_image_weights() -> list:
     """Which of dit/vae/text_encoder are unset or don't exist on disk."""
     return [k for k, v in qwen_image_weights().items()
            if not v or not os.path.isfile(v)]
+
+
+def describe_missing_qwen_image_weights() -> list:
+    """Same as missing_qwen_image_weights() but each entry names the exact
+    (sanitized) path the backend read — "unset" is not the same failure as
+    "set to a path that doesn't exist on this machine", and the plain key
+    name alone (e.g. just "text_encoder") gives a user nothing to check
+    against what they typed in Settings."""
+    weights = qwen_image_weights()
+    out = []
+    for k, v in weights.items():
+        if not v:
+            out.append(f'{k} (not set)')
+        elif not os.path.isfile(v):
+            out.append(f'{k} (configured as "{v}" — file not found)')
+    return out
 
 
 def write_dataset_toml(dataset_folder: str, cache_dir: str, resolution: int,
