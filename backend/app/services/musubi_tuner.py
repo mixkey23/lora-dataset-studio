@@ -62,6 +62,26 @@ release yet — CLAUDE.md's rename-needs-an-alias rule doesn't apply to an
 unreleased key). Unset (None/'auto') keeps today's behaviour byte-identical:
 shared qwen_image rank/optimizer/lr/timestep/resolution, no fp8, no swap,
 weighting_scheme 'none' (the ORIGINAL hardcoded value, still the default).
+
+TODO (verified, still NOT implemented — repo owner asked to defer this):
+an attention-backend toggle (`--split_attn`/`--flash_attn`/`--xformers`,
+vs. the `--sdpa` we always pass today). Confirmed present on kohya-ss's OWN
+upstream (2026-07-23: cloned FurkanGozukara/musubi-tuner, diffed against
+`upstream/main` = kohya-ss/musubi-tuner directly — the fork is 0 commits
+BEHIND upstream, so anything unchanged in that diff is verbatim current
+kohya-ss code) — `training/parser_common.py`'s shared `_add_attention_args`
+defines `--flash_attn`/`--xformers`/`--split_attn`/`--network_alpha`/
+`--weighting_scheme mode` UNCHANGED by the fork, i.e. all real on vanilla
+kohya-ss, not fork-only. (That same diff pass also hard-confirmed the
+OPPOSITE for the two things already deliberately excluded above: torch.compile
+toolchain, `--use_legacy_sdpa`, `--compile_resident_blocks_only`, the
+Automagic/Automagic2/Automagic3 optimizers and the whole full-finetune
+training mode are genuinely fork-only — `training/full_finetune.py` and
+`optimizers/factory.py` don't exist on kohya-ss's own `upstream/main` at
+all. `caching_teo_device` stays excluded too: `--device` IS a real flag,
+but only on the generic/legacy `cache_latents.py`/`cache_text_encoder_
+outputs.py`, NOT on the qwen_image-specific scripts this module calls.)
+Implementing the attention toggle is now unblocked whenever it's prioritized.
 """
 from __future__ import annotations
 import logging
