@@ -180,6 +180,17 @@ A second, optional local training engine — [kohya-ss/musubi-tuner](https://git
 
 None of these four weight files are downloaded by this app — point them at files you already have (a shared ComfyUI `models/` folder works fine). **Continuing/resuming a stopped run isn't available on the musubi-tuner engine yet** — every musubi launch starts fresh; use ai-toolkit if you need to resume a run.
 
+**GPU profile** (Training panel → Advanced options → Expert, only shown when the musubi-tuner engine is selected) — three ready presets built from kohya-ss's own `docs/qwen_image.md` VRAM table, so a run fits your card without hand-tuning flags:
+
+| Profile | Rank | fp8 | Block-swap | ~VRAM (kohya-ss's own table) |
+|---|---|---|---|---|
+| Auto (default) | this dataset's own rank setting | off | off | ~42GB (unchanged from before this control existed) |
+| Fast | 16 | off | off | ~42GB — kohya-ss's own example command, verbatim |
+| High quality | 64 | off | off | more than Fast (higher rank = more LoRA capacity, same memory profile) |
+| RTX 5090 / 32GB cards | 32 | `--fp8_base --fp8_scaled` | off | ~30GB — fits a 32GB card with headroom |
+
+Auto is byte-identical to how musubi-tuner ran before this setting existed. These numbers come from musubi-tuner's own official docs, not a third-party fork — if you've validated different numbers on your own hardware, the per-dataset Advanced options above (rank, etc.) still let you override anything a profile sets.
+
 ## Captioning & quality
 
 Settings for how captions are produced and how the quality tools behave.

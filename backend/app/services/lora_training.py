@@ -980,6 +980,15 @@ def _optimizer_eff(ds) -> str:
     return o if o in _OPTIMIZER_CHOICES else 'adamw8bit'
 
 
+def _musubi_profile_eff(ds) -> str | None:
+    """musubi-tuner-ONLY GPU/quality profile (see musubi_tuner.MUSUBI_PROFILES).
+    None (absent/unrecognized) keeps today's exact behaviour: rank from the
+    shared qwen_image family setting, no fp8, no block-swap — this lever has
+    zero effect on the ai-toolkit engine."""
+    p = _train_settings(ds).get('musubi_profile')
+    return p if p in musubi_tuner.MUSUBI_PROFILE_CHOICES else None
+
+
 _DEFAULT_LR = 1e-4                         # base LR for every non-adaptive optimizer
 _RESUME_LR_FACTORS = (0.5, 0.1)           # ▶ Continue "half (polish)" / "tenth (gentle finish)"
 
@@ -1511,6 +1520,14 @@ def effective_train_settings(ds, family=None) -> dict:
             'grad_accum_choices': list(_GRAD_ACCUM_CHOICES),
             'network_type': s.get('network_type') if s.get('network_type') in _NETWORK_TYPE_CHOICES else None,  # None → lora
             'network_type_choices': list(_NETWORK_TYPE_CHOICES),
+            # musubi-tuner ONLY (engine axis) — None → today's exact behaviour
+            # (shared rank, no fp8, no block-swap). Notes/labels ship alongside
+            # the choices so the panel can explain each profile without a
+            # second round-trip.
+            'musubi_profile': s.get('musubi_profile') if s.get('musubi_profile') in musubi_tuner.MUSUBI_PROFILE_CHOICES else None,
+            'musubi_profile_choices': list(musubi_tuner.MUSUBI_PROFILE_CHOICES),
+            'musubi_profiles': {k: {'label': v['label'], 'note': v['note'], 'rank': v['rank']}
+                                for k, v in musubi_tuner.MUSUBI_PROFILES.items()},
             # LoKr is arch-generic in ai-toolkit → offered on every family. The flag
             # mirrors timestep_type_supported so the UI can gate a future family with
             # one line; today it is always True (no family refuses lokr).
@@ -1660,6 +1677,14 @@ def update_train_settings(user_id, dataset_id, patch: dict) -> dict:
             cur['network_type'] = v
         else:
             raise ValueError(f'network_type must be one of {_NETWORK_TYPE_CHOICES} (or auto)')
+    if 'musubi_profile' in patch:
+        v = patch['musubi_profile']
+        if v in (None, 'auto', ''):
+            cur.pop('musubi_profile', None)                # auto → today's exact behaviour
+        elif v in musubi_tuner.MUSUBI_PROFILE_CHOICES:
+            cur['musubi_profile'] = v
+        else:
+            raise ValueError(f'musubi_profile must be one of {musubi_tuner.MUSUBI_PROFILE_CHOICES} (or auto)')
     if 'ema' in patch:
         v = patch['ema']
         if v in (None, 'off', '', 0, 0.0):
@@ -1698,7 +1723,7 @@ TRAIN_SETTING_KEYS = ('rank', 'resolution', 'save_every', 'max_step_saves',
                       'sample_every', 'sample_prompts', 'dropout', 'alpha',
                       'timestep_type', 'optimizer', 'lr_scheduler', 'warmup',
                       'grad_accum', 'network_type', 'ema', 'dual_captions',
-                      'learning_rate')
+                      'learning_rate', 'musubi_profile')
 
 # The ONLY settings a resume/continue may change. ai-toolkit rebuilds the job
 # config from scratch on every launch, so a re-read setting is honored on resume —
@@ -4493,13 +4518,21 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
                 # family's step target as epochs over the kept-image count
                 # (batch_size 1), same spirit as ai-toolkit's step target.
                 epochs = max(1, math.ceil(steps / max(1, kept_n)))
+                # GPU/quality profile (musubi-only lever, see musubi_tuner.
+                # MUSUBI_PROFILES): unset -> today's exact behaviour (shared
+                # qwen_image rank, no fp8, no block-swap).
+                _profile_name = _musubi_profile_eff(ds)
+                _profile = musubi_tuner.MUSUBI_PROFILES.get(_profile_name) if _profile_name else None
                 argv = musubi_tuner.build_train_argv(
                     toml_path=config_path, model_version=_model_version,
-                    rank=_lora_rank(ds, 'qwen_image'),
+                    rank=(_profile['rank'] if _profile else _lora_rank(ds, 'qwen_image')),
                     learning_rate=_lr_eff(ds), optimizer=_optimizer_eff(ds),
                     timestep_type=_timestep_type_eff(ds, 'sigmoid'),
                     max_train_epochs=epochs, output_dir=str(run_dir),
-                    output_name=f'lora_{_safe_trigger(ds)}')
+                    output_name=f'lora_{_safe_trigger(ds)}',
+                    fp8_base=bool(_profile and _profile['fp8_base']),
+                    fp8_scaled=bool(_profile and _profile['fp8_scaled']),
+                    blocks_to_swap=(_profile['blocks_to_swap'] if _profile else 0))
                 proc = musubi_tuner.spawn_training(
                     argv, cwd=str(musubi_tuner.musubi_dir()), env=env, log_path=log_path)
             else:

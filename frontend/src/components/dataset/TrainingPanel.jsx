@@ -428,6 +428,12 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const advNetworkType = adv?.network_type ?? 'lora';
   const advNetworkChoices = adv?.network_type_choices ?? ['lora', 'lokr'];
   const advNetworkSupported = adv ? adv.network_type_supported !== false : true;
+  // musubi-tuner-only GPU/quality profile (Fast / High quality / RTX 5090) —
+  // has zero effect while engine === 'aitoolkit'; 'auto' keeps today's exact
+  // behaviour (shared rank, no fp8, no block-swap).
+  const advMusubiProfile = adv?.musubi_profile ?? 'auto';
+  const advMusubiProfileChoices = adv?.musubi_profile_choices ?? ['fast', 'high_quality', 'rtx5090'];
+  const advMusubiProfiles = adv?.musubi_profiles ?? {};
   const advEma = adv?.ema ?? 0;
   const advEmaChoices = adv?.ema_choices ?? [0.99, 0.999];
   const advDualCaptions = Boolean(adv?.dual_captions);
@@ -1850,7 +1856,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
               <span aria-hidden className="text-indigo-300 transition-transform group-open:rotate-90">▸</span>
               <span aria-hidden>🔬</span>
               <span>Expert — last-mile levers</span>
-              <span className="ml-auto hidden sm:inline normal-case font-normal tracking-normal text-indigo-300/50">network · alpha · dropout{advTimestepSupported ? ' · timestep' : ''} · optimizer · schedule · EMA</span>
+              <span className="ml-auto hidden sm:inline normal-case font-normal tracking-normal text-indigo-300/50">network · alpha · dropout{advTimestepSupported ? ' · timestep' : ''} · optimizer · schedule · EMA{engine === 'musubi' ? ' · GPU profile' : ''}</span>
             </summary>
             <div className="flex flex-col px-2.5 pb-2.5 divide-y divide-indigo-400/10 [&>div]:py-2.5 [&>div:first-child]:pt-1 [&>div:last-child]:pb-0">
               {/* Network variant — LoRA (default) or LoKr. LoKr is arch-generic in
@@ -1875,6 +1881,33 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   fewer steps on a tiny set. Pair it with a low rank and EMA below.
                 </span>
               </div>
+              {/* musubi-tuner GPU/quality profile — only meaningful (and only
+                  shown) when the musubi-tuner engine is selected. */}
+              {engine === 'musubi' && (
+                <div className="flex flex-col gap-0.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-content text-[0.75rem] w-28 shrink-0 inline-flex items-center gap-1">
+                      GPU profile<HelpBadge topic="training.musubi_profile" />
+                    </span>
+                    <select value={advMusubiProfile}
+                      onChange={(e) => saveAdv({ musubi_profile: e.target.value })}
+                      aria-label="musubi-tuner GPU/quality profile"
+                      className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                      <option value="auto">Auto (default — this dataset's rank, no fp8)</option>
+                      {advMusubiProfileChoices.map((p) => (
+                        <option key={p} value={p}>{advMusubiProfiles[p]?.label || p}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
+                    <b className="text-content-muted font-medium">Why:</b> musubi-tuner's own docs give exact VRAM
+                    numbers per option combo — these 3 profiles package that table into one pick.
+                    {' '}<b className="text-content-muted font-medium">How:</b> {advMusubiProfile !== 'auto' && advMusubiProfiles[advMusubiProfile]?.note
+                      ? advMusubiProfiles[advMusubiProfile].note
+                      : "Auto keeps this dataset's own rank setting above, no fp8, no block-swap — unchanged from before this control existed."}
+                  </span>
+                </div>
+              )}
               {/* EMA — exponential moving average of the weights */}
               <div className="flex flex-col gap-0.5">
                 <div className="flex items-center gap-2 flex-wrap">

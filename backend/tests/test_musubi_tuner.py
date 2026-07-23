@@ -154,6 +154,118 @@ def test_build_train_argv_model_version_edit2511_and_unknown_sampling_falls_back
     assert '--network_alpha' not in argv   # unconfirmed flag, deliberately omitted
 
 
+# --- build_train_argv() fp8/blocks_to_swap (GPU profiles) -------------------
+
+def test_build_train_argv_defaults_omit_fp8_and_blocks_to_swap(app, tmp_path):
+    """No profile selected -> today's exact behaviour, byte-identical."""
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo')
+    assert '--fp8_base' not in argv
+    assert '--fp8_scaled' not in argv
+    assert '--blocks_to_swap' not in argv
+
+
+def test_build_train_argv_fp8_base_and_scaled_appended_together(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            fp8_base=True, fp8_scaled=True)
+    assert '--fp8_base' in argv
+    assert '--fp8_scaled' in argv
+    assert argv.index('--fp8_base') < argv.index('--fp8_scaled')
+
+
+def test_build_train_argv_fp8_scaled_alone_is_ignored_without_fp8_base(app, tmp_path):
+    """fp8_scaled only ever means anything paired with fp8_base (doc always
+    shows them together) — a caller passing fp8_scaled=True alone must not
+    get a lone, meaningless --fp8_scaled flag."""
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            fp8_base=False, fp8_scaled=True)
+    assert '--fp8_base' not in argv
+    assert '--fp8_scaled' not in argv
+
+
+def test_build_train_argv_blocks_to_swap_appended_when_positive(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            blocks_to_swap=45)
+    assert '--blocks_to_swap' in argv
+    assert argv[argv.index('--blocks_to_swap') + 1] == '45'
+
+
+def test_build_train_argv_blocks_to_swap_zero_or_negative_omits_flag(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv0 = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            blocks_to_swap=0)
+        argv_neg = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            blocks_to_swap=-1)
+    assert '--blocks_to_swap' not in argv0
+    assert '--blocks_to_swap' not in argv_neg
+
+
+# --- MUSUBI_PROFILES ---------------------------------------------------------
+
+def test_musubi_profiles_shape_and_choices():
+    from app.services import musubi_tuner as mt
+    assert set(mt.MUSUBI_PROFILE_CHOICES) == {'fast', 'high_quality', 'rtx5090'}
+    for name in mt.MUSUBI_PROFILE_CHOICES:
+        p = mt.MUSUBI_PROFILES[name]
+        assert isinstance(p['rank'], int) and p['rank'] > 0
+        assert isinstance(p['fp8_base'], bool)
+        assert isinstance(p['fp8_scaled'], bool)
+        assert isinstance(p['blocks_to_swap'], int)
+        assert p['label'] and p['note']
+
+
+def test_musubi_profile_fast_matches_official_doc_example():
+    from app.services import musubi_tuner as mt
+    p = mt.MUSUBI_PROFILES['fast']
+    assert p['rank'] == 16
+    assert p['fp8_base'] is False and p['fp8_scaled'] is False
+    assert p['blocks_to_swap'] == 0
+
+
+def test_musubi_profile_rtx5090_uses_fp8_pair_no_swap():
+    from app.services import musubi_tuner as mt
+    p = mt.MUSUBI_PROFILES['rtx5090']
+    assert p['fp8_base'] is True and p['fp8_scaled'] is True
+    assert p['blocks_to_swap'] == 0
+
+
+def test_musubi_profile_high_quality_stays_within_this_apps_rank_ceiling():
+    from app.services import musubi_tuner as mt
+    p = mt.MUSUBI_PROFILES['high_quality']
+    assert p['rank'] <= 64   # never guesses past our verified rank ceiling
+
+
 # --- run_precache() ---------------------------------------------------------
 
 def test_run_precache_raises_with_log_tail_on_nonzero_exit(app, tmp_path):

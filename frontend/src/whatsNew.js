@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-23-musubi-gpu-profiles',
+    date: '2026-07-23',
+    title: '🎛️ musubi-tuner: pick a GPU profile instead of hand-tuning flags',
+    blurb:
+      "Training Qwen-Image with the musubi-tuner engine now has a GPU profile picker (Advanced options → Expert) — Fast, High quality, or RTX 5090 / 32GB cards, each set from musubi-tuner's own documented VRAM numbers. Leave it on Auto and nothing changes from before.",
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-21-qwen-edit-declarative-prompts',
     date: '2026-07-21',
     title: '🎨 Qwen Edit prompts get even shorter — more consistent shots',

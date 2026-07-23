@@ -159,6 +159,110 @@ def test_launch_musubi_success_calls_write_precache_spawn_in_order(app, tmp_path
         assert ds.train_engine == 'musubi'
 
 
+# --- launch_training: GPU profile wiring ------------------------------------
+
+def test_launch_musubi_default_profile_matches_pre_profile_behaviour(app, tmp_path, monkeypatch):
+    """No musubi_profile set -> today's exact behaviour: rank from the shared
+    qwen_image family setting (32 default), no fp8, no block-swap."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    captured = {}
+
+    def _fake_build_argv(**kwargs):
+        captured.update(kwargs)
+        return ['-m', 'accelerate.commands.launch']
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP1', 'zchar_qip1', train_type='qwen_image')
+        with patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'x.toml')), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'build_train_argv', side_effect=_fake_build_argv), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert captured['rank'] == 32   # unchanged qwen_image family default
+    assert captured['fp8_base'] is False
+    assert captured['fp8_scaled'] is False
+    assert captured['blocks_to_swap'] == 0
+
+
+def test_launch_musubi_profile_rtx5090_overrides_rank_and_sets_fp8(app, tmp_path, monkeypatch):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    captured = {}
+
+    def _fake_build_argv(**kwargs):
+        captured.update(kwargs)
+        return ['-m', 'accelerate.commands.launch']
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP2', 'zchar_qip2', train_type='qwen_image')
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'rtx5090'})
+        with patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'x.toml')), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'build_train_argv', side_effect=_fake_build_argv), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert captured['rank'] == mt.MUSUBI_PROFILES['rtx5090']['rank']
+    assert captured['fp8_base'] is True
+    assert captured['fp8_scaled'] is True
+    assert captured['blocks_to_swap'] == 0
+
+
+def test_update_train_settings_musubi_profile_validation():
+    """Covered without app fixtures elsewhere in the suite; here we only check
+    the choices constant lines up with what update_train_settings accepts."""
+    from app.services import musubi_tuner as mt
+    assert 'fast' in mt.MUSUBI_PROFILE_CHOICES
+    assert 'bogus' not in mt.MUSUBI_PROFILE_CHOICES
+
+
+def test_update_train_settings_rejects_unknown_musubi_profile(app, tmp_path, monkeypatch):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP3', 'zchar_qip3', train_type='qwen_image')
+        with pytest.raises(ValueError, match=r'musubi_profile must be one of'):
+            lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'bogus'})
+
+
+def test_update_train_settings_musubi_profile_auto_clears_key(app, tmp_path, monkeypatch):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP4', 'zchar_qip4', train_type='qwen_image')
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'fast'})
+        eff = lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'auto'})
+    assert eff['musubi_profile'] is None
+
+
 # --- enqueue_training: same guards, plus the resume refusal ----------------
 
 def test_enqueue_refuses_musubi_resume(app, tmp_path, monkeypatch):

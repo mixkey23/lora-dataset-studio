@@ -369,6 +369,13 @@ const TOPICS = [
     app: { route: '/datasets?section=training' },
     tip: { trigger: 'dual-captions-advanced',
       text: 'New: train each image on a long AND a short caption (Advanced options → Dual captions) so the LoRA leans less on any single wording.' } },
+  // musubi-tuner GPU/quality profile — musubi-only Advanced option (Wave: Qwen
+  // musubi trainer adequation), same "not a global Setting" shape as dual_captions.
+  { id: 'training.musubi_profile', kind: 'setting', title: 'musubi-tuner GPU profile',
+    keywords: ['musubi', 'musubi-tuner', 'profile', 'fast', 'high quality', 'rtx5090',
+      '5090', 'fp8', 'blocks_to_swap', 'vram', 'gpu', 'qwen', 'advanced', 'training'],
+    guide: { chapter: 'settings-reference', anchor: 'musubi-tuner-qwen-image-only' },
+    app: { route: '/datasets?section=training' } },
   // server
   setting('server.port', 'server', 'server-port', 'Server port',
     ['server', 'port', 'bind', 'network', '5050']),

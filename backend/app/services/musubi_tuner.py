@@ -14,9 +14,29 @@ verifiable from its docs, so there is no continue/resume path here.
 
 CLI flags/TOML keys below are verified against the live kohya-ss/musubi-tuner
 docs (docs/qwen_image.md, docs/dataset_config.md, fetched 2026-07-20), not
-guessed. `--network_alpha`/`--fp8_base`/`--blocks_to_swap`/
-`--save_every_n_steps` were not confirmed present for the Qwen-Image script
-in that fetch, so they're deliberately omitted rather than guessed at.
+guessed. `--network_alpha`/`--save_every_n_steps` are still not confirmed
+present for the Qwen-Image script, so they stay omitted rather than guessed
+at (alpha follows the script's own dim-equals-alpha default instead).
+
+`--fp8_base`/`--fp8_scaled`/`--blocks_to_swap` WERE confirmed on a second doc
+pass (2026-07-23, re-fetch of docs/qwen_image.md) — the doc ships an exact
+VRAM table for Qwen-Image LoRA training:
+
+    no memory options                    -> ~42 GB
+    --fp8_base --fp8_scaled              -> ~30 GB
+    + --blocks_to_swap 16                -> ~24 GB
+    + --blocks_to_swap 45                -> ~12 GB (main RAM should be 64GB+;
+                                             the doc warns against going higher)
+
+MUSUBI_PROFILES below packages that table (plus the doc's own rank=16 example
+and this app's existing rank ceiling) into 3 named profiles a dataset can opt
+into via train_settings.musubi_profile — requested by the repo owner after
+comparing this integration against SECourses' third-party musubi-tuner GUI
+fork (which ships similar "ready" GPU-tier configs, but its exact preset
+numbers live behind a paywalled Patreon post we can't verify — so these
+profiles are built from kohya-ss's own OFFICIAL doc table instead, not
+copied from that fork). Unset (None) keeps today's behaviour byte-identical:
+no fp8, no block-swap, rank from the shared qwen_image family setting.
 """
 from __future__ import annotations
 import logging
@@ -40,6 +60,41 @@ QWEN_IMAGE_SCRIPTS = {
 # model_version flag value per our 'image'/'edit' variant (mirrors the
 # qwen_image training family's variant split in lora_training.py).
 MODEL_VERSION = {'image': 'original', 'edit': 'edit-2511'}
+
+# GPU/quality profiles (musubi-tuner engine ONLY — ai-toolkit's rank slider is
+# untouched). Built from kohya-ss's own doc VRAM table (see module docstring),
+# not from any third-party fork's unverified numbers. 'rank' stays inside this
+# app's existing _RANK_CHOICES ceiling (64) rather than copying a higher
+# third-party default we can't confirm --network_alpha even reaches for this
+# specific script. Selecting a profile overrides the shared qwen_image rank
+# AND turns on the paired fp8/block-swap flags; leaving it unset (None/
+# 'auto') keeps today's exact behaviour (shared rank, no fp8, no swap).
+MUSUBI_PROFILES = {
+    'fast': {
+        'label': 'Fast (rank 16)',
+        'rank': 16, 'fp8_base': False, 'fp8_scaled': False, 'blocks_to_swap': 0,
+        'note': ("kohya-ss's own qwen_image.md example, verbatim: rank 16, no fp8, "
+                 "no block-swap. Fastest per-step, but its own VRAM table puts this "
+                 "at ~42GB — needs a big card (A100/H100-class), not a 24-32GB one."),
+    },
+    'high_quality': {
+        'label': 'High quality (rank 64)',
+        'rank': 64, 'fp8_base': False, 'fp8_scaled': False, 'blocks_to_swap': 0,
+        'note': ("This app's highest supported rank (64) at full bf16 precision, no "
+                 "memory optimization — most LoRA capacity, needs the most VRAM. "
+                 "(A third-party musubi-tuner GUI trains its own default at rank "
+                 "128, but --network_alpha isn't confirmed wired for this script, "
+                 "so we cap at our own verified rank ceiling instead of guessing.)"),
+    },
+    'rtx5090': {
+        'label': 'RTX 5090 / 32GB cards (rank 32)',
+        'rank': 32, 'fp8_base': True, 'fp8_scaled': True, 'blocks_to_swap': 0,
+        'note': ("fp8_base + fp8_scaled together measure ~30GB in kohya-ss's own "
+                 "VRAM table — fits a 32GB card (RTX 5090 and similar) with "
+                 "headroom, no block-swap needed."),
+    },
+}
+MUSUBI_PROFILE_CHOICES = tuple(MUSUBI_PROFILES.keys())
 
 
 def musubi_dir():
@@ -149,22 +204,32 @@ def run_precache(toml_path: str, model_version: str, log_path: str) -> None:
 def build_train_argv(toml_path: str, model_version: str, rank: int,
                      learning_rate: float, optimizer: str, timestep_type: str,
                      max_train_epochs: int, output_dir: str, output_name: str,
-                     seed: int = 42) -> list:
+                     seed: int = 42, fp8_base: bool = False,
+                     fp8_scaled: bool = False, blocks_to_swap: int = 0) -> list:
     """Pure function: the accelerate-launch argv for qwen_image_train_network.py,
     built from the verified doc example. Rank/lr/optimizer come from
     lora_training.py's existing family-scoped helpers (_lora_rank(ds,
-    'qwen_image') etc.) so the recipe stays identical across engines — this
-    function does not re-derive any of that. No `--network_alpha`: not
-    confirmed present for the Qwen-Image script (see module docstring), so
-    musubi runs at its own alpha=dim default rather than guessing the flag.
+    'qwen_image') etc.) so the recipe stays identical across engines UNLESS a
+    MUSUBI_PROFILES entry overrides rank — this function does not re-derive
+    any of that, it only accepts what the caller resolved. No `--network_alpha`:
+    still not confirmed present for the Qwen-Image script (see module
+    docstring), so musubi runs at its own alpha=dim default rather than
+    guessing the flag.
 
     `timestep_type` maps our family-level 'sigmoid' default onto musubi's
     `--timestep_sampling` vocabulary; only 'shift' is confirmed from the doc
     example, so any other value degrades to 'shift' rather than guessing an
-    unverified flag value."""
+    unverified flag value.
+
+    `fp8_base`/`fp8_scaled`/`blocks_to_swap` ARE confirmed doc flags (see
+    module docstring's VRAM table). `fp8_scaled` is only ever meaningful
+    paired with `fp8_base` (the doc always shows them together) — emitted
+    defensively only when `fp8_base` is also set, even if a caller passes
+    fp8_scaled alone. `blocks_to_swap<=0` omits the flag entirely (0 = no
+    swap = today's default behaviour)."""
     weights = qwen_image_weights()
     sampling = timestep_type if timestep_type in ('shift', 'sigmoid', 'uniform') else 'shift'
-    return [
+    argv = [
         '-m', 'accelerate.commands.launch',
         '--num_cpu_threads_per_process', '1', '--mixed_precision', 'bf16',
         QWEN_IMAGE_SCRIPTS['train'],
@@ -181,6 +246,13 @@ def build_train_argv(toml_path: str, model_version: str, rank: int,
         '--seed', str(seed),
         '--output_dir', output_dir, '--output_name', output_name,
     ]
+    if fp8_base:
+        argv.append('--fp8_base')
+        if fp8_scaled:
+            argv.append('--fp8_scaled')
+    if blocks_to_swap and blocks_to_swap > 0:
+        argv += ['--blocks_to_swap', str(blocks_to_swap)]
+    return argv
 
 
 def spawn_training(argv: list, cwd: str, env: dict, log_path: str) -> subprocess.Popen:
