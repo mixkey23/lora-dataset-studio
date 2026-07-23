@@ -180,16 +180,23 @@ A second, optional local training engine — [kohya-ss/musubi-tuner](https://git
 
 None of these four weight files are downloaded by this app — point them at files you already have (a shared ComfyUI `models/` folder works fine). **Continuing/resuming a stopped run isn't available on the musubi-tuner engine yet** — every musubi launch starts fresh; use ai-toolkit if you need to resume a run.
 
-**GPU profile** (Training panel → Advanced options → Expert, only shown when the musubi-tuner engine is selected) — three ready presets built from kohya-ss's own `docs/qwen_image.md` VRAM table, so a run fits your card without hand-tuning flags:
+**GPU profile** (Training panel → Advanced options → Expert, only shown when the musubi-tuner engine is selected) — six ready-made, per-VRAM-tier recipes so a run fits your card without hand-tuning flags. Each profile is a FULL recipe (rank, alpha, optimizer, learning rate, weighting scheme, resolution — not just VRAM knobs), taken 1:1 from a real, field-tested config shipped by a third-party musubi-tuner GUI ([SECourses_Musubi_Trainer](https://github.com/FurkanGozukara/SECourses_Musubi_Trainer)'s `Qwen_Training_Configs/LoRA_Training`), not guessed:
 
-| Profile | Rank | fp8 | Block-swap | ~VRAM (kohya-ss's own table) |
-|---|---|---|---|---|
-| Auto (default) | this dataset's own rank setting | off | off | ~42GB (unchanged from before this control existed) |
-| Fast | 16 | off | off | ~42GB — kohya-ss's own example command, verbatim |
-| High quality | 64 | off | off | more than Fast (higher rank = more LoRA capacity, same memory profile) |
-| RTX 5090 / 32GB cards | 32 | `--fp8_base --fp8_scaled` | off | ~30GB — fits a 32GB card with headroom |
+| Profile | Rank / alpha | fp8 | Block-swap | Resolution | ~VRAM |
+|---|---|---|---|---|---|
+| Auto (default) | this dataset's own rank / alpha=rank | off | off | this dataset's own resolution setting | unchanged from before this control existed |
+| 48GB+ (fastest) | 128 / 128 | off | off | 1328px | ~51GB |
+| ~29GB, no fp8 | 128 / 128 | off | 35 | 1328px | ~29GB |
+| RTX 5090 / 32GB | 128 / 128 | `--fp8_base --fp8_scaled` | 20 | 1328px | ~30GB |
+| ~22GB (24GB cards) | 128 / 128 | `--fp8_base --fp8_scaled` | 36 | 1328px | ~22GB |
+| ~11GB | 64 / 128 | `--fp8_base --fp8_scaled` | 58 | 1328px | ~11GB |
+| ~5GB (minimum) | 24 / 128 | `--fp8_base --fp8_scaled` | 58 | 768px | ~5GB |
 
-Auto is byte-identical to how musubi-tuner ran before this setting existed. These numbers come from musubi-tuner's own official docs, not a third-party fork — if you've validated different numbers on your own hardware, the per-dataset Advanced options above (rank, etc.) still let you override anything a profile sets.
+Every non-Auto profile also switches `optimizer_type` to `AdaFactor` (with the args AdaFactor needs to respect the learning rate instead of self-adapting it), `learning_rate` to `0.00015`, and `weighting_scheme` to `mode` — all taken from the same source configs, not this app's own ai-toolkit-shared defaults. Note that rank and alpha are **decoupled** on the lower tiers (alpha stays 128 even as rank drops for VRAM) — that's SECourses' own tuning, not a typo.
+
+Two SECourses fields were deliberately **not** ported: `compile`/torch.compile and CPU-offloading the text-encoder caching step — SECourses runs their own musubi-tuner fork, and neither flag is confirmed present on the official kohya-ss scripts this app targets, so adding them could crash the launch outright instead of degrading.
+
+Auto is byte-identical to how musubi-tuner ran before this setting existed. If you've validated different numbers on your own hardware, the per-dataset Advanced options above (rank, etc.) still let you override anything a profile sets.
 
 ## Captioning & quality
 

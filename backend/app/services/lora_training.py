@@ -4455,13 +4455,19 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     run_token = secrets.token_hex(16)
     _model_version = musubi_tuner.MODEL_VERSION['edit' if variant == 'edit' else 'image']
     if launch_engine == 'musubi':
+        # GPU/quality profile (musubi-only lever, see musubi_tuner.
+        # MUSUBI_PROFILES): resolved HERE (before the dataset TOML is
+        # written) since a profile's own resolution overrides the shared
+        # qwen_image resolution setting. Unset -> today's exact behaviour.
+        _profile_name = _musubi_profile_eff(ds)
+        _profile = musubi_tuner.MUSUBI_PROFILES.get(_profile_name) if _profile_name else None
         # musubi-tuner's own "config" is a dataset TOML, not ai-toolkit's YAML —
         # write it, then run BOTH pre-caching scripts to completion (blocking,
         # BEFORE any training_in_progress/PID bookkeeping below: a precache
         # failure must never register a run as in progress).
         config_path = musubi_tuner.write_dataset_toml(
             dataset_folder, f'{dataset_folder}_musubi_cache',
-            resolution=max(_train_res(ds)))
+            resolution=(_profile['resolution'] if _profile else max(_train_res(ds))))
         musubi_tuner.run_precache(config_path, _model_version, log_path)
     else:
         config_path = write_job_config(ds, dataset_folder, steps=steps)
@@ -4518,21 +4524,23 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
                 # family's step target as epochs over the kept-image count
                 # (batch_size 1), same spirit as ai-toolkit's step target.
                 epochs = max(1, math.ceil(steps / max(1, kept_n)))
-                # GPU/quality profile (musubi-only lever, see musubi_tuner.
-                # MUSUBI_PROFILES): unset -> today's exact behaviour (shared
-                # qwen_image rank, no fp8, no block-swap).
-                _profile_name = _musubi_profile_eff(ds)
-                _profile = musubi_tuner.MUSUBI_PROFILES.get(_profile_name) if _profile_name else None
+                # Same profile resolved above (before write_dataset_toml). Unset
+                # -> today's exact behaviour: shared qwen_image rank/optimizer/lr,
+                # no fp8, no block-swap, no network_alpha, weighting_scheme 'none'.
                 argv = musubi_tuner.build_train_argv(
                     toml_path=config_path, model_version=_model_version,
                     rank=(_profile['rank'] if _profile else _lora_rank(ds, 'qwen_image')),
-                    learning_rate=_lr_eff(ds), optimizer=_optimizer_eff(ds),
+                    learning_rate=(_profile['learning_rate'] if _profile else _lr_eff(ds)),
+                    optimizer=(_profile['optimizer'] if _profile else _optimizer_eff(ds)),
                     timestep_type=_timestep_type_eff(ds, 'sigmoid'),
                     max_train_epochs=epochs, output_dir=str(run_dir),
                     output_name=f'lora_{_safe_trigger(ds)}',
                     fp8_base=bool(_profile and _profile['fp8_base']),
                     fp8_scaled=bool(_profile and _profile['fp8_scaled']),
-                    blocks_to_swap=(_profile['blocks_to_swap'] if _profile else 0))
+                    blocks_to_swap=(_profile['blocks_to_swap'] if _profile else 0),
+                    network_alpha=(_profile['alpha'] if _profile else None),
+                    weighting_scheme=(_profile['weighting_scheme'] if _profile else 'none'),
+                    optimizer_args=(_profile['optimizer_args'] if _profile else None))
                 proc = musubi_tuner.spawn_training(
                     argv, cwd=str(musubi_tuner.musubi_dir()), env=env, log_path=log_path)
             else:

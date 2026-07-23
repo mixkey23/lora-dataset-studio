@@ -222,17 +222,55 @@ def test_launch_musubi_profile_rtx5090_overrides_rank_and_sets_fp8(app, tmp_path
              patch.object(mt, 'spawn_training', return_value=_FakeProc()):
             lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
 
-    assert captured['rank'] == mt.MUSUBI_PROFILES['rtx5090']['rank']
+    p = mt.MUSUBI_PROFILES['rtx5090']
+    assert captured['rank'] == p['rank']
     assert captured['fp8_base'] is True
     assert captured['fp8_scaled'] is True
-    assert captured['blocks_to_swap'] == 0
+    assert captured['blocks_to_swap'] == p['blocks_to_swap']
+    # Full-recipe fields (not just VRAM knobs) also come from the profile.
+    assert captured['network_alpha'] == p['alpha']
+    assert captured['weighting_scheme'] == p['weighting_scheme']
+    assert captured['optimizer'] == p['optimizer']
+    assert captured['learning_rate'] == p['learning_rate']
+    assert captured['optimizer_args'] == p['optimizer_args']
+
+
+def test_launch_musubi_profile_vram5_overrides_resolution_in_dataset_toml(app, tmp_path, monkeypatch):
+    """A profile's resolution (not just rank/fp8/swap) reaches write_dataset_toml."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    captured_toml = {}
+
+    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt'):
+        captured_toml['resolution'] = resolution
+        return str(tmp_path / 'x.toml')
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP5', 'zchar_qip5', train_type='qwen_image')
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'vram5'})
+        with patch.object(mt, 'write_dataset_toml', side_effect=_fake_write_toml), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'build_train_argv', return_value=['-m', 'accelerate.commands.launch']), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert captured_toml['resolution'] == mt.MUSUBI_PROFILES['vram5']['resolution']
 
 
 def test_update_train_settings_musubi_profile_validation():
     """Covered without app fixtures elsewhere in the suite; here we only check
     the choices constant lines up with what update_train_settings accepts."""
     from app.services import musubi_tuner as mt
-    assert 'fast' in mt.MUSUBI_PROFILE_CHOICES
+    assert 'vram48' in mt.MUSUBI_PROFILE_CHOICES
     assert 'bogus' not in mt.MUSUBI_PROFILE_CHOICES
 
 
@@ -258,7 +296,7 @@ def test_update_train_settings_musubi_profile_auto_clears_key(app, tmp_path, mon
                         lambda p: type('u', (), {'free': 500e9})())
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'QIP4', 'zchar_qip4', train_type='qwen_image')
-        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'fast'})
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'vram48'})
         eff = lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'auto'})
     assert eff['musubi_profile'] is None
 

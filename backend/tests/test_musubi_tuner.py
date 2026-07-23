@@ -231,39 +231,122 @@ def test_build_train_argv_blocks_to_swap_zero_or_negative_omits_flag(app, tmp_pa
     assert '--blocks_to_swap' not in argv_neg
 
 
+# --- build_train_argv() network_alpha / weighting_scheme / optimizer_args --
+
+def test_build_train_argv_default_weighting_scheme_is_none(app, tmp_path):
+    """Auto (no profile) must stay byte-identical to before this pass."""
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo')
+    assert argv[argv.index('--weighting_scheme') + 1] == 'none'
+    assert '--network_alpha' not in argv
+    assert '--optimizer_args' not in argv
+
+
+def test_build_train_argv_network_alpha_emitted_when_set(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=64,
+            learning_rate=5e-5, optimizer='AdaFactor', timestep_type='sigmoid',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            network_alpha=128)
+    assert argv[argv.index('--network_alpha') + 1] == '128'
+
+
+def test_build_train_argv_weighting_scheme_mode_overrides_default(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=64,
+            learning_rate=5e-5, optimizer='AdaFactor', timestep_type='sigmoid',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            weighting_scheme='mode')
+    assert argv[argv.index('--weighting_scheme') + 1] == 'mode'
+
+
+def test_build_train_argv_optimizer_args_emitted_as_one_flag_with_multiple_values(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=64,
+            learning_rate=5e-5, optimizer='AdaFactor', timestep_type='sigmoid',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            optimizer_args=('scale_parameter=False', 'relative_step=False'))
+    i = argv.index('--optimizer_args')
+    assert argv[i + 1:i + 3] == ['scale_parameter=False', 'relative_step=False']
+
+
 # --- MUSUBI_PROFILES ---------------------------------------------------------
+
+_EXPECTED_PROFILES = {'vram48', 'vram29', 'rtx5090', 'vram22', 'vram11', 'vram5'}
+
 
 def test_musubi_profiles_shape_and_choices():
     from app.services import musubi_tuner as mt
-    assert set(mt.MUSUBI_PROFILE_CHOICES) == {'fast', 'high_quality', 'rtx5090'}
+    assert set(mt.MUSUBI_PROFILE_CHOICES) == _EXPECTED_PROFILES
     for name in mt.MUSUBI_PROFILE_CHOICES:
         p = mt.MUSUBI_PROFILES[name]
         assert isinstance(p['rank'], int) and p['rank'] > 0
+        assert isinstance(p['alpha'], int) and p['alpha'] > 0
         assert isinstance(p['fp8_base'], bool)
         assert isinstance(p['fp8_scaled'], bool)
         assert isinstance(p['blocks_to_swap'], int)
+        assert isinstance(p['resolution'], int) and p['resolution'] > 0
+        assert p['optimizer'] == 'AdaFactor'
+        assert len(p['optimizer_args']) == 4
+        assert isinstance(p['learning_rate'], float) and p['learning_rate'] > 0
+        assert p['weighting_scheme'] == 'mode'
         assert p['label'] and p['note']
 
 
-def test_musubi_profile_fast_matches_official_doc_example():
+def test_musubi_profile_vram48_matches_secourses_fastest_tier():
     from app.services import musubi_tuner as mt
-    p = mt.MUSUBI_PROFILES['fast']
-    assert p['rank'] == 16
+    p = mt.MUSUBI_PROFILES['vram48']
+    assert p['rank'] == 128 and p['alpha'] == 128
     assert p['fp8_base'] is False and p['fp8_scaled'] is False
     assert p['blocks_to_swap'] == 0
+    assert p['resolution'] == 1328
 
 
-def test_musubi_profile_rtx5090_uses_fp8_pair_no_swap():
+def test_musubi_profile_rtx5090_uses_fp8_pair_and_secourses_blocks_to_swap():
     from app.services import musubi_tuner as mt
     p = mt.MUSUBI_PROFILES['rtx5090']
     assert p['fp8_base'] is True and p['fp8_scaled'] is True
-    assert p['blocks_to_swap'] == 0
+    assert p['blocks_to_swap'] == 20   # SECourses Tier2_30000_MB.toml, not guessed
+    assert p['rank'] == 128
 
 
-def test_musubi_profile_high_quality_stays_within_this_apps_rank_ceiling():
+def test_musubi_profile_vram11_drops_rank_but_keeps_alpha_128_decoupled():
     from app.services import musubi_tuner as mt
-    p = mt.MUSUBI_PROFILES['high_quality']
-    assert p['rank'] <= 64   # never guesses past our verified rank ceiling
+    p = mt.MUSUBI_PROFILES['vram11']
+    assert p['rank'] == 64
+    assert p['alpha'] == 128   # decoupled from rank, per SECourses' own tiers
+
+
+def test_musubi_profile_vram5_drops_resolution_to_768():
+    from app.services import musubi_tuner as mt
+    p = mt.MUSUBI_PROFILES['vram5']
+    assert p['resolution'] == 768
+    assert p['rank'] == 24
+
+
+def test_musubi_profiles_never_emit_unconfirmed_compile_or_device_flags():
+    """SECourses' own tiers ship compile=true / caching_teo_device — both
+    deliberately dropped (SECourses runs their own musubi-tuner fork, not
+    vanilla kohya-ss; neither flag is confirmed on the official scripts)."""
+    from app.services import musubi_tuner as mt
+    for p in mt.MUSUBI_PROFILES.values():
+        assert 'compile' not in p
+        assert 'teo_device' not in p
+        assert 'caching_teo_device' not in p
 
 
 # --- run_precache() ---------------------------------------------------------

@@ -432,7 +432,8 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   // has zero effect while engine === 'aitoolkit'; 'auto' keeps today's exact
   // behaviour (shared rank, no fp8, no block-swap).
   const advMusubiProfile = adv?.musubi_profile ?? 'auto';
-  const advMusubiProfileChoices = adv?.musubi_profile_choices ?? ['fast', 'high_quality', 'rtx5090'];
+  const advMusubiProfileChoices = adv?.musubi_profile_choices
+    ?? ['vram48', 'vram29', 'rtx5090', 'vram22', 'vram11', 'vram5'];
   const advMusubiProfiles = adv?.musubi_profiles ?? {};
   const advEma = adv?.ema ?? 0;
   const advEmaChoices = adv?.ema_choices ?? [0.99, 0.999];

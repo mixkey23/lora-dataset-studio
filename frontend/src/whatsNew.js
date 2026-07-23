@@ -49,9 +49,9 @@ export const WHATS_NEW = [
   {
     id: '2026-07-23-musubi-gpu-profiles',
     date: '2026-07-23',
-    title: '🎛️ musubi-tuner: pick a GPU profile instead of hand-tuning flags',
+    title: '🎛️ musubi-tuner: 6 ready-made GPU profiles, field-tested per tier',
     blurb:
-      "Training Qwen-Image with the musubi-tuner engine now has a GPU profile picker (Advanced options → Expert) — Fast, High quality, or RTX 5090 / 32GB cards, each set from musubi-tuner's own documented VRAM numbers. Leave it on Auto and nothing changes from before.",
+      "Training Qwen-Image with the musubi-tuner engine now has a GPU profile picker (Advanced options → Expert) — from 48GB+ down to 5GB cards, including an RTX 5090 / 32GB profile. Each one is a full field-tested recipe (rank, optimizer, learning rate, resolution — not just VRAM knobs). Leave it on Auto and nothing changes from before.",
     to: '/datasets?section=training',
   },
   {
