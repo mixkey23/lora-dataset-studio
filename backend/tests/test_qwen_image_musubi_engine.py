@@ -3,6 +3,7 @@ local training engine — ai-toolkit (default, blanket-required regardless of
 engine) or musubi-tuner. These tests exercise launch_training/enqueue_training's
 engine branch with the actual subprocess boundary mocked (no real
 musubi-tuner/GPU in this sandbox)."""
+import os
 from unittest.mock import patch
 
 import pytest
@@ -394,3 +395,73 @@ def test_enqueue_musubi_persists_engine_on_success(app, tmp_path, monkeypatch):
         result = lt.enqueue_training(LOCAL_USER, ds.id, engine='musubi')
         assert result['queued'] is True
         assert ds.train_engine == 'musubi'
+
+
+# --- list_checkpoints() must find musubi's own output layout ---------------
+# Repo owner report: after a real musubi run finished, the guided-flow "Train"
+# step never went green. Root cause (two separate bugs, both fixed together):
+# (1) musubi writes checkpoints directly into --output_dir (no ai-toolkit-style
+#     lora_<trigger>/ subfolder of its own) — _run_dir() was unconditionally
+#     appending that subfolder regardless of engine.
+# (2) musubi/kohya's own epoch-numbered filenames use a HYPHEN
+#     (`lora_x-000001.safetensors`), not the underscore ai-toolkit's own
+#     step-numbered saves use (`lora_x_0000500.safetensors`) — the old
+#     _CK_RE only matched the underscore form.
+
+def test_run_dir_musubi_has_no_extra_subfolder(app, tmp_path, monkeypatch):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QID1', 'zchar_qid1', train_type='qwen_image')
+        ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        musubi_run = lt._run_dir(LOCAL_USER, ds.id)
+        assert not musubi_run.endswith('lora_zchar_qid1')
+        assert musubi_run == str(lt._output_dir() / lt._run_name(ds))
+
+        ds.train_engine = 'aitoolkit'
+        svc.db.session.commit()
+        aitoolkit_run = lt._run_dir(LOCAL_USER, ds.id)
+        assert aitoolkit_run.endswith(os.sep + 'lora_zchar_qid1')
+
+
+def test_list_checkpoints_finds_musubi_hyphenated_epoch_files(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QID2', 'zchar_qid2', train_type='qwen_image')
+        ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        run_dir = lt._output_dir() / lt._run_name(ds)   # no lora_<trigger>/ subfolder
+        run_dir.mkdir(parents=True)
+        (run_dir / 'lora_zchar_qid2-000001.safetensors').write_bytes(b'fake')
+        (run_dir / 'lora_zchar_qid2-000002.safetensors').write_bytes(b'fake')
+
+        cks = lt.list_checkpoints(LOCAL_USER, ds.id)
+        assert [c['filename'] for c in cks] == [
+            'lora_zchar_qid2-000001.safetensors', 'lora_zchar_qid2-000002.safetensors']
+        assert [c['step'] for c in cks] == [1, 2]
+
+
+def test_list_checkpoints_finds_musubi_final_bare_name_file(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QID3', 'zchar_qid3', train_type='qwen_image')
+        ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        run_dir = lt._output_dir() / lt._run_name(ds)
+        run_dir.mkdir(parents=True)
+        (run_dir / 'lora_zchar_qid3-000001.safetensors').write_bytes(b'fake')
+        (run_dir / 'lora_zchar_qid3.safetensors').write_bytes(b'fake')   # final, no suffix
+
+        cks = lt.list_checkpoints(LOCAL_USER, ds.id)
+        finals = [c for c in cks if c.get('final')]
+        assert len(finals) == 1
+        assert finals[0]['filename'] == 'lora_zchar_qid3.safetensors'

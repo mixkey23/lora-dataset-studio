@@ -3135,7 +3135,11 @@ def _build_job_config_sdxl(ds, dataset_folder: str, steps: int, training_folder=
     }
 
 
-_CK_RE = re.compile(r'_(\d{4,})\.safetensors$')
+# `_(\d{4,})` = ai-toolkit's own step-numbered saves (`lora_x_0000500.safetensors`).
+# `-(\d{4,})` = musubi-tuner/kohya's epoch-numbered saves (`lora_x-000001.safetensors`,
+# hyphen not underscore — a real repo-owner-reported bug: musubi checkpoints were
+# invisible to list_checkpoints, the guided-flow "Train" step never went green).
+_CK_RE = re.compile(r'[_-](\d{4,})\.safetensors$')
 
 
 def _run_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
@@ -3143,13 +3147,22 @@ def _run_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
+    fam = _train_type(ds, family)
+    base = _output_dir() / _run_name(ds, base_model, family, variant)
     # ai-toolkit écrit ses checkpoints/samples dans <training_folder>/<name>/
-    # où name = 'lora_<trigger>' (cf. build_job_config). On pointe ce sous-dossier.
+    # où name = 'lora_<trigger>' (cf. build_job_config) — ai-toolkit crée CE
+    # sous-dossier lui-même. musubi-tuner n'a pas cette notion : on lui passe
+    # --output_dir=<training_folder> directement (launch_training) et il écrit
+    # ses .safetensors À LA RACINE de ce dossier, préfixés par --output_name —
+    # PAS dans un sous-dossier lora_<trigger>/ (bug réel signalé : ce sous-dossier
+    # n'existe jamais pour un run musubi, donc list_checkpoints() ne trouvait rien
+    # et le pas « Train » du panneau guidé restait bloqué à non-fait).
+    if _train_engine(ds, family=fam) == 'musubi':
+        return str(base)
     # `base_model` cible le run d'une base PRÉCISE (sélection UI) ; `family` cible la
     # famille sélectionnée (Krea vs Z-Image) - sans quoi le panneau montre les
     # checkpoints du mauvais run quand deux familles partagent le même trigger.
-    return str(_output_dir() / _run_name(ds, base_model, family, variant)
-               / f'lora_{_safe_trigger(ds)}')
+    return str(base / f'lora_{_safe_trigger(ds)}')
 
 
 def open_training_folder(user_id, dataset_id, target='loras', family=None,
@@ -3202,16 +3215,21 @@ def list_checkpoints(user_id, dataset_id, base_model=_PERSISTED, family=None,
         if m:
             out.append({'step': int(m.group(1)), 'filename': f})
     out.sort(key=lambda c: c['step'])
-    # Fichier final (run = .../lora_<trigger> → lora_<trigger>.safetensors).
-    final_name = os.path.basename(run) + '.safetensors'
-    if os.path.isfile(os.path.join(run, final_name)):
+    # Fichier final SANS numéro de step/epoch: toujours `lora_<trigger>.safetensors`,
+    # quel que soit l'engine — ai-toolkit écrit ce nom dans son sous-dossier
+    # `lora_<trigger>/` (où `basename(run)` coïncide avec ce nom) ; musubi-tuner
+    # écrit le même nom directement à la racine de `run` (--output_name). Dérivé
+    # du trigger, PAS de basename(run) : basename(run) == run_name pour musubi
+    # (pas de sous-dossier), qui n'est PAS le nom du fichier final.
+    ds = fds.get_dataset(user_id, dataset_id)
+    final_name = f'lora_{_safe_trigger(ds)}.safetensors' if ds else None
+    if final_name and os.path.isfile(os.path.join(run, final_name)):
         last = out[-1]['step'] if out else 0
         out.append({'step': last, 'filename': final_name, 'final': True})
     # Provenance annotation: which dataset VERSION most plausibly produced
     # each file (newest registry record older than the file). Pre-feature
     # datasets have no records -> no annotation, shape unchanged otherwise.
     from . import checkpoint_registry
-    ds = fds.get_dataset(user_id, dataset_id)
     fam = _train_type(ds, family) if ds else None
     for c in out:
         try:
