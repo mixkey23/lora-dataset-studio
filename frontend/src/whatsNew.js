@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-24-test-studio-qwen-image',
+    date: '2026-07-24',
+    title: '🧪 Test Studio now supports Qwen-Image LoRAs',
+    blurb:
+      "The checkpoint × strength sweep tool now works for Qwen-Image — both training targets. Base Qwen-Image checkpoints get a normal prompt sweep; Qwen-Image-Edit-2511 checkpoints test against your dataset's own reference photo (the prompt becomes an edit instruction). This is also why the Graph tab's per-checkpoint previews were showing a floppy-disk icon for Qwen-Image runs — that gap is now closed too.",
+    to: '/datasets?section=studio',
+  },
+  {
     id: '2026-07-24-musubi-sample-previews',
     date: '2026-07-24',
     title: '📸 musubi-tuner runs now generate preview thumbnails too',

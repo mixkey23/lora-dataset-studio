@@ -54,6 +54,7 @@ export default function StudioGenerationSettings({ family = 'zimage', storagePre
   const isZ = family === 'zimage';
   const isSdxl = family === 'sdxl';
   const isKrea = family === 'krea';
+  const isQwen = family === 'qwen_image';
 
   // Helpers localStorage namespacés (init paresseuse + persistance des VALEURS ;
   // LockableSlider ne persiste que son verrou, pas la valeur → on s'en charge).
@@ -134,7 +135,7 @@ export default function StudioGenerationSettings({ family = 'zimage', storagePre
     // JAMAIS émis en studio riche (aspectPicker=false) — là, le ratio est un axe
     // de test choisi via AxisPickers et l'écraser ici casserait la matrice.
     if (aspectPicker && aspect) s.aspects = [aspect];
-    if (isZ) {
+    if (isZ || isQwen) {
       const neg = negative.trim();
       if (neg) s.negative = neg;
     }
@@ -159,7 +160,7 @@ export default function StudioGenerationSettings({ family = 'zimage', storagePre
       if (batched.length) s.batch_loras = batched;
     }
     onChange?.(s);
-  }, [isZ, isSdxl, isKrea, resolutionTier, aspectPicker, aspect, negative, detailAmount, sampler, scheduler,
+  }, [isZ, isSdxl, isKrea, isQwen, resolutionTier, aspectPicker, aspect, negative, detailAmount, sampler, scheduler,
       weightDtype, rebalanceOn, rebalanceStrength, enhancerOn, enhancerStrength, permStack, onChange]);
 
   return (
@@ -341,8 +342,8 @@ export default function StudioGenerationSettings({ family = 'zimage', storagePre
         </StudioSection>
       )}
 
-      {/* NEGATIVE (zimage) — prompt négatif global du run. */}
-      {isZ && (
+      {/* NEGATIVE (zimage, qwen_image T2I) — prompt négatif global du run. */}
+      {(isZ || isQwen) && (
         <StudioSection title="Negative" storageKey={k('sec_negative')} defaultOpen={false} anchorId="st-negative">
           <label className="flex flex-col gap-1">
             <span className="text-content-muted text-[0.625rem] uppercase">Negative prompt (optional)</span>

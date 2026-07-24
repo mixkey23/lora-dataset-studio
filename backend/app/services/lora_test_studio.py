@@ -47,12 +47,15 @@ from ..gpu_window import GpuBusyError
 from ..models import FaceDataset, ImageGenerationQueue, LoraTestImage
 from . import face_dataset_service as fds, trash
 from . import lora_training as lt
+from . import qwen_edit_assets as qea
+from . import qwen_edit_helper as qeh
 from ..job_queue import queue_manager
 from ..utils.comfyui import (FAMILY_LABELS, KREA_ALLOWED_SAMPLERS, KREA_ALLOWED_SCHEDULERS,
                              KREA_ALLOWED_WEIGHT_DTYPES, apply_optimal_sampler_params,
                              family_of_lora, format_trained_lora_label, get_krea_loras,
-                             get_krea_models, get_sdxl_loras, get_zimage_loras,
-                             get_zimage_models, inject_krea2t_enhancer,
+                             get_krea_models, get_qwen_image_loras, get_qwen_image_models,
+                             get_sdxl_loras, get_zimage_loras,
+                             get_zimage_models, inject_krea2t_enhancer, inject_krea_loras,
                              load_workflow_local, resolve_checkpoint_ckpt_name)
 from ..utils.zimage_helper import apply_zimage_settings
 
@@ -72,6 +75,12 @@ WORKFLOW_ZTURBO_PATH = cfg.BACKEND_DIR / 'workflows' / 'ZImage_bigLove_ZT3_optim
 WORKFLOW_HQ_PATH = cfg.BACKEND_DIR / 'workflows' / 'image_real_HQ.json'
 WORKFLOW_KREA_TURBO_PATH = cfg.BACKEND_DIR / 'workflows' / 'krea2_turbo.json'
 WORKFLOW_KREA_IMG2IMG_PATH = cfg.BACKEND_DIR / 'workflows' / 'krea2_turbo_img2img.json'
+# Wave 5: Qwen-Image (T2I) — authored fresh, no prior-art graph in this repo
+# (unlike the Edit-2511 workflow below, which reuses qwen_edit_variation.json's
+# already-ComfyUI-verified node shape). Flagged as best-effort/unverified per
+# this repo's honesty convention until the user's first real run confirms it.
+WORKFLOW_QWEN_T2I_PATH = cfg.BACKEND_DIR / 'workflows' / 'qwen_test_studio_t2i.json'
+WORKFLOW_QWEN_EDIT_PATH = cfg.BACKEND_DIR / 'workflows' / 'qwen_test_studio_edit.json'
 
 
 def _comfy_output_dir():
@@ -104,7 +113,8 @@ _STUDIO_ASPECT_TO_GENERATE = {
     '9:16': 'portrait', '3:4': 'portrait', '1:1': 'square',
     '4:3': 'landscape', '16:9': 'landscape',
 }
-_MODE_LABEL_BY_FAMILY = {'zimage': 'Z-Image', 'krea': 'Krea 2 Turbo', 'sdxl': 'SDXL'}
+_MODE_LABEL_BY_FAMILY = {'zimage': 'Z-Image', 'krea': 'Krea 2 Turbo', 'sdxl': 'SDXL',
+                         'qwen_image': 'Qwen-Image'}
 DEFAULT_ASPECT = '9:16'
 # Paliers de résolution (parité Generate) - mêmes clés que resolution.py/_TIERS. NULL =
 # table de formats fixe historique (comportement inchangé si le front n'envoie rien).
@@ -193,17 +203,21 @@ def _prompt_with_trigger(prompt, trigger_word):
 # --- Discovery ---------------------------------------------------------------
 # Familles testables, dans l'ordre d'affichage du sélecteur. Libellés = source
 # unique partagée avec le label de LoRA (app.utils.comfyui.FAMILY_LABELS).
-FAMILIES = ('zimage', 'sdxl', 'krea')
+FAMILIES = ('zimage', 'sdxl', 'krea', 'qwen_image')
 
 
 def _pool_for_family(family: str) -> list[dict]:
-    """Pool de LoRA d'une famille : SDXL → loras/sdxl, Krea → loras/krea, sinon
-    loras/z image. Source unique du branchement par pipeline."""
+    """Pool de LoRA d'une famille : SDXL → loras/sdxl, Krea → loras/krea, Qwen-Image
+    → loras/qwen_image (base T2I ET Edit-2511 partagent ce même dossier — le variant
+    est porté par le nom de fichier, cf. get_qwen_image_loras), sinon loras/z image.
+    Source unique du branchement par pipeline."""
     f = (family or 'zimage').lower()
     if f == 'sdxl':
         return get_sdxl_loras()
     if f == 'krea':
         return get_krea_loras()
+    if f == 'qwen_image':
+        return get_qwen_image_loras()
     return get_zimage_loras()
 
 
@@ -789,6 +803,140 @@ def apply_krea_lora_test_settings(workflow, *, lora_name, strength, prompt, seed
         inject_krea2t_enhancer(workflow, True, enhancer_strength)
 
 
+def apply_qwen_image_t2i_test_settings(workflow, *, lora_name, strength, prompt, seed,
+                                       width, height, cfg=None, steps=None, batch_size=1,
+                                       filename_prefix=None, allowed_loras=None,
+                                       extra_loras=None, negative=None,
+                                       base_model=None, allowed_bases=None):
+    """Configure une cellule de test sur qwen_test_studio_t2i.json (Qwen-Image base
+    T2I) : le LoRA testé est injecté après le UNETLoader (node 20 — même node id que
+    Krea, réutilise inject_krea_loras telle quelle) et ré-pointe le consumer
+    ModelSamplingAuraFlow (node 94), pas le KSampler directement (le graphe passe par
+    ModelSamplingAuraFlow → CFGNorm → KSampler, la normalisation Qwen-Image
+    standard). `extra_loras` = LoRA always-on chaînés dans la même chaîne. Pas de
+    steps2/rebalance/sampler-scheduler-picker ici (aucun de ces noeuds n'existe dans
+    ce workflow) — seul `negative` est exposé, comme Z-Image. Lève ValueError si le
+    LoRA testé n'est pas dans sa whitelist (anti path-injection)."""
+    if allowed_loras is not None and lora_name not in allowed_loras:
+        raise ValueError(f"unknown Qwen-Image LoRA: {lora_name}")
+    if base_model and allowed_bases is not None and base_model not in allowed_bases:
+        raise ValueError(f"unknown Qwen-Image base model: {base_model}")
+
+    def _set(node_id, key, value):
+        n = workflow.get(node_id)
+        if isinstance(n, dict) and key in n.get("inputs", {}):
+            n["inputs"][key] = value
+
+    if base_model:
+        _set("20", "unet_name", base_model)
+
+    _set("23", "text", prompt)
+    _set("24", "text", (negative or '').strip())
+    _set("25", "width", int(width))
+    _set("25", "height", int(height))
+    _set("25", "batch_size", int(batch_size))
+    _set("26", "seed", int(seed))
+    if steps is not None:
+        _set("26", "steps", max(1, min(50, int(steps))))
+    if cfg is not None:
+        _set("26", "cfg", max(1.0, min(10.0, float(cfg))))
+    if filename_prefix is not None:
+        _set("28", "filename_prefix", filename_prefix)
+
+    requested = [{"filename": lora_name, "strength": float(strength)}]
+    for e in (extra_loras or []):
+        fn = str((e or {}).get("filename") or "")
+        if not fn:
+            continue
+        try:
+            st = float(e.get("strength", 1.0))
+        except (TypeError, ValueError):
+            st = 1.0
+        requested.append({"filename": fn, "strength": st})
+    allowed = set(allowed_loras) if allowed_loras is not None else {r["filename"] for r in requested}
+    inject_krea_loras(workflow, requested, allowed=allowed, unet_node="20", consumers=("94",))
+
+
+def apply_qwen_image_edit_test_settings(workflow, *, lora_name, strength, prompt, seed,
+                                        sample_cfg=None, steps=None, filename_prefix=None,
+                                        allowed_loras=None, extra_loras=None,
+                                        dataset_id=None):
+    """Configure une cellule de test sur qwen_test_studio_edit.json (Qwen-Image
+    Edit-2511) — MVP scope (confirmed): the dataset's OWN reference photo
+    (ds.ref_filename) is copied into ComfyUI's input dir and used as the edit
+    source; there is no custom "test against a different image" picker yet.
+    `prompt` is the EDIT INSTRUCTION (Test Studio's existing prompt field
+    reused with a different meaning here, same as the Generate-variations
+    Qwen Edit engine already does). The tested LoRA is injected after the
+    Lightning speed LoRA (node 23 — same injection point Wave 4 already
+    established), a new node "50", strength swept per cell; KSampler (node
+    17) is repointed to read from it. Raises ValueError when the dataset has
+    no reference image, an unknown LoRA is requested (anti path-injection),
+    or a required asset (UNET/VAE/text-encoder) is missing."""
+    if allowed_loras is not None and lora_name not in allowed_loras:
+        raise ValueError(f"unknown Qwen-Image LoRA: {lora_name}")
+    ds = fds.get_dataset(cfg.LOCAL_USER, dataset_id) if dataset_id is not None else None
+    if not ds or not ds.ref_filename:
+        raise ValueError('this dataset has no reference image to test Qwen-Image-Edit against')
+    ref_path = fds._ref_path(ds)
+    if not os.path.isfile(ref_path):
+        raise ValueError('the dataset reference image is missing on disk')
+
+    missing = qeh.qwen_edit_missing_assets()
+    if any(a in missing for a in qeh.QWEN_EDIT_REQUIRED):
+        raise ValueError(f'Qwen-Image-Edit assets not configured: {", ".join(missing)}')
+
+    comfy_input_dir = str(cfg.comfyui_dir('input') or '')
+    if not comfy_input_dir:
+        raise RuntimeError('ComfyUI is not configured')
+    uid = uuid.uuid4().hex[:8]
+    comfy_input = f'qwen_studio_ref_{uid}_{os.path.basename(ref_path)}'
+    shutil.copy2(ref_path, os.path.join(comfy_input_dir, comfy_input))
+
+    workflow['39']['inputs']['image'] = comfy_input
+    workflow['10']['inputs']['prompt'] = prompt
+    workflow['31']['inputs']['unet_name'] = qea.resolve_unet()
+    workflow['7']['inputs']['vae_name'] = qea.resolve_vae()
+    workflow['6']['inputs']['clip_name'] = qea.resolve_text_encoder()
+    workflow['17']['inputs']['seed'] = int(seed)
+    if steps is not None:
+        workflow['17']['inputs']['steps'] = max(1, min(50, int(steps)))
+    if sample_cfg is not None:
+        workflow['17']['inputs']['cfg'] = max(1.0, min(10.0, float(sample_cfg)))
+    if filename_prefix is not None:
+        workflow['38']['inputs']['filename_prefix'] = filename_prefix
+
+    # Lightning speed LoRA (node 23, copied from qwen_edit_variation.json) —
+    # same resolve-or-bypass degrade as the Generate-variations Qwen Edit
+    # engine (qwen_edit_helper._enqueue_qwen_edit_sfw), no on/off toggle here
+    # (MVP scope: always try to use it, since Test Studio has no equivalent
+    # settings surface for it yet).
+    _light_rel, _light_abs = qea.resolve_lightning_lora()
+    if _light_abs and os.path.exists(_light_abs):
+        workflow['23']['inputs']['lora_name'] = _light_rel
+    else:
+        qeh._bypass_node(workflow, '23', 'model')
+
+    requested = [{'filename': lora_name, 'strength': float(strength)}]
+    for e in (extra_loras or []):
+        fn = str((e or {}).get('filename') or '')
+        if not fn:
+            continue
+        try:
+            st = float(e.get('strength', 1.0))
+        except (TypeError, ValueError):
+            st = 1.0
+        requested.append({'filename': fn, 'strength': st})
+    # Only ONE tested checkpoint per cell (node 50, always the primary/first
+    # requested LoRA) — extra_loras beyond it are always-on style LoRAs; this
+    # mirrors every other family's "one tested + N always-on" chain, just
+    # anchored on a single dedicated node instead of a full inject_* chain
+    # (this graph only ever swaps ONE tested LoRA, unlike zimage/krea/sdxl's
+    # open-ended stacks).
+    workflow['50']['inputs']['lora_name'] = requested[0]['filename']
+    workflow['50']['inputs']['strength_model'] = requested[0]['strength']
+
+
 # --- Node-class resolution (variant-tolerant custom nodes) --------------------
 # Some ComfyUI custom nodes register under DIFFERENT class names across installs
 # (a pack rename, a fork, a locally-edited copy). Our workflow JSON can only carry
@@ -908,6 +1056,38 @@ def _build_cell_workflow(user_id, checkpoint, strength, prompt, seed, z_model,
         # real upstream after any always-on chaining.
         _apply_sdxl_accelerator(workflow)
         return _resolve_workflow_node_classes(workflow, available_classes)
+    if (train_type or 'zimage').lower() == 'qwen_image':
+        # Both training variants (base T2I / Edit-2511) deploy into the same
+        # loras/qwen_image folder — detect which one THIS checkpoint is from
+        # its own filename (get_qwen_image_loras already tags each pool entry
+        # the same way). Undetectable/legacy filename -> T2I, the simpler and
+        # safer failure mode (no reference-image dependency).
+        _qwen_pool = {l['filename']: l for l in get_qwen_image_loras()}
+        _variant = (_qwen_pool.get(checkpoint) or {}).get('variant', 'image')
+        if _variant == 'edit':
+            workflow = load_workflow_local(str(WORKFLOW_QWEN_EDIT_PATH))
+            if not workflow:
+                raise ValueError('Qwen-Image Edit-2511 workflow not found/unreadable')
+            allowed_qwen = {l['filename'] for l in get_qwen_image_loras()}
+            apply_qwen_image_edit_test_settings(
+                workflow, lora_name=checkpoint, strength=strength, prompt=prompt,
+                seed=seed, sample_cfg=cfg, steps=steps, filename_prefix=fname,
+                allowed_loras=allowed_qwen, extra_loras=extra_loras,
+                dataset_id=dataset_id,
+            )
+            return _resolve_workflow_node_classes(workflow, available_classes)
+        workflow = load_workflow_local(str(WORKFLOW_QWEN_T2I_PATH))
+        if not workflow:
+            raise ValueError('Qwen-Image T2I workflow not found/unreadable')
+        allowed_qwen = {l['filename'] for l in get_qwen_image_loras()}
+        apply_qwen_image_t2i_test_settings(
+            workflow, lora_name=checkpoint, strength=strength, prompt=prompt,
+            seed=seed, width=width, height=height, cfg=cfg, steps=steps,
+            batch_size=1, filename_prefix=fname, allowed_loras=allowed_qwen,
+            extra_loras=extra_loras, negative=negative,
+            base_model=z_model, allowed_bases=set(get_qwen_image_models()),
+        )
+        return _resolve_workflow_node_classes(workflow, available_classes)
     if (train_type or 'zimage').lower() == 'krea':
         workflow = load_workflow_local(str(WORKFLOW_KREA_TURBO_PATH))
         if not workflow:
@@ -974,7 +1154,7 @@ def _sanitize_gen_knobs(run_family, *, negative=None, sampler=None, scheduler=No
     1.0 quand `enhancer` truthy sans force) ; `negative` vide → None ; `denoise` clampé
     0.05..1.0 ; `resolution_tier` doit être dans RESOLUTION_TIERS."""
     fam = (run_family or 'zimage').lower()
-    neg = ((negative or '').strip() or None) if fam == 'zimage' else None
+    neg = ((negative or '').strip() or None) if fam in ('zimage', 'qwen_image') else None
     smp = sampler if (fam == 'krea' and sampler in KREA_ALLOWED_SAMPLERS) else None
     sch = scheduler if (fam == 'krea' and scheduler in KREA_ALLOWED_SCHEDULERS) else None
     wdt = weight_dtype if (fam == 'krea' and weight_dtype in KREA_ALLOWED_WEIGHT_DTYPES) else None
@@ -1467,6 +1647,9 @@ def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=No
         # None en tête = UNET câblé du workflow (défaut historique et repli) ; les
         # checkpoints Krea locaux deviennent un axe de base optionnel comme ailleurs.
         models = [None] + get_krea_models()
+    elif run_family == 'qwen_image':
+        # Même sémantique que Krea : None = UNET câblé du workflow (T2I ou Edit).
+        models = [None] + get_qwen_image_models()
     else:
         models = get_zimage_models()
         if not models:
@@ -1601,6 +1784,8 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
         # None en tête = UNET câblé (node 20), repli des runs sans base explicite ;
         # les checkpoints Krea locaux sont désormais sélectionnables.
         models = [None] + get_krea_models()
+    elif run_type == 'qwen_image':
+        models = [None] + get_qwen_image_models()
     else:
         models = get_zimage_models()
         if not models:
@@ -1851,6 +2036,8 @@ def resume_run(user_id, dataset_id=None, run_id=None) -> dict:
             # base locale a disparu du disque retombent sur le UNET câblé, jamais
             # sur un modèle arbitraire.
             cell_models = [None] + get_krea_models()
+        elif cell_family == 'qwen_image':
+            cell_models = [None] + get_qwen_image_models()
         else:
             cell_models = get_zimage_models()
         z_model = (img.z_model if (img.z_model and img.z_model in cell_models)
@@ -2273,6 +2460,8 @@ def set_best_settings(user_id, dataset_id, checkpoint, strength,
         allowed_bases = {m['filename'] for m in list_sdxl_base_models()}
     elif family == 'krea':
         allowed_bases = set(get_krea_models())
+    elif family == 'qwen_image':
+        allowed_bases = set(get_qwen_image_models())
     else:
         allowed_bases = set(get_zimage_models())
     z_model = z_model or None  # '' (entrée « Official » Krea) ≡ défaut → NULL
@@ -2471,6 +2660,12 @@ def studio_payload(user_id, dataset_id, family=None) -> dict | None:
         z_models = ([{'value': '', 'label': 'Official – Krea 2 Turbo'}]
                     + [{'value': m, 'label': _basename(m).rsplit('.', 1)[0]} for m in _alts]
                     if _alts else [])
+    elif eff == 'qwen_image':
+        # Pas de nom de défaut « officiel » unique connu (contrairement à Krea) —
+        # tous les UNET Qwen-Image scannés sont proposés tels quels ; None (node
+        # non touché) reste le fallback implicite quand aucun n'est sélectionné.
+        z_models = [{'value': m, 'label': _basename(m).rsplit('.', 1)[0]}
+                    for m in get_qwen_image_models()]
     else:
         z_models = [{'value': m, 'label': _basename(m).rsplit('.', 1)[0]}
                     for m in get_zimage_models()]

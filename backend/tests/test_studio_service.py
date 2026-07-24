@@ -1172,6 +1172,32 @@ def test_embedded_workflow_model_refs_are_all_layout_independent():
             ('QwenImage/consistence_edit_v2.safetensors', 'RESOLVED'),   # or BYPASSED when absent
         ('qwen_multiangle.json', '102', 'lora_name'):
             ('QwenImage/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors', 'RESOLVED'),   # or BYPASSED when absent/disabled
+        ('qwen_test_studio_t2i.json', '20', 'unet_name'):
+            ('QwenImage/qwen_image_fp8_e4m3fn.safetensors', 'OVERRIDDEN'),
+        ('qwen_test_studio_t2i.json', '21', 'clip_name'):
+            ('qwen_2.5_vl_7b_fp8_scaled.safetensors', 'PREFLIGHT_DOCUMENTED'),
+        ('qwen_test_studio_t2i.json', '22', 'vae_name'):
+            ('QwenImage/qwen_image_vae.safetensors', 'PREFLIGHT_DOCUMENTED'),
+        ('qwen_test_studio_edit.json', '31', 'unet_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors', 'RESOLVED'),
+        ('qwen_test_studio_edit.json', '7', 'vae_name'):
+            ('QwenImage/qwen_image_vae.safetensors', 'RESOLVED'),
+        ('qwen_test_studio_edit.json', '6', 'clip_name'):
+            ('qwen_2.5_vl_7b_fp8_scaled.safetensors', 'RESOLVED'),
+        ('qwen_test_studio_edit.json', '23', 'lora_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-Lightning-8steps-V1.0-fp32.safetensors', 'RESOLVED'),   # or BYPASSED when absent
+        # Wave 4 gap (pre-existing, closed here): these two files were never added
+        # to this whitelist when qwen_edit_helper.py shipped.
+        ('qwen_edit_variation.json', '31', 'unet_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors', 'RESOLVED'),
+        ('qwen_edit_variation.json', '7', 'vae_name'):
+            ('QwenImage/qwen_image_vae.safetensors', 'RESOLVED'),
+        ('qwen_edit_variation.json', '6', 'clip_name'):
+            ('qwen_2.5_vl_7b_fp8_scaled.safetensors', 'RESOLVED'),
+        ('qwen_edit_variation.json', '23', 'lora_name'):
+            ('QwenImage/Qwen-Image-Edit-2511-Lightning-8steps-V1.0-fp32.safetensors', 'RESOLVED'),   # or BYPASSED when absent
+        ('qwen_edit_variation_nsfw.json', '1', 'ckpt_name'):
+            ('Qwen/Qwen-Rapid-AIO-v1.safetensors', 'RESOLVED'),
     }
     assert all(cat in ALLOWED for _ref, cat in EXPECTED.values())
     actual = {}

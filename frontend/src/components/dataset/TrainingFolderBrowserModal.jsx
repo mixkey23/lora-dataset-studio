@@ -79,7 +79,7 @@ export default function TrainingFolderBrowserModal({ datasetId, target, scope = 
             </thead>
             <tbody>
               {files.map((f) => (
-                <tr key={f.filename} className="border-b border-border/50">
+                <tr key={f.filename} className="border-b border-border">
                   <td className="py-1.5 pr-2 text-content break-all">{f.filename}</td>
                   <td className="py-1.5 pr-2 text-content-muted tabular-nums whitespace-nowrap">{formatSize(f.size)}</td>
                   <td className="py-1.5 pr-2 text-content-muted whitespace-nowrap">{formatDate(f.mtime)}</td>

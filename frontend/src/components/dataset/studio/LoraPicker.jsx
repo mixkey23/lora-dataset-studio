@@ -26,11 +26,12 @@ const famOf = (l) => l.family || l.train_type || 'zimage';
 const keyOf = (l) => `${l.dataset_id}:${famOf(l)}`;
 // Badge de famille : libellé + couleur DISTINCTE par pipeline (toutes taguées, y
 // compris Z-Image — sinon une ligne zimage d'un dataset multi-famille reste ambiguë).
-const FAMILY_BADGE_LABEL = { zimage: 'Z-Image', sdxl: 'SDXL', krea: 'Krea' };
+const FAMILY_BADGE_LABEL = { zimage: 'Z-Image', sdxl: 'SDXL', krea: 'Krea', qwen_image: 'Qwen-Image' };
 const familyBadgeClass = (fam) => ({
   zimage: 'border-sky-400/40 bg-sky-500/10 text-sky-300',
   sdxl: 'border-violet-400/40 bg-violet-500/10 text-violet-300',
   krea: 'border-amber-400/40 bg-amber-500/10 text-amber-300',
+  qwen_image: 'border-emerald-400/40 bg-emerald-500/10 text-emerald-300',
 }[fam] || 'border-border-strong bg-white/5 text-content-muted');
 
 export default function LoraPicker({ preselectDataset, onSelectionChange }) {

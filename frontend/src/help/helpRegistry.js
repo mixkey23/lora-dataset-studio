@@ -374,7 +374,7 @@ const TOPICS = [
   { id: 'training.musubi_profile', kind: 'setting', title: 'musubi-tuner GPU profile',
     keywords: ['musubi', 'musubi-tuner', 'profile', 'fast', 'high quality', 'rtx5090',
       '5090', 'fp8', 'blocks_to_swap', 'vram', 'gpu', 'qwen', 'advanced', 'training'],
-    guide: { chapter: 'settings-reference', anchor: 'musubi-tuner-qwen-image-only' },
+    guide: { chapter: 'settings-reference', anchor: 'training' },
     app: { route: '/datasets?section=training' } },
   // server
   setting('server.port', 'server', 'server-port', 'Server port',

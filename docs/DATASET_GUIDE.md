@@ -66,6 +66,22 @@ the same dataset — pick whichever install you already have. musubi-tuner
 launches are **fresh-start only**: continuing/resuming a stopped run isn't
 available on that engine yet, so use ai-toolkit if you need to resume.
 
+**Test Studio** now supports Qwen-Image too, for both training targets —
+base **Qwen-Image** checkpoints run a normal prompt + strength sweep like
+every other family; **Qwen-Image-Edit-2511** checkpoints use the dataset's
+own reference photo as the edit source instead of generating from scratch
+(the prompt field becomes an edit instruction — "rotate to a 3/4 profile",
+not a scene description). Which target a checkpoint uses is auto-detected,
+nothing to configure. Freshly authored, best-effort workflow — flag any
+issue you hit on your first real run.
+
+The base-T2I graph expects the CLIP text encoder at
+`models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors` and the VAE at
+`models/vae/QwenImage/qwen_image_vae.safetensors` (standard ComfyUI
+QwenImage layout, same files the Edit-2511 path auto-resolves) — there's no
+missing-asset preflight for these two on the T2I path yet, so a run will
+fail at ComfyUI if they're absent under those exact names.
+
 ---
 
 ## 2. How many images, and which ones

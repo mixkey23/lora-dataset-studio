@@ -1,0 +1,154 @@
+{
+    "20": {
+        "inputs": {
+            "unet_name": "QwenImage/qwen_image_fp8_e4m3fn.safetensors",
+            "weight_dtype": "default"
+        },
+        "class_type": "UNETLoader",
+        "_meta": {
+            "title": "Load Diffusion Model (Qwen-Image)"
+        }
+    },
+    "21": {
+        "inputs": {
+            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "type": "qwen_image",
+            "device": "default"
+        },
+        "class_type": "CLIPLoader",
+        "_meta": {
+            "title": "Load CLIP"
+        }
+    },
+    "22": {
+        "inputs": {
+            "vae_name": "QwenImage/qwen_image_vae.safetensors"
+        },
+        "class_type": "VAELoader",
+        "_meta": {
+            "title": "Load VAE"
+        }
+    },
+    "23": {
+        "inputs": {
+            "text": "a photo",
+            "clip": [
+                "21",
+                0
+            ]
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+            "title": "CLIP Text Encode (Positive)"
+        }
+    },
+    "24": {
+        "inputs": {
+            "text": "",
+            "clip": [
+                "21",
+                0
+            ]
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+            "title": "CLIP Text Encode (Negative)"
+        }
+    },
+    "25": {
+        "inputs": {
+            "width": 1328,
+            "height": 1328,
+            "batch_size": 1
+        },
+        "class_type": "EmptySD3LatentImage",
+        "_meta": {
+            "title": "Empty Latent (Qwen-Image)"
+        }
+    },
+    "26": {
+        "inputs": {
+            "seed": 0,
+            "steps": 25,
+            "cfg": 4.0,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 1.0,
+            "model": [
+                "98",
+                0
+            ],
+            "positive": [
+                "23",
+                0
+            ],
+            "negative": [
+                "24",
+                0
+            ],
+            "latent_image": [
+                "25",
+                0
+            ]
+        },
+        "class_type": "KSampler",
+        "_meta": {
+            "title": "KSampler"
+        }
+    },
+    "27": {
+        "inputs": {
+            "samples": [
+                "26",
+                0
+            ],
+            "vae": [
+                "22",
+                0
+            ]
+        },
+        "class_type": "VAEDecode",
+        "_meta": {
+            "title": "VAE Decode"
+        }
+    },
+    "28": {
+        "inputs": {
+            "filename_prefix": "QwenImage_LoraTest",
+            "images": [
+                "27",
+                0
+            ]
+        },
+        "class_type": "SaveImage",
+        "_meta": {
+            "title": "Save Image"
+        }
+    },
+    "94": {
+        "inputs": {
+            "shift": 3.1,
+            "model": [
+                "20",
+                0
+            ]
+        },
+        "class_type": "ModelSamplingAuraFlow",
+        "_meta": {
+            "title": "ModelSamplingAuraFlow"
+        }
+    },
+    "98": {
+        "inputs": {
+            "strength": 1,
+            "model": [
+                "94",
+                0
+            ]
+        },
+        "class_type": "CFGNorm",
+        "_meta": {
+            "title": "CFGNorm"
+        }
+    }
+}

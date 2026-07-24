@@ -24,7 +24,7 @@ export const SDXL_LORAS_LS_KEY = 'sdxlLoras_v1';
 export const PENDING_KREA_APPLY_KEY = 'pendingKreaApply';
 export const KREA_LORAS_LS_KEY = 'kreaLoras_v1';
 // Libellés des familles d'entraînement (= pipelines), pour le sélecteur de famille.
-export const FAMILY_LABELS = { zimage: 'Z-Image', sdxl: 'SDXL', krea: 'Krea 2' };
+export const FAMILY_LABELS = { zimage: 'Z-Image', sdxl: 'SDXL', krea: 'Krea 2', qwen_image: 'Qwen-Image' };
 // generate n'a que 3 formats → mapping depuis les 5 ratios du studio.
 export const ASPECT_TO_GENERATE = {
   '9:16': 'portrait', '3:4': 'portrait', '1:1': 'square', '4:3': 'landscape', '16:9': 'landscape',

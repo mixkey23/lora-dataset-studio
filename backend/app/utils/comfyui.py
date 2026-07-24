@@ -1173,6 +1173,44 @@ def get_krea_models():
     return out
 
 
+_qwen_image_models_cache = {"data": None, "timestamp": 0}
+
+
+def get_qwen_image_models():
+    """List Qwen-Image UNET checkpoints (base T2I and Edit-2511 both live in
+    the same ComfyUI 'QwenImage'/'qwen_image' subfolder — there's no
+    filesystem split between the two, same as loras below). Mirrors
+    get_krea_models()'s shape/cache/output form."""
+    current_time = time.time()
+    if (_qwen_image_models_cache["data"] is not None
+            and current_time - _qwen_image_models_cache["timestamp"] < _MODEL_CACHE_TTL):
+        return _qwen_image_models_cache["data"]
+    out = []
+    out_dir = _out_dir()
+    if out_dir:
+        try:
+            models_root = os.path.normpath(os.path.join(out_dir, "..", "models"))
+            for base in ("unet", "diffusion_models"):
+                base_dir = os.path.join(models_root, base)
+                if not os.path.isdir(base_dir):
+                    continue
+                for root, _dirs, files in os.walk(base_dir):
+                    rel_dir = os.path.relpath(root, base_dir)
+                    low = rel_dir.lower()
+                    if "qwenimage" not in low.replace(" ", "").replace("_", "").replace("-", ""):
+                        continue
+                    for f in files:
+                        if f.lower().endswith((".safetensors", ".gguf", ".sft")):
+                            rel = f if rel_dir == "." else os.path.join(rel_dir, f)
+                            out.append(rel.replace("/", "\\"))
+            out = sorted(set(out))
+        except Exception as e:
+            logger.error(f"get_qwen_image_models error: {e}")
+    _qwen_image_models_cache["data"] = out
+    _qwen_image_models_cache["timestamp"] = current_time
+    return out
+
+
 def clear_model_caches() -> None:
     """Drop the 5-min TTL caches of every base/model lister.
 
@@ -1182,7 +1220,8 @@ def clear_model_caches() -> None:
     user as "models still not found" right after they pointed the app at ComfyUI).
     SRC exposed `invalidate_model_caches`; this app dropped that helper, so the
     caches were never invalidated on config change until now."""
-    for c in (_checkpoint_models_cache, _zimage_models_cache, _krea_models_cache):
+    for c in (_checkpoint_models_cache, _zimage_models_cache, _krea_models_cache,
+              _qwen_image_models_cache):
         c["data"] = None
         c["timestamp"] = 0
         if "key" in c:
@@ -1257,6 +1296,46 @@ def get_sdxl_loras():
                     })
     except Exception as e:
         logger.error(f"get_sdxl_loras error: {e}")
+    return out
+
+
+def get_qwen_image_loras():
+    """List Qwen-Image LoRAs: .safetensors under the 'qwen_image' subfolder of
+    models/loras. Both training variants (base T2I and Edit-2511) deploy into
+    this SAME folder (see lora_training._lora_dest_dir_qwen_image) — there is
+    no folder-level split like sdxl/krea/zimage get. Each entry additionally
+    carries `variant: 'image' | 'edit'`, detected from the deployed filename's
+    own base tag (`_Qwen-Image` vs `_Qwen-Image-Edit-2511`, from
+    lora_training.QWEN_IMAGE_BASE_LABELS) — 'image' is the safe fallback for
+    an undetectable/legacy filename (Test Studio's simpler, non-reference
+    generation mode). Mirrors get_krea_loras()'s shape/output form otherwise."""
+    out = []
+    lora_dir = _lora_dir()
+    try:
+        if lora_dir and os.path.isdir(lora_dir):
+            for root, _dirs, files in os.walk(lora_dir):
+                rel_dir = os.path.relpath(root, lora_dir)
+                low = rel_dir.lower()
+                if low != 'qwen_image' and not low.startswith('qwen_image' + os.sep):
+                    continue
+                for f in sorted(files):
+                    if not f.lower().endswith(".safetensors"):
+                        continue
+                    rel = (f if rel_dir == "." else os.path.join(rel_dir, f)).replace("/", "\\")
+                    triggers = _extract_klein_triggers(f)
+                    grp, stp = trained_lora_group(f, 'qwen_image')
+                    variant = 'edit' if 'edit-2511' in f.lower() else 'image'
+                    out.append({
+                        "filename": rel,
+                        "displayName": format_trained_lora_label(f, 'qwen_image') or _clean_klein_lora_label(f),
+                        "triggerWord": triggers[0]["prompt"] if triggers else None,
+                        "triggerWords": triggers,
+                        "group": grp,
+                        "step": stp,
+                        "variant": variant,
+                    })
+    except Exception as e:
+        logger.error(f"get_qwen_image_loras error: {e}")
     return out
 
 

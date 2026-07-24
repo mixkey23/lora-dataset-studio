@@ -1,0 +1,258 @@
+{
+    "4": {
+        "inputs": {
+            "shift": 3.1,
+            "model": [
+                "31",
+                0
+            ]
+        },
+        "class_type": "ModelSamplingAuraFlow",
+        "_meta": {
+            "title": "ModelSamplingAuraFlow"
+        }
+    },
+    "5": {
+        "inputs": {
+            "strength": 1,
+            "pre_cfg": false,
+            "model": [
+                "4",
+                0
+            ]
+        },
+        "class_type": "CFGNorm",
+        "_meta": {
+            "title": "CFGNorm"
+        }
+    },
+    "6": {
+        "inputs": {
+            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "type": "qwen_image",
+            "device": "default"
+        },
+        "class_type": "CLIPLoader",
+        "_meta": {
+            "title": "Load CLIP"
+        }
+    },
+    "7": {
+        "inputs": {
+            "vae_name": "QwenImage/qwen_image_vae.safetensors"
+        },
+        "class_type": "VAELoader",
+        "_meta": {
+            "title": "Load VAE"
+        }
+    },
+    "8": {
+        "inputs": {
+            "max_size": 1024,
+            "image": [
+                "39",
+                0
+            ]
+        },
+        "class_type": "QwenEditAdaptiveLongestEdge",
+        "_meta": {
+            "title": "Qwen Edit Adaptive Longest Edge"
+        }
+    },
+    "10": {
+        "inputs": {
+            "prompt": "",
+            "return_full_refs_cond": true,
+            "instruction": "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.",
+            "clip": [
+                "6",
+                0
+            ],
+            "vae": [
+                "7",
+                0
+            ],
+            "configs": [
+                "13",
+                0
+            ]
+        },
+        "class_type": "TextEncodeQwenImageEditPlusCustom_lrzjason",
+        "_meta": {
+            "title": "Positive Prompt"
+        }
+    },
+    "13": {
+        "inputs": {
+            "to_ref": true,
+            "ref_main_image": true,
+            "ref_longest_edge": [
+                "8",
+                0
+            ],
+            "ref_crop": "pad",
+            "ref_upscale": "lanczos",
+            "to_vl": true,
+            "vl_resize": true,
+            "vl_target_size": 384,
+            "vl_crop": "center",
+            "vl_upscale": "lanczos",
+            "image": [
+                "39",
+                0
+            ]
+        },
+        "class_type": "QwenEditConfigPreparer",
+        "_meta": {
+            "title": "Qwen Edit Config Preparer"
+        }
+    },
+    "17": {
+        "inputs": {
+            "seed": 0,
+            "steps": 8,
+            "cfg": 1,
+            "sampler_name": "euler_ancestral",
+            "scheduler": "beta",
+            "denoise": 1,
+            "model": [
+                "50",
+                0
+            ],
+            "positive": [
+                "10",
+                0
+            ],
+            "negative": [
+                "21",
+                0
+            ],
+            "latent_image": [
+                "33",
+                0
+            ]
+        },
+        "class_type": "KSampler",
+        "_meta": {
+            "title": "KSampler"
+        }
+    },
+    "19": {
+        "inputs": {
+            "samples": [
+                "17",
+                0
+            ],
+            "vae": [
+                "7",
+                0
+            ]
+        },
+        "class_type": "VAEDecode",
+        "_meta": {
+            "title": "VAE Decode"
+        }
+    },
+    "21": {
+        "inputs": {
+            "text": "",
+            "clip": [
+                "6",
+                0
+            ]
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+            "title": "Negative Prompt"
+        }
+    },
+    "23": {
+        "inputs": {
+            "lora_name": "QwenImage/Qwen-Image-Edit-2511-Lightning-8steps-V1.0-fp32.safetensors",
+            "strength_model": 1,
+            "model": [
+                "5",
+                0
+            ]
+        },
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {
+            "title": "Lightning Speed LoRA"
+        }
+    },
+    "31": {
+        "inputs": {
+            "unet_name": "QwenImage/Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors",
+            "weight_dtype": "default"
+        },
+        "class_type": "UNETLoader",
+        "_meta": {
+            "title": "Load Diffusion Model"
+        }
+    },
+    "33": {
+        "inputs": {
+            "width": [
+                "40",
+                0
+            ],
+            "height": [
+                "40",
+                1
+            ],
+            "batch_size": 1
+        },
+        "class_type": "EmptyLatentImage",
+        "_meta": {
+            "title": "Empty Latent Image"
+        }
+    },
+    "38": {
+        "inputs": {
+            "filename_prefix": "QwenImageEdit_LoraTest",
+            "images": [
+                "19",
+                0
+            ]
+        },
+        "class_type": "SaveImage",
+        "_meta": {
+            "title": "Save Image"
+        }
+    },
+    "39": {
+        "inputs": {
+            "image": ""
+        },
+        "class_type": "LoadImage",
+        "_meta": {
+            "title": "Load Image"
+        }
+    },
+    "40": {
+        "inputs": {
+            "image": [
+                "39",
+                0
+            ]
+        },
+        "class_type": "GetImageSize",
+        "_meta": {
+            "title": "Get Image Size (matches the reference's aspect ratio)"
+        }
+    },
+    "50": {
+        "inputs": {
+            "lora_name": "",
+            "strength_model": 1,
+            "model": [
+                "23",
+                0
+            ]
+        },
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {
+            "title": "Tested LoRA (swept strength)"
+        }
+    }
+}
