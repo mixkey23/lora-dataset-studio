@@ -20,6 +20,7 @@ import PublishHfModal from './PublishHfModal';
 import WatermarkReviewLightbox, { buildWatermarkRecap } from './WatermarkReviewLightbox';
 import { useToast } from '../common/Toast';
 import { pickNativeFolder, FolderBrowserModal } from '../common/FolderPicker';
+import TrainingFolderBrowserModal from './TrainingFolderBrowserModal';
 import { useCapabilities } from '../../context/CapabilitiesContext';
 import InstallRunner from '../setup/InstallRunner';
 import GuidedChecklist from './GuidedChecklist';
@@ -135,6 +136,7 @@ export default function DatasetWorkspace({ ds, onBack }) {
   const [captionMode, setCaptionMode] = useState(null);   // null → défaut auto selon train_type
   const [showLeaks, setShowLeaks] = useState(false);       // liste dépliée des captions qui fuient
   const [captionToolsOpen, setCaptionToolsOpen] = useState(false);
+  const [datasetFolderBrowserOpen, setDatasetFolderBrowserOpen] = useState(false);
   const [installInpaintOpen, setInstallInpaintOpen] = useState(false);  // panneau d'install LaMa
   const [watermarkMethod, setWatermarkMethod] = useState('lama');  // moteur d'inpaint batch : lama | klein
   const [savingAllowCrop, setSavingAllowCrop] = useState(false);  // write-through of the auto-crop pref
@@ -1363,10 +1365,15 @@ export default function DatasetWorkspace({ ds, onBack }) {
                   onExclude={toggleExclude} onInclude={toggleInclude}
                   onReplace={ds.replaceCaptions}
                   onWriteFiles={ds.writeCaptionFiles} onOpenFolder={ds.openDatasetFolder}
+                  onBrowseFolder={() => setDatasetFolderBrowserOpen(true)}
                   busy={ds.busy}
                   open={captionToolsOpen}
                   onOpenChange={(open) => onRevealOpenChange('tools', open, setCaptionToolsOpen)} />
               </div>
+              {datasetFolderBrowserOpen && (
+                <TrainingFolderBrowserModal datasetId={d.id} target="dataset" label="Dataset folder"
+                  onClose={() => setDatasetFolderBrowserOpen(false)} />
+              )}
               {filtersActive && (
                 <p className="m-0 text-content-subtle text-[0.6875rem]">
                   🔎 A tag filter is active — the filtered grid lives in{' '}

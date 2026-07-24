@@ -1082,6 +1082,54 @@ def dataset_train_open_folder(dataset_id):
     return jsonify({'ok': True, 'path': path})
 
 
+def _folder_scope_kwargs(args) -> dict:
+    """train_type/base_model/variant from the query string, same shape
+    open-folder already reads from its POST body — shared by the two
+    in-app file-browser routes below."""
+    kw = {}
+    if args.get('train_type'):
+        kw['family'] = args.get('train_type')
+    if 'base_model' in args:
+        kw['base_model'] = args.get('base_model')
+    if args.get('variant'):
+        kw['variant'] = args.get('variant')
+    return kw
+
+
+@bp.get('/dataset/<int:dataset_id>/train/folder/<target>/files')
+def dataset_train_folder_files(dataset_id, target):
+    """In-app file browser: list one of the 3 server-resolved training
+    folders (run/loras/dataset — see lt._resolve_folder_target) — the
+    fallback for a machine where the 📂 Open-folder button's `xdg-open`
+    has no file manager to hand off to (repo owner report)."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    try:
+        files = lt.list_folder_files(LOCAL_USER, dataset_id, target,
+                                     **_folder_scope_kwargs(request.args))
+    except Exception as e:
+        return _map_error(e)
+    return jsonify({'files': files})
+
+
+@bp.get('/dataset/<int:dataset_id>/train/folder/<target>/download/<path:filename>')
+def dataset_train_folder_download(dataset_id, target, filename):
+    """Download ONE file the file-browser listed above. `filename` is
+    whitelist-checked against that same listing server-side (folder_file_path)
+    — never a client-controlled path."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    try:
+        path = lt.folder_file_path(LOCAL_USER, dataset_id, target, filename,
+                                   **_folder_scope_kwargs(request.args))
+    except Exception as e:
+        return _map_error(e)
+    if not path or not os.path.isfile(path):
+        return jsonify({'error': 'not found'}), 404
+    from flask import send_file
+    return send_file(path, as_attachment=True)
+
+
 @bp.post('/dataset/<int:dataset_id>/train/checkpoint/delete')
 def dataset_train_checkpoint_delete(dataset_id):
     gate = _require_aitoolkit()

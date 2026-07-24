@@ -410,6 +410,61 @@ def test_base_info_qwen_image_defaults_to_musubi_engine_and_edit_variant(client,
     assert body['valid_engines'] == ['aitoolkit', 'musubi']
 
 
+# --- In-app file browser (/train/folder/<target>/files, .../download/<name>) --
+
+def test_folder_files_route_lists_run_dir(client, app, monkeypatch, tmp_path):
+    from app import config as cfg
+    _valid(monkeypatch, True)
+    cfg.save_config({'aitoolkit': {'dir': str(tmp_path / 'aitoolkit')}})
+    ds_id = _create(client)
+    with app.app_context():
+        from app.services import lora_training as lt
+        from app.models import FaceDataset
+        ds = FaceDataset.query.get(ds_id)
+        run_dir = lt._output_dir() / lt._run_name(ds) / f'lora_{ds.trigger_word}'
+        run_dir.mkdir(parents=True)
+        (run_dir / f'lora_{ds.trigger_word}_000000500.safetensors').write_bytes(b'x')
+    resp = client.get(f'/api/dataset/{ds_id}/train/folder/run/files')
+    assert resp.status_code == 200
+    files = resp.get_json()['files']
+    assert len(files) == 1
+    assert files[0]['filename'].endswith('.safetensors')
+
+
+def test_folder_files_route_unknown_target_400(client, monkeypatch):
+    _valid(monkeypatch, True)
+    ds_id = _create(client)
+    resp = client.get(f'/api/dataset/{ds_id}/train/folder/bogus/files')
+    assert resp.status_code == 400
+
+
+def test_folder_download_route_serves_a_listed_file(client, app, monkeypatch, tmp_path):
+    from app import config as cfg
+    _valid(monkeypatch, True)
+    cfg.save_config({'aitoolkit': {'dir': str(tmp_path / 'aitoolkit')}})
+    ds_id = _create(client)
+    with app.app_context():
+        from app.services import lora_training as lt
+        from app.models import FaceDataset
+        ds = FaceDataset.query.get(ds_id)
+        run_dir = lt._output_dir() / lt._run_name(ds) / f'lora_{ds.trigger_word}'
+        run_dir.mkdir(parents=True)
+        fname = f'lora_{ds.trigger_word}_000000500.safetensors'
+        (run_dir / fname).write_bytes(b'fake-weights')
+    resp = client.get(f'/api/dataset/{ds_id}/train/folder/run/download/{fname}')
+    assert resp.status_code == 200
+    assert resp.data == b'fake-weights'
+
+
+def test_folder_download_route_404s_on_unlisted_filename(client, monkeypatch, tmp_path):
+    from app import config as cfg
+    _valid(monkeypatch, True)
+    cfg.save_config({'aitoolkit': {'dir': str(tmp_path / 'aitoolkit')}})
+    ds_id = _create(client)
+    resp = client.get(f'/api/dataset/{ds_id}/train/folder/run/download/not_real.safetensors')
+    assert resp.status_code == 404
+
+
 def test_base_info_unknown_dataset_404(client, monkeypatch):
     _valid(monkeypatch, True)
     resp = client.get('/api/dataset/999999/train/base-info')

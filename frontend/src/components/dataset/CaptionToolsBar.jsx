@@ -10,7 +10,7 @@ import { captionCategoryCopy, captionFrequencyEntries } from './captionCategory'
    the images on disk, same text as the export ZIP) + 📂 open that folder. */
 export default function CaptionToolsBar({ images, kind = 'character', mode = 'booru',
                                           excludes = [], includes = [], onExclude, onInclude,
-                                          onReplace, onWriteFiles, onOpenFolder, busy,
+                                          onReplace, onWriteFiles, onOpenFolder, onBrowseFolder, busy,
                                           open: controlledOpen, onOpenChange }) {
   const [internalOpen, setInternalOpen] = useState(false);
   const open = controlledOpen === undefined ? internalOpen : controlledOpen;
@@ -191,6 +191,14 @@ export default function CaptionToolsBar({ images, kind = 'character', mode = 'bo
                     aria-label="Open the dataset folder"
                     className="px-2 py-1 rounded-lg bg-surface-raised border border-border text-content text-xs hover:bg-surface">
                     📂
+                  </button>
+                )}
+                {onBrowseFolder && (
+                  <button type="button" onClick={onBrowseFolder}
+                    title="Browse/download this folder's files in-app (works even without a desktop file manager)"
+                    aria-label="Browse the dataset folder in-app"
+                    className="px-2 py-1 rounded-lg bg-surface-raised border border-border text-content text-xs hover:bg-surface">
+                    🗂
                   </button>
                 )}
                 <span className="text-content-subtle text-[0.6875rem]">

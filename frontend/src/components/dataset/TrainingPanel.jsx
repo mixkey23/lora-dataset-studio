@@ -37,6 +37,7 @@ import { useToast } from '../common/Toast';
 import ContinueDialog from './ContinueDialog';
 import RunLineageGraph from './RunLineageGraph';
 import TrainingProgress from './TrainingProgress';
+import TrainingFolderBrowserModal from './TrainingFolderBrowserModal';
 import PreflightModal from './PreflightModal';
 import { DatasetVersionChip, RunIdChip } from './RunIdentityBadges';
 import {
@@ -203,6 +204,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const [presetBusy, setPresetBusy] = useState(false);
   const [trainTypeBusy, setTrainTypeBusy] = useState(false);
   const presetFileRef = useRef(null);
+  // In-app file browser (🗂), the fallback for the 📂 Open-folder button on a
+  // machine where xdg-open has no file manager to hand off to. null = closed.
+  const [folderBrowser, setFolderBrowser] = useState(null);
 
   const refreshStatus = async () => {
     try {
@@ -2329,7 +2333,11 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
               </button>
             </div>
             {/* Ouvre les dossiers dans l'explorateur du poste (app locale) :
-                loras = imports ComfyUI de la famille ; run = checkpoints bruts. */}
+                loras = imports ComfyUI de la famille ; run = checkpoints bruts.
+                🗂 Browse = alternative in-app listing, for a machine where
+                xdg-open has no file manager to hand off to (repo owner report:
+                'Open folder' silently no-ops on a desktop-less/snap-confined
+                Linux box). */}
             <button type="button"
               onClick={() => postTrain(`/api/dataset/${ds.currentId}/train/open-folder`,
                 { target: 'loras', ...trainingRunSelection(undefined, checkpointTrainType, checkpointVariant) })}
@@ -2338,11 +2346,29 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
               📂 LoRA folder
             </button>
             <button type="button"
+              onClick={() => setFolderBrowser({ target: 'loras',
+                scope: trainingRunSelection(undefined, checkpointTrainType, checkpointVariant),
+                label: `Imported ${checkpointTypeLabel} LoRAs` })}
+              title="Browse/download this folder's files in-app (works even without a desktop file manager)"
+              aria-label="Browse the LoRA folder in-app"
+              className="px-2 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs">
+              🗂
+            </button>
+            <button type="button"
               onClick={() => postTrain(`/api/dataset/${ds.currentId}/train/open-folder`,
                 { target: 'run', ...trainingRunSelection(checkpointBase, checkpointTrainType, checkpointVariant) })}
               title="Open this run's output folder (raw checkpoints, samples, training log)"
               className="px-3 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs font-semibold">
               📂 Run folder
+            </button>
+            <button type="button"
+              onClick={() => setFolderBrowser({ target: 'run',
+                scope: trainingRunSelection(checkpointBase, checkpointTrainType, checkpointVariant),
+                label: 'Run output folder' })}
+              title="Browse/download this folder's files in-app (works even without a desktop file manager)"
+              aria-label="Browse the run folder in-app"
+              className="px-2 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs">
+              🗂
             </button>
             <span className="text-content-subtle text-[0.625rem]">
               import the checkpoint you like into ComfyUI to use (and test) the LoRA
@@ -2695,6 +2721,12 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             optimizer: adv?.optimizer, learning_rate: adv?.learning_rate }}
           busy={status.in_progress}
           onResolve={runContinue} />
+      )}
+
+      {folderBrowser && (
+        <TrainingFolderBrowserModal datasetId={ds.currentId} target={folderBrowser.target}
+          scope={folderBrowser.scope} label={folderBrowser.label}
+          onClose={() => setFolderBrowser(null)} />
       )}
 
     </div>

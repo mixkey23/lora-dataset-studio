@@ -3165,6 +3165,24 @@ def _run_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
     return str(base / f'lora_{_safe_trigger(ds)}')
 
 
+_FOLDER_TARGETS = ('run', 'loras', 'dataset')
+
+
+def _resolve_folder_target(ds, dataset_id, target, base_model=_PERSISTED,
+                           family=None, variant=_PERSISTED) -> str:
+    """The 3 server-resolved training folders, shared by open_training_folder
+    (OS file manager) and the in-app file browser (list_folder_files/
+    folder_file_path) — same targets, same security model (fixed server-side
+    paths, the client only ever names WHICH of the 3, never a path)."""
+    if target == 'run':
+        return _run_dir(ds.user_id, dataset_id, base_model, family, variant)
+    if target == 'loras':
+        return _lora_dest_dir(ds, family)
+    if target == 'dataset':
+        return fds._dataset_dir(dataset_id)
+    raise ValueError(f"unknown folder target {target!r} (must be one of {_FOLDER_TARGETS})")
+
+
 def open_training_folder(user_id, dataset_id, target='loras', family=None,
                          base_model=_PERSISTED, variant=_PERSISTED) -> str:
     """Ouvre dans l'explorateur de fichiers du POSTE (app locale mono-utilisateur,
@@ -3175,18 +3193,17 @@ def open_training_folder(user_id, dataset_id, target='loras', family=None,
     .txt files » dépose les captions sidecar ; aucune dépendance ai-toolkit).
     Cibles FIXES résolues côté serveur — le client n'envoie jamais de chemin.
     Crée le dossier au besoin (avant un premier import il n'existe pas encore).
-    Retourne le chemin ouvert."""
+    Retourne le chemin ouvert.
+
+    Best-effort: on Linux this hands off to `xdg-open`, which silently no-ops
+    when the desktop has no file manager registered for `inode/directory`
+    (repo owner report, snap-confined/desktop-less setup) — Popen doesn't
+    raise on that, there is nothing to catch. list_folder_files/
+    folder_file_path below are the in-app fallback for exactly that case."""
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
-    if target == 'run':
-        path = _run_dir(user_id, dataset_id, base_model, family, variant)
-    elif target == 'loras':
-        path = _lora_dest_dir(ds, family)
-    elif target == 'dataset':
-        path = fds._dataset_dir(dataset_id)
-    else:
-        raise ValueError('unknown folder target')
+    path = _resolve_folder_target(ds, dataset_id, target, base_model, family, variant)
     os.makedirs(path, exist_ok=True)
     if os.name == 'nt':
         os.startfile(path)                                   # Explorateur Windows
@@ -3196,6 +3213,54 @@ def open_training_folder(user_id, dataset_id, target='loras', family=None,
         subprocess.Popen(['xdg-open', path])
     logger.info('open folder (%s): %s', target, path)
     return path
+
+
+def list_folder_files(user_id, dataset_id, target='loras', family=None,
+                      base_model=_PERSISTED, variant=_PERSISTED) -> list[dict]:
+    """Top-level files in one of the 3 server-resolved training folders (see
+    _resolve_folder_target) — powers the in-app file browser, an alternative
+    to the OS 'Open folder' button for a machine where xdg-open has nothing
+    to hand off to. Non-recursive (mirrors what a file manager's address bar
+    shows for that one folder — samples/ etc. stay one level down,
+    unexplored). Newest-modified first. Missing folder -> []  (nothing
+    imported/trained yet is normal, not an error)."""
+    ds = fds.get_dataset(user_id, dataset_id)
+    if not ds:
+        raise ValueError('dataset not found')
+    path = _resolve_folder_target(ds, dataset_id, target, base_model, family, variant)
+    if not os.path.isdir(path):
+        return []
+    out = []
+    for name in os.listdir(path):
+        p = os.path.join(path, name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        out.append({'filename': name, 'size': st.st_size, 'mtime': st.st_mtime})
+    out.sort(key=lambda f: f['mtime'], reverse=True)
+    return out
+
+
+def folder_file_path(user_id, dataset_id, target, filename, family=None,
+                     base_model=_PERSISTED, variant=_PERSISTED):
+    """Absolute path of ONE file from list_folder_files, for a browser
+    download — None on any mismatch (route maps that to 404). `filename`
+    must be a bare basename (no separators/`..`) AND actually be a name
+    list_folder_files just reported for this SAME target/scope: a
+    whitelist-by-listing check, same pattern checkpoint_file_path already
+    uses, so this can never escape the resolved folder."""
+    if not filename or filename != os.path.basename(filename) or filename in ('.', '..'):
+        return None
+    names = {f['filename'] for f in list_folder_files(
+        user_id, dataset_id, target, family, base_model, variant)}
+    if filename not in names:
+        return None
+    ds = fds.get_dataset(user_id, dataset_id)
+    path = _resolve_folder_target(ds, dataset_id, target, base_model, family, variant)
+    return os.path.join(path, filename)
 
 
 def list_checkpoints(user_id, dataset_id, base_model=_PERSISTED, family=None,

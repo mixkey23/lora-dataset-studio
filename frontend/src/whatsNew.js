@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-24-training-folder-browser',
+    date: '2026-07-24',
+    title: '🗂 Browse and download training files without a file manager',
+    blurb:
+      "The 📂 Open-folder buttons (LoRA folder, Run folder, dataset folder) now have a 🗂 sibling that lists the folder's files right in the app, with a Download link per file — no OS file manager needed. Also fixes a real bug: musubi-tuner's checkpoints were invisible to the Training panel and the guided-flow \"Train\" step, because musubi saves files in a different layout (no subfolder, hyphenated epoch numbers) than ai-toolkit — both engines' checkpoints now show up correctly.",
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-23-qwen-image-defaults-musubi-edit',
     date: '2026-07-23',
     title: '🎯 Qwen-Image now defaults to musubi-tuner + Edit-2511',

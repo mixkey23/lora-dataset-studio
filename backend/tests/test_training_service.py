@@ -779,6 +779,118 @@ def test_import_list_delete_checkpoint_roundtrip_filesystem_scan(app, tmp_path):
         assert lt.list_imported_checkpoints(LOCAL_USER, ds.id) == []
 
 
+# --- In-app file browser (list_folder_files / folder_file_path) ------------
+# The xdg-open 'Open folder' button silently no-ops on a machine with no
+# default file manager registered (repo owner report) — these two functions
+# are the in-app fallback: list what's in one of the 3 server-resolved
+# folders, and resolve ONE of those names back to a safe absolute path.
+
+def test_list_folder_files_run_target_lists_and_sorts_newest_first(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        cfg_dir = tmp_path / 'aitoolkit'
+        from app import config as cfg
+        cfg.save_config({'aitoolkit': {'dir': str(cfg_dir)}})
+        ds = svc.create_dataset(LOCAL_USER, 'FB1', 'FbTrig1')
+        run_dir = lt._output_dir() / lt._run_name(ds) / 'lora_FbTrig1'
+        run_dir.mkdir(parents=True)
+        older = run_dir / 'lora_FbTrig1_000000500.safetensors'
+        newer = run_dir / 'lora_FbTrig1_000001000.safetensors'
+        older.write_bytes(b'a')
+        newer.write_bytes(b'bb')
+        os.utime(older, (1000, 1000))
+        os.utime(newer, (2000, 2000))
+
+        files = lt.list_folder_files(LOCAL_USER, ds.id, 'run')
+        assert [f['filename'] for f in files] == [
+            'lora_FbTrig1_000001000.safetensors', 'lora_FbTrig1_000000500.safetensors']
+        assert files[0]['size'] == 2
+        assert files[1]['size'] == 1
+
+
+def test_list_folder_files_missing_folder_returns_empty_not_error(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        cfg_dir = tmp_path / 'aitoolkit'
+        from app import config as cfg
+        cfg.save_config({'aitoolkit': {'dir': str(cfg_dir)}})
+        ds = svc.create_dataset(LOCAL_USER, 'FB2', 'FbTrig2')
+        assert lt.list_folder_files(LOCAL_USER, ds.id, 'run') == []
+
+
+def test_list_folder_files_unknown_target_raises(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'FB3', 'FbTrig3')
+        with pytest.raises(ValueError, match='unknown folder target'):
+            lt.list_folder_files(LOCAL_USER, ds.id, 'bogus')
+
+
+def test_folder_file_path_resolves_a_listed_file(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        cfg_dir = tmp_path / 'aitoolkit'
+        from app import config as cfg
+        cfg.save_config({'aitoolkit': {'dir': str(cfg_dir)}})
+        ds = svc.create_dataset(LOCAL_USER, 'FB4', 'FbTrig4')
+        run_dir = lt._output_dir() / lt._run_name(ds) / 'lora_FbTrig4'
+        run_dir.mkdir(parents=True)
+        (run_dir / 'lora_FbTrig4_000000500.safetensors').write_bytes(b'x')
+
+        p = lt.folder_file_path(LOCAL_USER, ds.id, 'run', 'lora_FbTrig4_000000500.safetensors')
+        assert p == str(run_dir / 'lora_FbTrig4_000000500.safetensors')
+        assert os.path.isfile(p)
+
+
+def test_folder_file_path_rejects_path_traversal_and_unlisted_names(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        cfg_dir = tmp_path / 'aitoolkit'
+        from app import config as cfg
+        cfg.save_config({'aitoolkit': {'dir': str(cfg_dir)}})
+        ds = svc.create_dataset(LOCAL_USER, 'FB5', 'FbTrig5')
+        run_dir = lt._output_dir() / lt._run_name(ds) / 'lora_FbTrig5'
+        run_dir.mkdir(parents=True)
+        (run_dir / 'lora_FbTrig5_000000500.safetensors').write_bytes(b'x')
+
+        assert lt.folder_file_path(LOCAL_USER, ds.id, 'run', '../../etc/passwd') is None
+        assert lt.folder_file_path(LOCAL_USER, ds.id, 'run', 'not_a_real_file.safetensors') is None
+        assert lt.folder_file_path(LOCAL_USER, ds.id, 'run', '..') is None
+
+
+def test_folder_file_path_musubi_run_finds_flat_layout(app, tmp_path):
+    """Same flat (no lora_<trigger>/ subfolder) layout the checkpoint-listing
+    fix established for musubi -- the file browser must agree with it."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        cfg_dir = tmp_path / 'aitoolkit'
+        from app import config as cfg
+        cfg.save_config({'aitoolkit': {'dir': str(cfg_dir)}})
+        ds = svc.create_dataset(LOCAL_USER, 'FB6', 'FbTrig6', train_type='qwen_image')
+        ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        run_dir = lt._output_dir() / lt._run_name(ds)   # flat, no subfolder
+        run_dir.mkdir(parents=True)
+        (run_dir / 'lora_FbTrig6-000001.safetensors').write_bytes(b'x')
+
+        files = lt.list_folder_files(LOCAL_USER, ds.id, 'run')
+        assert [f['filename'] for f in files] == ['lora_FbTrig6-000001.safetensors']
+        p = lt.folder_file_path(LOCAL_USER, ds.id, 'run', 'lora_FbTrig6-000001.safetensors')
+        assert p == str(run_dir / 'lora_FbTrig6-000001.safetensors')
+
+
 def test_imported_list_shows_cloud_named_checkpoints(app, tmp_path):
     """Cloud-trained LoRA land in the same ComfyUI folder but named after the
     pod job (lds<N>_…), not lora_<trigger>… — the trigger-boundary filter hid
