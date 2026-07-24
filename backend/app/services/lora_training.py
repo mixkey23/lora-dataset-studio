@@ -4565,10 +4565,18 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         # write it, then run BOTH pre-caching scripts to completion (blocking,
         # BEFORE any training_in_progress/PID bookkeeping below: a precache
         # failure must never register a run as in progress).
+        _musubi_res = _profile['resolution'] if _profile else max(_train_res(ds))
         config_path = musubi_tuner.write_dataset_toml(
-            dataset_folder, f'{dataset_folder}_musubi_cache',
-            resolution=(_profile['resolution'] if _profile else max(_train_res(ds))))
+            dataset_folder, f'{dataset_folder}_musubi_cache', resolution=_musubi_res)
         musubi_tuner.run_precache(config_path, _model_version, log_path)
+        # Training-time sample previews (musubi produced NONE before this —
+        # reuses the exact same prompt list ai-toolkit's own sample block
+        # resolves, see _sample_prompts()) so the Runs-hub card gets a real
+        # thumbnail instead of the generic family tile.
+        _musubi_sample_prompts_path = musubi_tuner.write_sample_prompts(
+            _sample_prompts(ds, _safe_trigger(ds)),
+            f'{dataset_folder}_musubi_samples.txt',
+            width=_musubi_res, height=_musubi_res)
     else:
         config_path = write_job_config(ds, dataset_folder, steps=steps)
     # The authoritative live-run check, identity state and PID publication are
@@ -4640,7 +4648,8 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
                     blocks_to_swap=(_profile['blocks_to_swap'] if _profile else 0),
                     network_alpha=(_profile['alpha'] if _profile else None),
                     weighting_scheme=(_profile['weighting_scheme'] if _profile else 'none'),
-                    optimizer_args=(_profile['optimizer_args'] if _profile else None))
+                    optimizer_args=(_profile['optimizer_args'] if _profile else None),
+                    sample_prompts=_musubi_sample_prompts_path)
                 proc = musubi_tuner.spawn_training(
                     argv, cwd=str(musubi_tuner.musubi_dir()), env=env, log_path=log_path)
             else:

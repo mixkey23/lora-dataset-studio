@@ -351,6 +351,71 @@ def test_build_train_argv_optimizer_args_emitted_as_one_flag_with_multiple_value
     assert argv[i + 1:i + 3] == ['scale_parameter=False', 'relative_step=False']
 
 
+# --- build_train_argv() sample_prompts (training-time previews) -------------
+
+def test_build_train_argv_sample_prompts_omitted_by_default(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo')
+    assert '--sample_prompts' not in argv
+    assert '--sample_every_n_epochs' not in argv
+    assert '--sample_at_first' not in argv
+
+
+def test_build_train_argv_sample_prompts_emitted_when_set(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            sample_prompts='/x/ds_musubi_samples.txt', sample_every_n_epochs=3)
+    i = argv.index('--sample_prompts')
+    assert argv[i + 1] == '/x/ds_musubi_samples.txt'
+    j = argv.index('--sample_every_n_epochs')
+    assert argv[j + 1] == '3'
+    assert '--sample_at_first' in argv
+
+
+def test_build_train_argv_sample_at_first_can_be_disabled(app, tmp_path):
+    from app.services import musubi_tuner as mt
+    _configure_musubi(tmp_path, app, with_weights=True)
+    with app.app_context():
+        argv = mt.build_train_argv(
+            toml_path='/x/ds.toml', model_version='original', rank=32,
+            learning_rate=5e-5, optimizer='adamw8bit', timestep_type='shift',
+            max_train_epochs=16, output_dir='/x/out', output_name='lora_foo',
+            sample_prompts='/x/samples.txt', sample_at_first=False)
+    assert '--sample_at_first' not in argv
+
+
+def test_write_sample_prompts_one_line_per_prompt_with_wh_s_flags(tmp_path):
+    from app.services import musubi_tuner as mt
+    out = tmp_path / 'samples.txt'
+    path = mt.write_sample_prompts(
+        ['a photo of sks person', 'sks person smiling'], str(out),
+        width=1328, height=1328, steps=20)
+    assert path == str(out)
+    lines = out.read_text(encoding='utf-8').strip().splitlines()
+    assert lines == [
+        'a photo of sks person --w 1328 --h 1328 --s 20',
+        'sks person smiling --w 1328 --h 1328 --s 20',
+    ]
+
+
+def test_write_sample_prompts_skips_falsy_entries(tmp_path):
+    from app.services import musubi_tuner as mt
+    out = tmp_path / 'samples.txt'
+    mt.write_sample_prompts(['ok prompt', '', None], str(out), width=512, height=512, steps=10)
+    lines = out.read_text(encoding='utf-8').strip().splitlines()
+    assert lines == ['ok prompt --w 512 --h 512 --s 10']
+
+
 # --- MUSUBI_PROFILES ---------------------------------------------------------
 
 _EXPECTED_PROFILES = {'vram48', 'vram29', 'rtx5090', 'vram22', 'vram11', 'vram5'}

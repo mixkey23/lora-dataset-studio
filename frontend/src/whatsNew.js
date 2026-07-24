@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-24-musubi-sample-previews',
+    date: '2026-07-24',
+    title: '📸 musubi-tuner runs now generate preview thumbnails too',
+    blurb:
+      "Qwen-Image training via the musubi-tuner engine now generates sample images during the run (same prompts ai-toolkit already uses) so the Runs-hub card shows a real thumbnail instead of the generic family tile. (The Graph tab's per-checkpoint pill previews are a separate, still-unsupported mechanism for Qwen-Image — that's next.)",
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-24-training-folder-browser',
     date: '2026-07-24',
     title: '🗂 Browse and download training files without a file manager',

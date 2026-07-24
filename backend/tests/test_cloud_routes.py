@@ -397,6 +397,39 @@ def test_run_preview_local_record(client, app, monkeypatch, tmp_path):
     assert row['preview_url'] == f'/api/dataset/train/runs/rec-{rec_id}/preview'
 
 
+def test_run_preview_local_record_musubi_engine_reads_singular_sample_dir(client, app, monkeypatch, tmp_path):
+    """A qwen_image dataset trained via the musubi engine writes its
+    training-time previews to <run_dir>/sample/ (singular — kohya's own
+    convention, confirmed against docs/sampling_during_training.md), NOT
+    ai-toolkit's samples/ (plural) — _run_samples_dir must pick the right
+    one per the run's actual engine."""
+    ds = client.post('/api/dataset/create',
+                     json={'name': 'Qwen1', 'trigger_word': 'qw1',
+                           'train_type': 'qwen_image'}).get_json()['id']
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        row = svc.get_dataset(LOCAL_USER, ds)
+        row.train_engine = 'musubi'
+        svc.db.session.commit()
+    run_dir = tmp_path / 'lora_qw1'
+    (run_dir / 'sample').mkdir(parents=True)
+    (run_dir / 'sample' / '170__100_0.jpg').write_bytes(b'MUSUBI-SAMPLE')
+    from app.extensions import db
+    from app.models import TrainingRunRecord
+    with app.app_context():
+        rec = TrainingRunRecord(dataset_id=ds, family='qwen_image', source='local',
+                                fingerprint='fp', version=1, steps=1000,
+                                masked=True)
+        db.session.add(rec)
+        db.session.commit()
+        rec_id = rec.id
+    monkeypatch.setattr('app.services.lora_training._run_dir',
+                        lambda *a, **k: str(run_dir))
+    r = client.get(f'/api/dataset/train/runs/rec-{rec_id}/preview')
+    assert r.status_code == 200 and r.data == b'MUSUBI-SAMPLE'
+
+
 def test_run_preview_unknown_or_sampleless_404(client, app, monkeypatch, tmp_path):
     """Unknown keys and runs that left no sample 404; their rows carry no
     preview_url (the hub falls back to the family tile)."""

@@ -180,6 +180,8 @@ A second, optional local training engine — [kohya-ss/musubi-tuner](https://git
 
 None of these four weight files are downloaded by this app — point them at files you already have (a shared ComfyUI `models/` folder works fine). **Continuing/resuming a stopped run isn't available on the musubi-tuner engine yet** — every musubi launch starts fresh; use ai-toolkit if you need to resume a run.
 
+musubi-tuner runs also generate sample preview images during training (same prompts as ai-toolkit's own sample block), so the Runs-hub card shows a real thumbnail instead of the generic family tile — no setting to configure, this is automatic.
+
 **GPU profile** (Training panel → Advanced options → Expert, only shown when the musubi-tuner engine is selected) — six ready-made, per-VRAM-tier recipes so a run fits your card without hand-tuning flags. Each profile is a FULL recipe (rank, alpha, optimizer, learning rate, weighting scheme, resolution — not just VRAM knobs), taken 1:1 from a real, field-tested config shipped by a third-party musubi-tuner GUI ([SECourses_Musubi_Trainer](https://github.com/FurkanGozukara/SECourses_Musubi_Trainer)'s `Qwen_Training_Configs/LoRA_Training`), not guessed:
 
 | Profile | Rank / alpha | fp8 | Block-swap | Resolution | ~VRAM |

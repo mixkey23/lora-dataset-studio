@@ -1993,18 +1993,22 @@ def _latest_sample_name(samples_dir):
 
 
 def _run_samples_dir(crun, rec):
-    """Samples dir of a run — cloud: its staging download; local: the
-    ai-toolkit run dir stamped on its registry row. None when unresolvable
-    (purged staging, ai-toolkit not configured, deleted dataset)."""
+    """Samples dir of a run — cloud: its staging download (always ai-toolkit,
+    cloud training has no musubi path); local: the run dir stamped on its
+    registry row. None when unresolvable (purged staging, engine not
+    configured, deleted dataset). Folder name differs per engine: ai-toolkit
+    writes `samples/`, musubi-tuner's own `--sample_prompts` flow (confirmed
+    in docs/sampling_during_training.md) writes `sample/` (singular)."""
     if crun is not None and crun.staging_dir:
         return os.path.join(crun.staging_dir, 'samples')
     if rec is not None and rec.source == 'local':
         try:
-            return os.path.join(
-                lt._run_dir(cfg.LOCAL_USER, rec.dataset_id,
-                            base_model=rec.base_model or '',
-                            family=rec.family, variant=rec.variant),
-                'samples')
+            run_dir = lt._run_dir(cfg.LOCAL_USER, rec.dataset_id,
+                                  base_model=rec.base_model or '',
+                                  family=rec.family, variant=rec.variant)
+            ds = fds.get_dataset(cfg.LOCAL_USER, rec.dataset_id)
+            engine = lt._train_engine(ds, family=rec.family) if ds else 'aitoolkit'
+            return os.path.join(run_dir, 'sample' if engine == 'musubi' else 'samples')
         except Exception:
             return None
     return None

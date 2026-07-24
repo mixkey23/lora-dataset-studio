@@ -275,6 +275,19 @@ def write_dataset_toml(dataset_folder: str, cache_dir: str, resolution: int,
     return toml_path
 
 
+def write_sample_prompts(prompts: list, path: str, width: int = 1024,
+                         height: int = 1024, steps: int = 20) -> str:
+    """Writes musubi-tuner's `--sample_prompts` file (docs/sampling_during_training.md:
+    one prompt per line, trailing `--w --h --s` flags per line, `#` comments).
+    `prompts` is the SAME list `lora_training._sample_prompts(ds, trigger)`
+    already resolves for ai-toolkit's sample block — reused as-is so both
+    engines preview identical prompts, just through a different file format."""
+    lines = [f'{p} --w {width} --h {height} --s {steps}' for p in prompts if p]
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path
+
+
 def _run_step(argv: list, cwd: str, env: dict, log_path: str, step_label: str) -> None:
     """Runs one pre-caching step to completion (blocking), appending its
     output to `log_path`. Raises RuntimeError with the log tail on a
@@ -322,7 +335,10 @@ def build_train_argv(toml_path: str, model_version: str, rank: int,
                      fp8_scaled: bool = False, blocks_to_swap: int = 0,
                      network_alpha: int | None = None,
                      weighting_scheme: str = 'none',
-                     optimizer_args: tuple | list | None = None) -> list:
+                     optimizer_args: tuple | list | None = None,
+                     sample_prompts: str | None = None,
+                     sample_every_n_epochs: int = 1,
+                     sample_at_first: bool = True) -> list:
     """Pure function: the accelerate-launch argv for qwen_image_train_network.py.
     Rank/lr/optimizer/weighting_scheme/network_alpha come from lora_training.py
     — either the shared family-scoped helpers (Auto/no profile: unchanged
@@ -347,7 +363,15 @@ def build_train_argv(toml_path: str, model_version: str, rank: int,
     real, shipped tier configs (see module docstring), not the kohya-ss doc
     directly. `optimizer_args` (e.g. AdaFactor's scale_parameter=False etc.)
     is emitted as one `--optimizer_args k=v k2=v2 ...` flag, a standard
-    kohya-ecosystem convention — omitted entirely when falsy."""
+    kohya-ecosystem convention — omitted entirely when falsy.
+
+    `sample_prompts` (a path from write_sample_prompts(), or None to omit
+    the whole sampling block — musubi produced no preview images at all
+    before this) enables musubi's own training-time preview generation
+    (docs/sampling_during_training.md, confirmed flags): writes PNGs into
+    `<output_dir>/sample/`, which cloud_training.py's Runs-hub thumbnail
+    already reads generically (samples-dir path only needed a folder-name
+    fix, no new reader logic)."""
     weights = qwen_image_weights()
     sampling = timestep_type if timestep_type in ('shift', 'sigmoid', 'uniform') else 'shift'
     argv = [
@@ -377,6 +401,11 @@ def build_train_argv(toml_path: str, model_version: str, rank: int,
             argv.append('--fp8_scaled')
     if blocks_to_swap and blocks_to_swap > 0:
         argv += ['--blocks_to_swap', str(blocks_to_swap)]
+    if sample_prompts:
+        argv += ['--sample_prompts', sample_prompts,
+                 '--sample_every_n_epochs', str(max(1, sample_every_n_epochs))]
+        if sample_at_first:
+            argv.append('--sample_at_first')
     return argv
 
 
