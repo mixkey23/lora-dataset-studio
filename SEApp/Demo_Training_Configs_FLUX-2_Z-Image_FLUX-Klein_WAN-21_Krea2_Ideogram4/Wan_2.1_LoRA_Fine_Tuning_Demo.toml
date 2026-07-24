@@ -1,0 +1,63 @@
+# Wan 2.1 is fine-tuned through LoRA because this backend has no full-Wan trainer.
+training_mode = "LoRA Training"
+task = "t2v-14B"
+dit = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Wan/wan2.1_t2v_14B_bf16.safetensors"
+vae = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Wan/Wan2_1_VAE_bf16.safetensors"
+t5 = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Wan/umt5-xxl-enc-bf16.safetensors"
+clip = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Wan/models_clip_open-clip-xlm-roberta-large-vit-huge-14.safetensors"
+
+dataset_config_mode = "Generate from Folder Structure"
+parent_folder_path = "C:/Users/Furkan/Pictures/demo_training_videos"
+dataset_resolution_width = 960
+dataset_resolution_height = 544
+dataset_caption_extension = ".txt"
+dataset_batch_size = 1
+dataset_enable_bucket = true
+dataset_bucket_no_upscale = false
+dataset_cache_directory = "cache_dir"
+target_frames = 17
+
+mixed_precision = "bf16"
+fp8_base = true
+fp8_scaled = true
+fp8_t5 = true
+blocks_to_swap = 38
+use_pinned_memory_for_block_swap = true
+block_swap_h2d_only = true
+block_swap_ring_size = 1
+gradient_checkpointing = true
+gradient_accumulation_steps = 1
+
+network_module = "networks.lora_wan"
+network_dim = 32
+network_alpha = 32
+network_dropout = 0
+optimizer_type = "AdaFactor"
+optimizer_args = ["scale_parameter=False", "relative_step=False", "warmup_init=False", "weight_decay=0.01"]
+learning_rate = 6e-5
+max_grad_norm = 0
+lr_scheduler = "constant"
+
+timestep_sampling = "sigma"
+weighting_scheme = "none"
+discrete_flow_shift = 5.0
+sdpa = true
+max_train_epochs = 200
+max_train_steps = 80000
+max_data_loader_n_workers = 2
+persistent_data_loader_workers = true
+seed = 42
+
+output_dir = "G:/SECourses_Musubi_Trainer_v29/Training_Outputs_Wan_2.1_LoRA"
+output_name = "My_Wan_2.1_T2V_LoRA"
+save_precision = "bf16"
+save_every_n_epochs = 1
+save_every_n_steps = 0
+save_state = false
+
+num_processes = 1
+num_machines = 1
+gpu_ids = "0"
+num_cpu_threads_per_process = 1
+dynamo_backend = "no"
+

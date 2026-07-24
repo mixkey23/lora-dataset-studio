@@ -1,0 +1,82 @@
+# Ideogram 4 full-DiT fine-tuning requires a plain FP32/FP16/BF16 conditional DiT.
+# The official ideogram4_fp8_scaled.safetensors file is intentionally not selected.
+training_mode = "Full Fine-Tuning"
+dit = ""
+vae = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Ideogram_4/flux2-vae.safetensors"
+text_encoder = "G:/SECourses_Musubi_Trainer_v29/Training_Models_Ideogram_4/qwen3vl_8b_fp8_scaled.safetensors"
+unconditional_dit = ""
+dit_dtype = "bfloat16"
+vae_dtype = "bfloat16"
+
+dataset_config_mode = "Generate from Folder Structure"
+parent_folder_path = "C:/Users/Furkan/Pictures/demo_training_images"
+dataset_resolution_width = 1024
+dataset_resolution_height = 1024
+dataset_caption_extension = ".txt"
+dataset_batch_size = 1
+dataset_enable_bucket = true
+dataset_bucket_no_upscale = false
+dataset_cache_directory = "cache_dir"
+
+mixed_precision = "bf16"
+full_bf16 = true
+full_fp16 = false
+save_precision = "bf16"
+fp8_base = false
+fp8_scaled = false
+blocks_to_swap = 32
+use_pinned_memory_for_block_swap = true
+block_swap_h2d_only = false
+block_swap_ring_size = 1
+gradient_checkpointing = true
+gradient_accumulation_steps = 1
+
+optimizer_type = "AdaFactor"
+optimizer_args = ["scale_parameter=False", "relative_step=False", "warmup_init=False", "weight_decay=0.01"]
+learning_rate = 1e-5
+max_grad_norm = 0
+fused_backward_pass = true
+block_swap_optimizer_patch_params = false
+lr_scheduler = "constant_with_warmup"
+lr_warmup_steps = 10
+
+timestep_sampling = "ideogram4_shift"
+weighting_scheme = "none"
+discrete_flow_shift = 1.0
+max_timestep = 1000
+sampler_preset = "V4_DEFAULT_20"
+initial_sigma = 1.004
+sdpa = true
+max_train_epochs = 200
+max_train_steps = 80000
+max_data_loader_n_workers = 1
+persistent_data_loader_workers = true
+seed = 42
+
+cache_latents = true
+caching_latent_device = "cuda"
+caching_latent_batch_size = 1
+caching_latent_num_workers = 1
+caching_latent_skip_existing = true
+caching_latent_keep_cache = true
+cache_text_encoder_outputs = true
+caching_teo_device = "cuda"
+caching_teo_batch_size = 1
+caching_teo_num_workers = 1
+caching_teo_skip_existing = true
+caching_teo_keep_cache = true
+caching_teo_text_cache_dtype = "bf16"
+
+output_dir = "G:/SECourses_Musubi_Trainer_v29/Training_Outputs_Ideogram_4_Fine_Tuning"
+output_name = "My_Ideogram_4_Full_DiT"
+save_every_n_epochs = 1
+save_every_n_steps = 0
+save_state = true
+save_state_on_train_end = true
+mem_eff_save = true
+
+num_processes = 1
+num_machines = 1
+gpu_ids = "0"
+num_cpu_threads_per_process = 1
+dynamo_backend = "no"

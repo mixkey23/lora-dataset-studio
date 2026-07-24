@@ -1,0 +1,69 @@
+
+Fast Upload Download Data HuggingFace Tutorial : https://youtu.be/X5WVZ0NMaTg
+
+SIMPLEPOD CHEAPER AND FASTER THAN RUNPOD
+
+Now we fully support SimplePod as well please use this link to register : https://simplepod.ai/ref?user=secourses
+
+SimplePod is faster and cheaper than RunPod and works exactly same
+
+Please use this template on SimplePod : https://dash.simplepod.ai/account/explore/100/ref-secourses/
+
+For permanent storage, generate it from Storage tab with any name and size you want and when selecting template with above link, click Edit and Use, select Persistence Volume and change mount point to /workspace
+
+Up-to-date (22 June 2026) SimplePod tutorial (including how to use permanent storage) starting from 1:03:25 : https://youtu.be/9C_6qNKjgpA?si=ge1XvDomYQ7ssvMu&t=3805
+
+RUNPOD
+
+Please register for RunPod at: https://get.runpod.io/955rkuppqv4h
+
+Up-to-date (22 June 2026) RunPod tutorial (including how to use permanent storage) starting from 31:01 : https://youtu.be/9C_6qNKjgpA?si=vEXM_L4V1L768f9f&t=1861
+
+Select this template mandatory (based on official Runpod Pytorch template) : https://get.runpod.io/SECourses_CU13
+
+Recommended GPU is RTX PRO 5090, but you can use any GPU. The more VRAM it is better
+
+You can edit template and change Volume Disk size. it is by default 200 GB and should be sufficient without any changes
+
+You can also use your permanent storage system - from filters select CUDA 12.8, 12.9, 13 and so on to get newer NVIDIA driver - only NVIDIA driver matter it must be 570+ for CUDA 13
+
+Upload zip file into workspace and extract there or extract in your system and upload all files into workspace
+
+Start a new terminal
+
+To install run below command
+
+export UV_THREADPOOL_SIZE=8
+pip install huggingface_hub hf_xet hf_transfer requests
+export HF_HOME="/workspace"
+chmod +x RunPod_Install_Musubi_Trainer.sh
+./RunPod_Install_Musubi_Trainer.sh
+
+To automatically download training models into /workspace folder open a new terminal in the folder and execute below commands
+
+You can run this command same time as installation with opening another terminal
+
+Then download models (choose which model you want):
+
+apt clean
+rm -rf /var/cache/apt/archives/*
+apt update
+apt install -y aria2
+pip install huggingface_hub hf_xet hf_transfer requests
+python Download_Train_Models.py
+
+This above command will ask you which model to download choose from menu
+
+Option 13 downloads Ideogram 4 into Training_Models_Ideogram_4.
+
+Option 14 downloads Krea 2 into Training_Models_Krea_2. The source file raw.safetensors is saved as Krea_2_Raw_Base.safetensors.
+
+To run the app again after installation later run below command - installation will auto start the app so use this later for re-starting the app
+
+cd /workspace/SECourses_Musubi_Trainer
+git pull
+source venv/bin/activate
+unset LD_LIBRARY_PATH
+python gui.py --share
+
+

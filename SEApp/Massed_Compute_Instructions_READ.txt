@@ -1,0 +1,63 @@
+
+
+Fast Upload Download Data HuggingFace Tutorial : https://youtu.be/X5WVZ0NMaTg
+
+Register for Massed Compute using the following link I appreicate that a lot:
+https://vm.massedcompute.com/signup?linkId=lp_034338&sourceId=secourses&tenantId=massed-compute
+
+Up-to-date (22 June 2026) Massed Compute tutorial starting from 53:36 : https://youtu.be/9C_6qNKjgpA?si=BGBn10rYXzjZbSdq&t=3216
+
+We have a special coupon for all GPUs : SECourses
+
+If you want to learn more about GPUs and prices read this link : https://www.patreon.com/posts/126671823
+
+Recommended GPU is RTX PRO 6000 - best F/P and for best performance select H200
+
+But app works with any GPU, the more VRAM it is better
+
+Use thinclient or login patreon on Massed Compute to download files on to your Massed Compute
+
+Put everything into a folder in like desktop or downloads
+
+Don't run scripts from inside of synchronization folder 
+
+Move zip file into downloads folder and extract there
+
+Open a terminal in the folder where you did put the files
+
+To install run below command
+
+It will first install our advanced trainer with Kohya Musubi Tuner backend and start it
+
+pip install huggingface_hub hf_xet hf_transfer requests
+chmod +x Massed_Compute_Install.sh
+./Massed_Compute_Install.sh
+
+Then Our Advanced Trainer GUI will automatically start in browser with following URL and browser will be opened : http://127.0.0.1:7860
+
+To automatically download training models open a new terminal in the folder and execute below commands
+
+You can run this command same time as installation with opening another terminal
+
+Then download models (choose which model you want):
+
+sudo apt clean
+rm -rf /var/cache/apt/archives/*
+sudo apt update
+sudo apt install -y aria2
+pip install huggingface_hub hf_xet hf_transfer requests
+python3 Download_Train_Models.py
+
+This above command will ask you which model to download choose from menu
+
+Option 13 downloads Ideogram 4 into Training_Models_Ideogram_4.
+
+Option 14 downloads Krea 2 into Training_Models_Krea_2. The source file raw.safetensors is saved as Krea_2_Raw_Base.safetensors.
+
+To run it again after install just open a CMD where you installed - installation will auto start the app so use this later for re-starting the app
+
+cd SECourses_Musubi_Trainer
+git pull
+source venv/bin/activate
+unset LD_LIBRARY_PATH
+python3 gui.py --share
