@@ -782,7 +782,11 @@ def _parse_trained_stem(filename: str, trigger: str | None = None):
          famille connu (`_FAMILY_BASE_TAGS`), le trigger = tout ce qui le précède.
       4. Sinon, repli legacy : ``tokens[0]`` (triggers mono-token + noms de merge
          tiers ``lora_Lola2_mopMix_pornmaster`` où la frontière est indevinable)."""
-    stem = os.path.basename(filename).rsplit('.', 1)[0]
+    # os.path.basename only splits on '/' on POSIX (the CI/prod host), so a
+    # ComfyUI-style 'krea\lora_...' path kept its folder prefix on Linux and
+    # never matched the 'lora_' convention below (bug: label silently fell
+    # back to the raw filename, e.g. test_underscore_trigger_labels_faithfully_in_studio).
+    stem = (filename or '').replace('\\', '/').rsplit('/', 1)[-1].rsplit('.', 1)[0]
     if not stem.lower().startswith('lora_'):
         return None
     body = stem[len('lora_'):]
