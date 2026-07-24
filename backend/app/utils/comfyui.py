@@ -1180,7 +1180,15 @@ def get_qwen_image_models():
     """List Qwen-Image UNET checkpoints (base T2I and Edit-2511 both live in
     the same ComfyUI 'QwenImage'/'qwen_image' subfolder — there's no
     filesystem split between the two, same as loras below). Mirrors
-    get_krea_models()'s shape/cache/output form."""
+    get_krea_models()'s shape/cache form, EXCEPT the output separator: unlike
+    the other family getters (which hardcode backslash), this one emits
+    forward slash — confirmed via a real /object_info dump (2026-07-24, repo
+    owner's own ComfyUI) that its LoraLoaderModelOnly combo lists Qwen-Image
+    entries as 'qwen_image/name.safetensors', not backslash-joined; sending
+    the wrong separator back gets a 400 value_not_in_list, ComfyUI does no
+    separator normalization on the incoming value. Not generalized to the
+    other getters — unverified there, and this repo's convention is to only
+    change what's been confirmed."""
     current_time = time.time()
     if (_qwen_image_models_cache["data"] is not None
             and current_time - _qwen_image_models_cache["timestamp"] < _MODEL_CACHE_TTL):
@@ -1202,7 +1210,7 @@ def get_qwen_image_models():
                     for f in files:
                         if f.lower().endswith((".safetensors", ".gguf", ".sft")):
                             rel = f if rel_dir == "." else os.path.join(rel_dir, f)
-                            out.append(rel.replace("/", "\\"))
+                            out.append(rel.replace("\\", "/"))
             out = sorted(set(out))
         except Exception as e:
             logger.error(f"get_qwen_image_models error: {e}")
@@ -1308,7 +1316,10 @@ def get_qwen_image_loras():
     own base tag (`_Qwen-Image` vs `_Qwen-Image-Edit-2511`, from
     lora_training.QWEN_IMAGE_BASE_LABELS) — 'image' is the safe fallback for
     an undetectable/legacy filename (Test Studio's simpler, non-reference
-    generation mode). Mirrors get_krea_loras()'s shape/output form otherwise."""
+    generation mode). Mirrors get_krea_loras()'s shape otherwise, EXCEPT the
+    output separator — forward slash, confirmed via a real /object_info dump
+    (2026-07-24) against the repo owner's own ComfyUI; see get_qwen_image_models()
+    for the full explanation."""
     out = []
     lora_dir = _lora_dir()
     try:
@@ -1321,7 +1332,7 @@ def get_qwen_image_loras():
                 for f in sorted(files):
                     if not f.lower().endswith(".safetensors"):
                         continue
-                    rel = (f if rel_dir == "." else os.path.join(rel_dir, f)).replace("/", "\\")
+                    rel = (f if rel_dir == "." else os.path.join(rel_dir, f)).replace("\\", "/")
                     triggers = _extract_klein_triggers(f)
                     grp, stp = trained_lora_group(f, 'qwen_image')
                     variant = 'edit' if 'edit-2511' in f.lower() else 'image'

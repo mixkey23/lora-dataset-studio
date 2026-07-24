@@ -10,6 +10,7 @@ status, cancel) stays reachable even when ComfyUI is offline so run history
 never goes dark.
 """
 import base64
+import re
 
 from flask import Blueprint, jsonify, request
 
@@ -58,7 +59,9 @@ def studio_base_models():
         out += [{'filename': m, 'label': m.split('\\')[-1].rsplit('.', 1)[0]} for m in alts]
         return jsonify({'models': out})
     if kind == 'qwen_image':
-        out = [{'filename': m, 'label': m.split('\\')[-1]} for m in get_qwen_image_models()]
+        # Qwen-Image filenames use forward slash (see get_qwen_image_models),
+        # unlike the backslash-joined form the other kinds' labels split on.
+        out = [{'filename': m, 'label': re.split(r'[\\/]', m)[-1]} for m in get_qwen_image_models()]
         return jsonify({'models': out})
     out = [{'filename': m, 'label': m.split('\\')[-1]} for m in get_zimage_models()]
     return jsonify({'models': out})

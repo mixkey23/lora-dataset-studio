@@ -52,6 +52,21 @@ def test_get_qwen_image_loras_detects_variant_from_filename(app, tmp_path):
         assert edit['variant'] == 'edit'
 
 
+def test_get_qwen_image_loras_uses_forward_slash_not_backslash(app, tmp_path):
+    """Real bug, repo owner's own ComfyUI (2026-07-24): its /object_info lists
+    Qwen-Image LoRAs as 'qwen_image/name.safetensors' (forward slash), unlike
+    every other family getter here which hardcodes backslash — sending
+    backslash got a 400 value_not_in_list, since ComfyUI does no separator
+    normalization on the incoming prompt value."""
+    from app import config as cfg
+    from app.utils.comfyui import get_qwen_image_loras
+    with app.app_context():
+        _comfy(tmp_path, cfg)
+        for l in get_qwen_image_loras():
+            assert '\\' not in l['filename']
+            assert l['filename'].startswith('qwen_image/')
+
+
 def test_get_qwen_image_models_scans_qwenimage_folder(app, tmp_path):
     from app import config as cfg
     from app.utils.comfyui import get_qwen_image_models
@@ -77,7 +92,7 @@ def test_cell_workflow_qwen_image_t2i_loads_t2i_workflow_and_injects_lora(app, t
     from app.services import lora_test_studio as lts
     with app.app_context():
         _comfy(tmp_path, cfg)
-        checkpoint = 'qwen_image\\lora_qw1_000001000_Qwen-Image.safetensors'
+        checkpoint = 'qwen_image/lora_qw1_000001000_Qwen-Image.safetensors'
         workflow = lts._build_cell_workflow(
             user_id='local', checkpoint=checkpoint, strength=0.9, prompt='a portrait',
             seed=7, z_model=None, allowed_loras={checkpoint}, dataset_id=1,
@@ -105,7 +120,7 @@ def test_variant_lookup_defaults_to_image_when_checkpoint_not_in_pool(app, tmp_p
     with app.app_context():
         _comfy(tmp_path, cfg)
         pool = {l['filename']: l for l in get_qwen_image_loras()}
-        ghost = 'qwen_image\\lora_ghost_000001000_Qwen-Image-Edit-2511.safetensors'
+        ghost = 'qwen_image/lora_ghost_000001000_Qwen-Image-Edit-2511.safetensors'
         assert (pool.get(ghost) or {}).get('variant', 'image') == 'image'
 
 
@@ -127,7 +142,7 @@ def test_cell_workflow_qwen_image_edit_uses_dataset_reference_image(app, tmp_pat
         cfg_orig = fds_mod._dataset_dir
         fds_mod._dataset_dir = lambda _id: str(ds_dir)
         try:
-            checkpoint = 'qwen_image\\lora_qw1_000001000_Qwen-Image-Edit-2511.safetensors'
+            checkpoint = 'qwen_image/lora_qw1_000001000_Qwen-Image-Edit-2511.safetensors'
             workflow = lts._build_cell_workflow(
                 user_id=LOCAL_USER, checkpoint=checkpoint, strength=1.1,
                 prompt='rotate to a 3/4 profile', seed=3, z_model=None,
@@ -153,7 +168,7 @@ def test_apply_qwen_image_edit_test_settings_raises_without_reference_image(app,
         svc.db.session.commit()
         # Reuses the qw1-named checkpoint already installed by _comfy() — variant
         # detection is purely filename-based, unrelated to this dataset's trigger.
-        checkpoint = 'qwen_image\\lora_qw1_000001000_Qwen-Image-Edit-2511.safetensors'
+        checkpoint = 'qwen_image/lora_qw1_000001000_Qwen-Image-Edit-2511.safetensors'
         with pytest.raises(ValueError, match='no reference image'):
             lts._build_cell_workflow(
                 user_id=LOCAL_USER, checkpoint=checkpoint, strength=1.0, prompt='x',
