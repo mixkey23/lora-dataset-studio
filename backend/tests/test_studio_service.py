@@ -47,6 +47,22 @@ def test_build_matrix_accepts_negative_strengths_down_to_minus_2(app):
             build_matrix(['a.safetensors'], [bad])
 
 
+def test_cell_workflow_filename_prefix_carries_studio_prefix(app):
+    """Repo owner's request (2026-07-24): Test Studio's own ComfyUI output
+    files must be identifiable at a glance in ComfyUI's output/ folder —
+    the SaveImage filename_prefix now always starts with 'studio_'."""
+    from app.services import lora_test_studio as lts
+    with app.app_context():
+        checkpoint = 'z image\\lora_zt_000001000.safetensors'
+        workflow = lts._build_cell_workflow(
+            user_id='local', checkpoint=checkpoint, strength=1.0, prompt='a prompt',
+            seed=42, z_model=None, allowed_loras={checkpoint}, dataset_id=1,
+            train_type='zimage', trigger_word='zt')
+        save = next(n for n in workflow.values()
+                   if isinstance(n, dict) and n.get('class_type') == 'SaveImage')
+        assert save['inputs']['filename_prefix'].startswith('studio_')
+
+
 def test_cell_workflow_carries_extended_strength_unclamped(app):
     """A > 2.0 test strength must reach the LoraLoader as-is (no silent clamp back
     to the old 2.0 ceiling) so the exaggerated effect is actually rendered."""

@@ -1027,7 +1027,10 @@ def _build_cell_workflow(user_id, checkpoint, strength, prompt, seed, z_model,
     # Trigger word auto-injecté ICI (montage seul) - le prompt reste brut en base.
     prompt = _prompt_with_trigger(prompt, trigger_word)
     ds_tag = f"d{dataset_id}_" if dataset_id is not None else ""
-    fname = f"{user_id}_{ds_tag}LoraTest_{uuid.uuid4().hex[:8]}"
+    # 'studio_' prefix (repo owner's request, 2026-07-24) so Test Studio's own
+    # ComfyUI output files are identifiable at a glance in ComfyUI's output/
+    # folder, next to Klein/Generate-variations/training-sample files.
+    fname = f"studio_{user_id}_{ds_tag}LoraTest_{uuid.uuid4().hex[:8]}"
     extra_loras = extra_loras or []
     if (train_type or 'zimage').lower() == 'sdxl':
         workflow = load_workflow_local(str(WORKFLOW_HQ_PATH))
