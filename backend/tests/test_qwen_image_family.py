@@ -7,6 +7,8 @@ resume), the possibly-extension arch guard refuses a launch on an ai-toolkit
 that lacks the qwen_image arch (silent SD-loader fallback otherwise), and the
 cloud path stays CLOSED for this family (local-only this wave, unlike
 flux2klein)."""
+import os
+
 import pytest
 
 
@@ -223,3 +225,112 @@ def test_family_of_lora_classifies_qwen_image_folder():
     # the 'flux' prefix match must not misclassify a qwen_image folder.
     assert family_of_lora(r'flux\x.safetensors') == 'flux'
     assert FAMILY_LABELS['qwen_image'] == 'Qwen-Image'
+
+
+# --- 8) Qwen-Image-Edit control images (both engines) ----------------------------
+# Repo owner's guide (2026-07-25): character/style/concept LoRAs use a solid
+# BLACK control image (erases spatial guidance so the model places the subject
+# from the prompt alone); only a genuine before/after edit-pair dataset would
+# use the real source image, and this app has no dataset kind for that yet.
+
+def _add_kept_image(ds, filename='src.png', size=(48, 32), color=(200, 30, 30)):
+    from PIL import Image
+    from app.services import face_dataset_service as svc
+    from app.models import FaceDatasetImage
+    Image.new('RGB', size, color).save(os.path.join(svc._dataset_dir(ds.id), filename))
+    svc.db.session.add(FaceDatasetImage(dataset_id=ds.id, status='keep',
+                                        filename=filename, caption='a subject, plain background'))
+    svc.db.session.commit()
+
+
+def test_export_generates_black_control_images_for_edit_variant(app, tmp_path):
+    from PIL import Image
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QCtrl', 'zchar_qctrl', train_type='qwen_image')
+        assert lt._qwen_image_is_edit(ds) is True   # unset variant -> edit (default)
+        _add_kept_image(ds, size=(48, 32))
+        out = lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False,
+                                             dest_dir=tmp_path / 'export')
+        control_dir = lt._qwen_edit_control_dir(str(out))
+        assert os.path.isdir(control_dir)
+        target_png = next((tmp_path / 'export').glob('*.png'))
+        control_png = next(p for p in os.listdir(control_dir) if p.endswith('.png'))
+        assert control_png == target_png.name   # same filename, filename-paired lookup
+        with Image.open(os.path.join(control_dir, control_png)) as im:
+            assert im.size == (48, 32)           # matches the TARGET image, not a fixed size
+            assert im.convert('RGB').getpixel((0, 0)) == (0, 0, 0)   # solid black
+            assert im.convert('RGB').getpixel((24, 16)) == (0, 0, 0)
+
+
+def test_export_omits_control_images_for_base_qwen_image_variant(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QBase', 'zchar_qbase', train_type='qwen_image')
+        ds.train_variant = 'image'   # base T2I, not Edit-2511
+        svc.db.session.commit()
+        _add_kept_image(ds)
+        out = lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False,
+                                             dest_dir=tmp_path / 'export')
+        assert not os.path.isdir(lt._qwen_edit_control_dir(str(out)))
+
+
+def test_export_omits_control_images_for_non_qwen_image_family(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'ZChar', 'zchar_zc', train_type='zimage')
+        _add_kept_image(ds)
+        out = lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False,
+                                             dest_dir=tmp_path / 'export')
+        assert not os.path.isdir(lt._qwen_edit_control_dir(str(out)))
+
+
+def test_export_clears_stale_control_dir_when_switched_to_base_variant(app, tmp_path):
+    """A dataset re-exported after switching Edit-2511 -> base T2I must not leave
+    a stale control folder for build_job_config to accidentally pick up."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QSwitch', 'zchar_qsw', train_type='qwen_image')
+        _add_kept_image(ds)
+        dest = tmp_path / 'export'
+        out = lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False, dest_dir=dest)
+        control_dir = lt._qwen_edit_control_dir(str(out))
+        assert os.path.isdir(control_dir)
+
+        ds.train_variant = 'image'
+        svc.db.session.commit()
+        lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False, dest_dir=dest)
+        assert not os.path.isdir(control_dir)
+
+
+def test_build_job_config_qwen_image_control_path_follows_variant(app, tmp_path):
+    """ai-toolkit's `control_path` (verified against toolkit/config_modules.py's
+    DatasetConfig) tracks the SAME edit/base split as name_or_path: present only
+    when the folder was actually populated by export_dataset_to_aitoolkit."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QJob', 'zchar_qjob', train_type='qwen_image')
+        _add_kept_image(ds)
+        out = lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False,
+                                             dest_dir=tmp_path / 'export')
+        proc = lt.build_job_config(ds, str(out), steps=1500,
+                                   training_folder='__test__')['config']['process'][0]
+        assert proc['datasets'][0]['control_path'] == lt._qwen_edit_control_dir(str(out))
+
+        ds.train_variant = 'image'
+        svc.db.session.commit()
+        lt.export_dataset_to_aitoolkit(LOCAL_USER, ds.id, masked=False,
+                                       dest_dir=tmp_path / 'export')
+        proc = lt.build_job_config(ds, str(out), steps=1500,
+                                   training_folder='__test__')['config']['process'][0]
+        assert 'control_path' not in proc['datasets'][0]

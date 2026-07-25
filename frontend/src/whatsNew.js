@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-25-qwen-image-edit-control-images',
+    date: '2026-07-25',
+    title: '🎯 Qwen-Image-Edit LoRAs now train correctly',
+    blurb:
+      'Training the Qwen-Image-Edit-2511 target (musubi-tuner or ai-toolkit) now auto-generates the control image each run requires — without it, training was silently falling back to plain text-to-image and skipping the edit-conditioned pass entirely.',
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-24-test-studio-output-prefix',
     date: '2026-07-24',
     title: '🔖 Test Studio\'s output files are now easy to spot',

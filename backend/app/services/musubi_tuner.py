@@ -250,13 +250,29 @@ def describe_missing_qwen_image_weights() -> list:
 
 
 def write_dataset_toml(dataset_folder: str, cache_dir: str, resolution: int,
-                       caption_ext: str = 'txt') -> str:
+                       caption_ext: str = 'txt', control_dir: str | None = None) -> str:
     """Writes the musubi-tuner dataset TOML next to `dataset_folder` (sibling
     file, `<dataset_folder>_musubi.toml`) and returns its path. Keys verified
     against docs/dataset_config.md. A single square `resolution` (no
     multi-scale bucket list like ai-toolkit) — enable_bucket stays off for
-    this first cut, kept simple over exact aspect-ratio bucketing."""
+    this first cut, kept simple over exact aspect-ratio bucketing.
+
+    `control_dir` (Qwen-Image-Edit only): when given AND it actually contains
+    files, emits `control_directory` (+ `control_resolution = [1024, 1024]`,
+    the value kohya-ss's own doc "strongly recommends" to match the official
+    implementation) — verified against docs/dataset_config.md's dedicated
+    "Qwen-Image-Edit and Qwen-Image-Edit-2509/2511" section. Without this key,
+    `qwen_image_train_network.py` silently trains `--model_version edit-2511`
+    as plain text-to-image (confirmed in its own source: `is_edit` is forced
+    False per-batch when no `latents_control_0` key is cached) — the LoRA
+    would never see the edit-conditioned forward pass at all. The caller
+    (lora_training.py) generates `control_dir`'s contents (black placeholders
+    for character/style/concept, per the app's control-image guide) — this
+    function only wires whatever it finds there into the TOML, unconditionally
+    omitting the keys when the folder is missing/empty (today's exact
+    behaviour on every other family/variant)."""
     toml_path = f'{dataset_folder}_musubi.toml'
+    has_control = bool(control_dir) and os.path.isdir(control_dir) and bool(os.listdir(control_dir))
     content = (
         '[general]\n'
         f'resolution = [{resolution}, {resolution}]\n'
@@ -270,6 +286,11 @@ def write_dataset_toml(dataset_folder: str, cache_dir: str, resolution: int,
         f'image_directory = "{dataset_folder}"\n'
         f'cache_directory = "{cache_dir}"\n'
     )
+    if has_control:
+        content += (
+            f'control_directory = "{control_dir}"\n'
+            'control_resolution = [1024, 1024]\n'
+        )
     with open(toml_path, 'w', encoding='utf-8') as fh:
         fh.write(content)
     return toml_path

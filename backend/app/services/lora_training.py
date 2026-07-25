@@ -2351,6 +2351,88 @@ def _mask_fields(dataset_folder: str) -> dict:
     return {}
 
 
+# --- Qwen-Image-Edit control images (musubi `control_directory` / ai-toolkit
+# `control_path`) --------------------------------------------------------------
+# Verified against musubi-tuner's dataset_config.md ("Qwen-Image-Edit and
+# Qwen-Image-Edit-2509/2511" section) and ai-toolkit's own DatasetConfig
+# (toolkit/config_modules.py: `control_path`, folder of same-filename images).
+# Without a control image, Qwen-Image-Edit training silently degrades to plain
+# text-to-image per batch (confirmed in musubi-tuner's own
+# qwen_image_train_network.py: `is_edit` is forced False when no control
+# latent was cached) — the LoRA never sees the edit-conditioned forward pass.
+#
+# What goes in the control folder depends on WHAT the LoRA is meant to learn
+# (repo owner's own guide, 2026-07-25):
+#   - Character / style / concept-object LoRAs: a SOLID BLACK placeholder,
+#     same size as the target image. Blanking the control image erases all
+#     spatial guidance, so the model can only place the subject/style via the
+#     PROMPT — it never "freezes" onto one pose/composition/background.
+#   - Genuine instruction-edit pairs (before -> after, e.g. "make the jacket
+#     red"): the REAL unedited source image, so the model has a structural
+#     anchor for what to keep vs. change. This app has no dataset kind for
+#     that yet (DATASET_KINDS is character/concept/style) — every kind it
+#     actually supports today uses the black placeholder.
+def _qwen_edit_control_dir(dataset_folder: str) -> str:
+    """Control-image sibling folder of an export (same naming convention as
+    `_masks_dir`: sibling folder, one image per target filename)."""
+    return f'{dataset_folder}_control'
+
+
+def _qwen_edit_control_mode(ds) -> str:
+    """'black' (solid placeholder) or 'source' (real before-image) — see the
+    module-level guide comment above `_qwen_edit_control_dir`. Every dataset
+    `kind` this app currently supports (character/concept/style/None) maps to
+    'black'; 'source' is reserved for a future genuine edit-pair dataset kind."""
+    return 'black'
+
+
+def _generate_qwen_edit_control_images(dataset_folder: str, ds) -> None:
+    """(Re)generates `_qwen_edit_control_dir(dataset_folder)` from the just-exported
+    target images — same size, same filename, so musubi/ai-toolkit's filename-paired
+    control lookup finds one per target unconditionally. Called from
+    `export_dataset_to_aitoolkit` only when the dataset is actually training the
+    Qwen-Image-Edit-2511 target (cf. `_qwen_image_is_edit`); every other
+    family/variant never creates this folder at all. Never raises — a failure here
+    must not block export; the two callers (musubi TOML / ai-toolkit job-config)
+    both degrade to "no control images" (today's exact prior behaviour) when the
+    folder ends up missing or empty."""
+    control_dir = _qwen_edit_control_dir(dataset_folder)
+    try:
+        if os.path.isdir(control_dir):
+            shutil.rmtree(control_dir)  # dérivé du dataset, jamais périmé
+        mode = _qwen_edit_control_mode(ds)
+        files = [f for f in os.listdir(dataset_folder) if f.lower().endswith('.png')]
+        if not files:
+            return
+        os.makedirs(control_dir, exist_ok=True)
+        for fname in files:
+            src = os.path.join(dataset_folder, fname)
+            dst = os.path.join(control_dir, fname)
+            if mode == 'source':
+                shutil.copyfile(src, dst)
+            else:
+                with Image.open(src) as im:
+                    size = im.size
+                Image.new('RGB', size, (0, 0, 0)).save(dst, 'PNG')
+    except OSError as e:
+        logger.warning(f'qwen_image edit control-image generation failed for '
+                       f'{dataset_folder}: {e} - training will run without control images')
+
+
+def _qwen_edit_control_fields(dataset_folder: str) -> dict:
+    """ai-toolkit job-config counterpart of `_mask_fields`: `control_path` merged
+    into the datasets entry IF `_generate_qwen_edit_control_images` actually wrote
+    something there. Absent/empty folder -> {} (plain text-to-image, today's exact
+    prior behaviour for every non-edit family/variant)."""
+    cd = _qwen_edit_control_dir(dataset_folder)
+    try:
+        if os.path.isdir(cd) and any(f.lower().endswith('.png') for f in os.listdir(cd)):
+            return {'control_path': cd}
+    except OSError:
+        pass
+    return {}
+
+
 # ai-toolkit reads dual long+short captions ONLY from a JSON caption file (folder_path
 # points at the file, keys are image paths, values {caption, caption_short}); the .txt
 # sidecar path cannot carry a short. We keep writing the .txt sidecars too so the cloud
@@ -2467,6 +2549,16 @@ def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_d
     # they never set this flag.
     queue_manager._set_system_state('training_masks_skipped', bool(masked and not masked_ok),
                                     ttl_seconds=_TRAIN_STATE_TTL)
+    # Qwen-Image-Edit-2511 control images (see the guide comment above
+    # `_qwen_edit_control_dir`) — every other family/variant never creates this
+    # folder. Regenerated on every export like masks; explicitly torn down when
+    # NOT applicable so a stale folder from an earlier edit-variant export of the
+    # SAME dataset can never leak into a later T2I/base-variant run.
+    control_dir = _qwen_edit_control_dir(out)
+    if _train_type(ds) == 'qwen_image' and _qwen_image_is_edit(ds):
+        _generate_qwen_edit_control_images(out, ds)
+    elif os.path.isdir(control_dir):
+        shutil.rmtree(control_dir, ignore_errors=True)
     logger.info(f'export dataset {dataset_id} -> {out} ({n} paires)')
     return out
 
@@ -3026,6 +3118,12 @@ def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_f
                     'cache_latents_to_disk': True,
                     'resolution': _train_res(ds),
                     **_mask_fields(dataset_folder),
+                    # Qwen-Image-Edit-2511 control images (`control_path`, ai-toolkit's
+                    # own DatasetConfig key — verified against toolkit/config_modules.py):
+                    # {} when `dataset_folder` isn't training the edit target (`is_edit`
+                    # False) or control-image generation found nothing, so a base
+                    # Qwen-Image (T2I) run is byte-identical to before this key existed.
+                    **_qwen_edit_control_fields(dataset_folder),
                 }],
                 'train': {
                     'batch_size': 1,
@@ -4566,8 +4664,12 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         # BEFORE any training_in_progress/PID bookkeeping below: a precache
         # failure must never register a run as in progress).
         _musubi_res = _profile['resolution'] if _profile else max(_train_res(ds))
+        # control_dir: {} when export_dataset_to_aitoolkit() above didn't create it
+        # (base Qwen-Image / any other family) — write_dataset_toml itself only
+        # emits control_directory when the folder actually has files in it.
         config_path = musubi_tuner.write_dataset_toml(
-            dataset_folder, f'{dataset_folder}_musubi_cache', resolution=_musubi_res)
+            dataset_folder, f'{dataset_folder}_musubi_cache', resolution=_musubi_res,
+            control_dir=_qwen_edit_control_dir(dataset_folder))
         musubi_tuner.run_precache(config_path, _model_version, log_path)
         # Training-time sample previews (musubi produced NONE before this —
         # reuses the exact same prompt list ai-toolkit's own sample block

@@ -176,6 +176,57 @@ def test_write_dataset_toml_exact_content(tmp_path):
     )
 
 
+def test_write_dataset_toml_omits_control_directory_when_missing_or_empty(tmp_path):
+    """No control_dir arg, an unset folder, and an empty folder must all produce
+    the SAME TOML as before control images existed (Qwen-Image base T2I training,
+    and every non-qwen_image family, must never see this key)."""
+    from app.services import musubi_tuner as mt
+    dataset_folder = str(tmp_path / 'ds')
+    cache_dir = str(tmp_path / 'ds_cache')
+    baseline = mt.write_dataset_toml(dataset_folder, cache_dir, resolution=1024)
+    baseline_content = open(baseline, encoding='utf-8').read()
+
+    missing_dir = str(tmp_path / 'does_not_exist')
+    out = mt.write_dataset_toml(dataset_folder, cache_dir, resolution=1024, control_dir=missing_dir)
+    assert open(out, encoding='utf-8').read() == baseline_content
+
+    empty_dir = tmp_path / 'ds_control_empty'
+    empty_dir.mkdir()
+    out = mt.write_dataset_toml(dataset_folder, cache_dir, resolution=1024, control_dir=str(empty_dir))
+    assert open(out, encoding='utf-8').read() == baseline_content
+
+
+def test_write_dataset_toml_emits_control_directory_when_populated(tmp_path):
+    """A populated control_dir adds control_directory + the kohya-ss-recommended
+    control_resolution = [1024, 1024] (verified against dataset_config.md's
+    "Qwen-Image-Edit and Qwen-Image-Edit-2509/2511" section) — never touching the
+    other keys."""
+    from app.services import musubi_tuner as mt
+    dataset_folder = str(tmp_path / 'ds')
+    cache_dir = str(tmp_path / 'ds_cache')
+    control_dir = tmp_path / 'ds_control'
+    control_dir.mkdir()
+    (control_dir / 'img_000.png').write_bytes(b'fake')
+    toml_path = mt.write_dataset_toml(dataset_folder, cache_dir, resolution=1024,
+                                      control_dir=str(control_dir))
+    content = open(toml_path, encoding='utf-8').read()
+    assert content == (
+        '[general]\n'
+        'resolution = [1024, 1024]\n'
+        'caption_extension = ".txt"\n'
+        'batch_size = 1\n'
+        'num_repeats = 1\n'
+        'enable_bucket = false\n'
+        'bucket_no_upscale = false\n'
+        '\n'
+        '[[datasets]]\n'
+        f'image_directory = "{dataset_folder}"\n'
+        f'cache_directory = "{cache_dir}"\n'
+        f'control_directory = "{control_dir}"\n'
+        'control_resolution = [1024, 1024]\n'
+    )
+
+
 # --- build_train_argv() -----------------------------------------------------
 
 def test_build_train_argv_exact_flags_model_version_original(app, tmp_path):

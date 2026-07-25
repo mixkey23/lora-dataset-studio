@@ -179,7 +179,7 @@ def test_launch_musubi_success_calls_write_precache_spawn_in_order(app, tmp_path
 
     calls = []
 
-    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt'):
+    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt', control_dir=None):
         calls.append('write_dataset_toml')
         return str(tmp_path / 'ds_musubi.toml')
 
@@ -302,7 +302,7 @@ def test_launch_musubi_profile_vram5_overrides_resolution_in_dataset_toml(app, t
 
     captured_toml = {}
 
-    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt'):
+    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt', control_dir=None):
         captured_toml['resolution'] = resolution
         return str(tmp_path / 'x.toml')
 
