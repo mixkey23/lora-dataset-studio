@@ -4407,8 +4407,14 @@ def assert_free_disk(path, min_gb, what) -> None:
             f'~{min_gb} GB needed - free up space and retry')
 
 
-def _log_tail(path: str, n: int = 30) -> str:
-    """Dernières `n` lignes d'un fichier log (pour remonter une erreur ai-toolkit)."""
+def _log_tail(path: str, n: int = 60) -> str:
+    """Dernières `n` lignes d'un fichier log (pour remonter une erreur d'entraînement).
+    `n` relevé de 30 -> 60 (bug reporté 2026-07-26) : sur musubi-tuner, `accelerate
+    launch` échoue en ré-affichant tout l'argv du sous-process lancé (un seul
+    tres long \"Command '[...]' returned non-zero exit status 1.\") avant sa
+    PROPRE traceback Python (raise CalledProcessError) — à 30 lignes, ces deux
+    seuls éléments remplissaient déjà toute la fenêtre et poussaient la VRAIE
+    erreur du script enfant (le motif réel du crash) hors de vue."""
     try:
         with open(path, encoding='utf-8', errors='replace') as fh:
             return ''.join(fh.readlines()[-n:]).strip()
@@ -4416,12 +4422,17 @@ def _log_tail(path: str, n: int = 30) -> str:
         return '(log illisible)'
 
 
-def _watch_training(app, proc, log_path, dataset_id) -> None:
-    """Thread daemon : attend la fin du process ai-toolkit puis fait avancer la
-    file (libère ComfyUI / lance le suivant) DÈS la fin, sans dépendre du polling
-    client. Sur un crash (rc≠0), remonte la fin du log. process_training_queue()
-    reste le filet de secours si Flask redémarre (le watcher meurt, le flag est
-    rattrapé au prochain poll ou à l'expiration du TTL)."""
+def _watch_training(app, proc, log_path, dataset_id, engine: str = 'aitoolkit') -> None:
+    """Thread daemon : attend la fin du process (ai-toolkit OU musubi-tuner, cf.
+    `engine`) puis fait avancer la file (libère ComfyUI / lance le suivant) DÈS
+    la fin, sans dépendre du polling client. Sur un crash (rc≠0), remonte la fin
+    du log ET l'engine réellement utilisé (bug reporté 2026-07-26 : l'UI
+    affichait toujours « ai-toolkit exited N » même pour un crash musubi-tuner,
+    donnant l'impression trompeuse que le sélecteur d'engine avait été ignoré
+    alors que musubi tournait bel et bien - seul le LIBELLÉ de l'erreur était
+    faux). process_training_queue() reste le filet de secours si Flask
+    redémarre (le watcher meurt, le flag est rattrapé au prochain poll ou à
+    l'expiration du TTL)."""
     try:
         proc.wait()
         rc = proc.returncode
@@ -4431,14 +4442,18 @@ def _watch_training(app, proc, log_path, dataset_id) -> None:
         with app.app_context():
             if rc not in (0, None):
                 tail = _log_tail(log_path)
-                logger.error("Entraînement ai-toolkit dataset %s terminé en ERREUR (rc=%s). "
-                             "Fin du log :\n%s", dataset_id, rc, tail)
+                logger.error("Entraînement %s dataset %s terminé en ERREUR (rc=%s). "
+                             "Fin du log :\n%s", engine, dataset_id, rc, tail)
                 # Surface l'erreur à l'UI (sinon un crash = juste « terminé » silencieux).
+                # log_tail élargi 1500 -> 4000 chars : la ligne d'argv unique de
+                # musubi (voir _log_tail) peut à elle seule dépasser 1000
+                # caractères, laissant sinon trop peu de place à la vraie erreur.
                 queue_manager._set_system_state(
-                    'training_error', {'dataset_id': dataset_id, 'rc': rc, 'log_tail': tail[-1500:]},
+                    'training_error',
+                    {'dataset_id': dataset_id, 'rc': rc, 'engine': engine, 'log_tail': tail[-4000:]},
                     ttl_seconds=3600)
             else:
-                logger.info("Entraînement ai-toolkit dataset %s terminé (rc=%s).", dataset_id, rc)
+                logger.info("Entraînement %s dataset %s terminé (rc=%s).", engine, dataset_id, rc)
             process_training_queue()  # libère le GPU / enchaîne la file immédiatement
     except Exception as e:
         logger.warning("watcher training : post-traitement échoué : %s", e)
@@ -4777,6 +4792,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         from flask import current_app
         threading.Thread(target=_watch_training,
                          args=(current_app._get_current_object(), proc, log_path, int(dataset_id)),
+                         kwargs={'engine': launch_engine},
                          daemon=True).start()
     except Exception as e:
         logger.warning("watcher training non démarré : %s", e)

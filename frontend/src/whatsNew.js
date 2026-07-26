@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-training-crash-banner-engine-aware',
+    date: '2026-07-26',
+    title: '🩹 Clearer crash messages for musubi-tuner runs',
+    blurb:
+      'A failed musubi-tuner training run used to show a confusing "ai-toolkit exited" message — it now correctly names musubi-tuner, with musubi-specific troubleshooting hints and more of the crash log so the real cause is easier to spot.',
+    to: '/settings/local-tools',
+  },
+  {
     id: '2026-07-25-qwen-image-edit-control-images',
     date: '2026-07-25',
     title: '🎯 Qwen-Image-Edit LoRAs now train correctly',

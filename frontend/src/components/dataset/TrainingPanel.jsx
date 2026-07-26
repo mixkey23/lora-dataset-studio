@@ -1155,7 +1155,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
       {status.error && (!status.error.dataset_id || status.error.dataset_id === ds.currentId) && (
         <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-red-200 text-[0.6875rem]">
           <div className="font-semibold">
-            ⚠ The last training run failed{status.error.rc != null ? ` (ai-toolkit exited ${status.error.rc})` : ''} — nothing is training now.
+            ⚠ The last training run failed{status.error.rc != null ? ` (${status.error.engine === 'musubi' ? 'musubi-tuner' : 'ai-toolkit'} exited ${status.error.rc})` : ''} — nothing is training now.
           </div>
           {status.error.log_tail && (
             <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-black/30 p-1.5 font-mono text-[0.625rem] text-red-300/90">
@@ -1163,9 +1163,10 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             </pre>
           )}
           <div className="mt-1 text-red-300/80">
-            Common first-run causes: ai-toolkit’s Python venv is missing packages
-            (re-run its install), or the base model is still downloading / needs a
-            Hugging Face token (gated models like Krea 2, FLUX.1 and FLUX.2 Klein). Fix the cause above, then Train again.
+            {status.error.engine === 'musubi'
+              ? 'Common first-run causes: musubi-tuner’s Python venv is missing packages (re-run its install), one of the 3 Qwen-Image weight paths in Settings is wrong, or the GPU profile’s block-swap/fp8 settings don’t fit this card’s VRAM.'
+              : 'Common first-run causes: ai-toolkit’s Python venv is missing packages (re-run its install), or the base model is still downloading / needs a Hugging Face token (gated models like Krea 2, FLUX.1 and FLUX.2 Klein).'}
+            {' '}Fix the cause above, then Train again.
           </div>
         </div>
       )}
