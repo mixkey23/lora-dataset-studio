@@ -461,6 +461,51 @@ def test_effective_train_settings_exposes_profile_optimizer_for_ui_override_note
             assert snap['musubi_profiles'][name]['rank'] == profile['rank']
 
 
+# --- Training panel's own live sample gallery must find musubi's samples ----
+# Bug found 2026-07-27 (repo owner asked where training samples show up in the
+# UI): musubi-tuner writes previews to `<run>/sample/` (singular) while
+# ai-toolkit writes `<run>/samples/` (plural) - cloud_training.py's Runs-hub
+# thumbnail was already engine-aware about this, but the Training panel's OWN
+# live gallery (training_progress -> list_training_samples -> _samples_dir)
+# stayed hardcoded to the plural name, so a musubi run's live previews never
+# showed up there even though musubi wrote them correctly to disk.
+
+def test_samples_dir_is_singular_for_musubi_plural_for_aitoolkit(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    with app.app_context():
+        musubi_ds = svc.create_dataset(LOCAL_USER, 'QIS1', 'zchar_qis1', train_type='qwen_image')
+        musubi_ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        assert lt._samples_dir(LOCAL_USER, musubi_ds.id).endswith(os.sep + 'sample')
+
+        aitoolkit_ds = svc.create_dataset(LOCAL_USER, 'QIS2', 'zchar_qis2', train_type='qwen_image')
+        aitoolkit_ds.train_engine = 'aitoolkit'
+        svc.db.session.commit()
+        assert lt._samples_dir(LOCAL_USER, aitoolkit_ds.id).endswith(os.sep + 'samples')
+
+
+def test_list_training_samples_finds_musubi_previews(app, tmp_path):
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIS3', 'zchar_qis3', train_type='qwen_image')
+        ds.train_engine = 'musubi'
+        svc.db.session.commit()
+        sample_dir = os.path.join(lt._samples_dir(LOCAL_USER, ds.id))
+        os.makedirs(sample_dir)
+        with open(os.path.join(sample_dir, '20260727-000000__000010_0.jpg'), 'wb') as fh:
+            fh.write(b'fake')
+
+        samples = lt.list_training_samples(LOCAL_USER, ds.id)
+        assert len(samples) == 1
+        assert samples[0]['step'] == 10
+
+
 def test_update_train_settings_musubi_profile_validation():
     """Covered without app fixtures elsewhere in the suite; here we only check
     the choices constant lines up with what update_train_settings accepts."""

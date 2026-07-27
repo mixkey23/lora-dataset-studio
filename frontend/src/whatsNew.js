@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-27-musubi-live-samples-fix',
+    date: '2026-07-27',
+    title: '🖼 musubi-tuner training previews now show up live',
+    blurb:
+      'The Training panel\'s own "Samples" strip (the live preview thumbnails under the progress bar) was hardcoded to ai-toolkit\'s folder name and never found musubi-tuner\'s previews, even though musubi wrote them correctly — they only ever showed up in the Runs hub thumbnail. The live gallery now checks the run\'s actual engine.',
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-27-pinned-checkpoints-modals-fix',
     date: '2026-07-27',
     title: '🗂 The in-app folder browser and "Continue training" work from any section now',

@@ -5556,8 +5556,19 @@ def _parse_training_log(text: str) -> dict:
 
 def _samples_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
                  variant=_PERSISTED) -> str:
+    """Folder name differs per engine (bug found 2026-07-27, repo owner asked
+    where samples live): ai-toolkit writes `<run>/samples/`, musubi-tuner's own
+    `--sample_prompts` flow (docs/sampling_during_training.md) writes
+    `<run>/sample/` (singular) — cloud_training.py's Runs-hub thumbnail was
+    already engine-aware about this (_run_samples_dir), but this reader (the
+    Training panel's OWN live sample gallery, training_progress/
+    list_training_samples) stayed hardcoded to the plural name, so a musubi
+    run's live previews never showed up here even though musubi wrote them."""
+    ds = fds.get_dataset(user_id, dataset_id)
+    fam = _train_type(ds, family) if ds else family
+    name = 'sample' if (ds and _train_engine(ds, family=fam) == 'musubi') else 'samples'
     return os.path.join(
-        _run_dir(user_id, dataset_id, base_model, family, variant), 'samples')
+        _run_dir(user_id, dataset_id, base_model, family, variant), name)
 
 
 def list_training_samples(user_id, dataset_id, base_model=_PERSISTED, family=None,
