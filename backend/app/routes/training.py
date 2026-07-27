@@ -1098,11 +1098,14 @@ def _folder_scope_kwargs(args) -> dict:
 
 @bp.get('/dataset/<int:dataset_id>/train/log')
 def dataset_train_log(dataset_id):
-    """Tail of THIS run's training.log — the raw CLI output (ai-toolkit or
+    """Tail of one of THIS run's log files — the raw CLI output (ai-toolkit or
     musubi-tuner), readable while the run is in progress AND long after it's
     done (until a fresh run of the same base+variant archives the folder), so
-    it's not just a tail after a crash. Same run-scope query params as the
-    folder browser (train_type/base_model/variant)."""
+    it's not just a tail after a crash. Every LAUNCH keeps its own log file
+    now (`_archive_existing_log`) — optional `?file=` picks a specific past
+    attempt from the `logs` list this response includes; omitted/unknown falls
+    back to the current run's `training.log`. Same run-scope query params as
+    the folder browser (train_type/base_model/variant)."""
     if not svc.get_dataset(LOCAL_USER, dataset_id):
         return jsonify({'error': 'not found'}), 404
     try:
@@ -1111,6 +1114,7 @@ def dataset_train_log(dataset_id):
         n = 300
     try:
         data = lt.tail_run_log(LOCAL_USER, dataset_id, n=n,
+                               filename=request.args.get('file'),
                                **_folder_scope_kwargs(request.args))
     except Exception as e:
         return _map_error(e)

@@ -3444,26 +3444,58 @@ def list_folder_files(user_id, dataset_id, target='loras', family=None,
     return out
 
 
+_LOG_FILE_RE = re.compile(r'^training(?:_\d{8}-\d{6})?\.log$')
+
+
+def list_run_logs(user_id, dataset_id, family=None,
+                  base_model=_PERSISTED, variant=_PERSISTED) -> list[dict]:
+    """This run's own log files, newest first: the CURRENT `training.log`
+    (the in-progress or most recent launch) plus one `training_<timestamp>.log`
+    per PRIOR launch archived by `_archive_existing_log` (repo owner ask: a
+    retry after an OOM used to overwrite/concatenate the previous attempt's
+    log, so there was no way to read back one specific attempt once a later
+    one had started). [{filename, mtime, current}], current marks the live
+    `training.log` entry."""
+    run = _run_dir(user_id, dataset_id, base_model, family, variant)
+    if not os.path.isdir(run):
+        return []
+    out = []
+    for name in os.listdir(run):
+        if not _LOG_FILE_RE.match(name):
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(run, name))
+        except OSError:
+            continue
+        out.append({'filename': name, 'mtime': mtime, 'current': name == 'training.log'})
+    out.sort(key=lambda f: f['mtime'], reverse=True)
+    return out
+
+
 def tail_run_log(user_id, dataset_id, n=300, family=None,
-                 base_model=_PERSISTED, variant=_PERSISTED) -> dict:
-    """Last `n` lines of THIS run's training.log — the in-app live viewer asked
-    for after a silent musubi-tuner failure left no checkpoint and no visible
-    error (the crash banner only shows a tail on a non-zero exit code; a run
-    that hangs or that a restarted server lost track of had nothing to show).
-    {'exists': bool, 'lines': [...]} — a missing log (nothing launched yet, or
-    an archived run) is normal, not an error."""
-    ds = fds.get_dataset(user_id, dataset_id)
-    if not ds:
-        raise ValueError('dataset not found')
-    path = os.path.join(_run_dir(user_id, dataset_id, base_model, family, variant),
-                        'training.log')
+                 base_model=_PERSISTED, variant=_PERSISTED, filename=None) -> dict:
+    """Last `n` lines of one of THIS run's log files — the in-app live viewer
+    asked for after a silent musubi-tuner failure left no checkpoint and no
+    visible error (the crash banner only shows a tail on a non-zero exit code;
+    a run that hangs or that a restarted server lost track of had nothing to
+    show). `filename` picks a specific attempt from list_run_logs (whitelist-
+    by-listing, same pattern folder_file_path uses); omitted/unrecognized ->
+    falls back to the current `training.log`. {'exists': bool, 'lines': [...]}
+    — a missing log (nothing launched yet, or an archived run) is normal,
+    not an error."""
+    logs = list_run_logs(user_id, dataset_id, family, base_model, variant)
+    names = {f['filename'] for f in logs}
+    chosen = filename if filename in names else 'training.log'
+    run = _run_dir(user_id, dataset_id, base_model, family, variant)
+    path = os.path.join(run, chosen)
     if not os.path.isfile(path):
-        return {'exists': False, 'lines': []}
+        return {'exists': False, 'lines': [], 'filename': chosen, 'logs': logs}
     try:
         with open(path, encoding='utf-8', errors='replace') as fh:
-            return {'exists': True, 'lines': fh.readlines()[-max(1, int(n)):]}
+            lines = fh.readlines()[-max(1, int(n)):]
+        return {'exists': True, 'lines': lines, 'filename': chosen, 'logs': logs}
     except OSError:
-        return {'exists': True, 'lines': ['(log unreadable)']}
+        return {'exists': True, 'lines': ['(log unreadable)'], 'filename': chosen, 'logs': logs}
 
 
 def folder_file_path(user_id, dataset_id, target, filename, family=None,
@@ -4605,6 +4637,27 @@ def archive_previous_run(ds) -> str | None:
     return dest
 
 
+def _archive_existing_log(run_dir) -> None:
+    """Rename an existing `training.log` in `run_dir` to a timestamped
+    `training_<ts>.log` BEFORE a new launch starts writing to it (repo owner
+    ask: after a run OOM's and gets retried, ai-toolkit's own `open(..., 'w')`
+    truncated the previous attempt's log on the next launch, and musubi-tuner's
+    `open(..., 'a')` instead silently concatenated every attempt into one file
+    — either way there was no way to read back ONE specific attempt's log once
+    a later one had started). Every attempt keeps its own file from here on,
+    listed/downloadable via the same run-folder browser as checkpoints.
+    Best-effort: a rename failure (locked file) must never block a launch."""
+    log_path = run_dir / 'training.log'
+    if not log_path.is_file():
+        return
+    dest = run_dir / f'training_{datetime.now().strftime("%Y%m%d-%H%M%S")}.log'
+    try:
+        os.rename(log_path, dest)
+    except OSError as e:
+        logger.warning('could not archive previous training.log (%s) - next '
+                       'launch will overwrite/append to it', e)
+
+
 def launch_training(user_id, dataset_id, steps: int | None = None, check_captions: bool = True,
                     base_model=None, variant: str | None = None, train_type: str | None = None,
                     engine: str | None = None,
@@ -4811,6 +4864,10 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     run_dir = _output_dir() / _run_name(
         ds, base_model=base_model, family=launch_fam, variant=variant)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Every launch gets its OWN log from here — see _archive_existing_log's
+    # docstring (a retry after an OOM used to truncate/concatenate the prior
+    # attempt's log before this).
+    _archive_existing_log(run_dir)
     log_path = str(run_dir / 'training.log')
     run_token = secrets.token_hex(16)
     _model_version = musubi_tuner.MODEL_VERSION['edit' if variant == 'edit' else 'image']

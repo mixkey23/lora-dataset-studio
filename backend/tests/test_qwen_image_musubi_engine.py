@@ -214,6 +214,53 @@ def test_launch_musubi_success_calls_write_precache_spawn_in_order(app, tmp_path
         assert ds.train_engine == 'musubi'
 
 
+def test_relaunch_archives_previous_attempts_log(app, tmp_path, monkeypatch):
+    """Repo owner report: after an OOM, retrying (fresh=False, same base+
+    variant -> same run dir) used to overwrite/concatenate the previous
+    attempt's training.log with no way to read it back once the retry had
+    started writing. launch_training must archive whatever log is already
+    there BEFORE the new one starts, on every launch, not just a fresh one."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context(), \
+         patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'ds.toml')), \
+         patch.object(mt, 'run_precache'), \
+         patch.object(mt, 'build_train_argv', return_value=[]), \
+         patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+        ds = svc.create_dataset(LOCAL_USER, 'QI3B', 'zchar_qi3b', train_type='qwen_image')
+        lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+        run_dir = lt._run_dir(LOCAL_USER, ds.id)
+        # Simulate the OOM'd first attempt having written some output, then
+        # actually died (the training_in_progress flag from the fake PID
+        # above would otherwise make the retry refuse as "already running").
+        with open(os.path.join(run_dir, 'training.log'), 'w', encoding='utf-8') as fh:
+            fh.write('attempt 1 - OOM\n')
+        from app.job_queue import queue_manager
+        queue_manager._set_system_state('training_in_progress', False)
+
+        lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+        # The mocked run_precache/spawn_training never actually write to
+        # log_path, so no fresh training.log exists here — only the archived
+        # attempt matters for this test (a real launch's own log content is
+        # covered by test_run_log.py).
+        logs = lt.list_run_logs(LOCAL_USER, ds.id)
+        names = [l['filename'] for l in logs]
+        assert len(names) == 1
+        assert names[0] != 'training.log'
+        with open(os.path.join(run_dir, names[0]), encoding='utf-8') as fh:
+            assert fh.read() == 'attempt 1 - OOM\n'
+
+
 # --- launch_training: GPU profile wiring ------------------------------------
 
 def test_launch_musubi_default_profile_matches_pre_profile_behaviour(app, tmp_path, monkeypatch):

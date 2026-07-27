@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-27-per-attempt-run-log',
+    date: '2026-07-27',
+    title: '📄 Every training attempt now keeps its own log',
+    blurb:
+      'Retrying a run after an OOM (or any crash) used to overwrite or mix together the previous attempt\'s log with the new one, so you lost the failure once the retry started. Every launch now keeps its own log file — the "Run log" viewer in Checkpoints & LoRAs gets a picker whenever a run has more than one attempt on record.',
+    to: '/datasets?section=checkpoints&panel=manager',
+  },
+  {
     id: '2026-07-27-cloud-runs-compact-history',
     date: '2026-07-27',
     title: '🗜 A long training history is easier to scan now',

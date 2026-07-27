@@ -87,6 +87,17 @@ const fmtBytes = (b) => {
   return `${Math.max(1, Math.round(b / 1e3))} KB`;
 };
 
+// Human label for one of a run's log files (see backend _archive_existing_log):
+// 'training.log' -> "Current attempt"; 'training_20260727-193000.log' -> its
+// timestamp, readably formatted. An unparseable name still shows something.
+const logFileLabel = (filename) => {
+  if (filename === 'training.log') return 'Current attempt';
+  const m = /^training_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.log$/.exec(filename || '');
+  if (!m) return filename;
+  const [, y, mo, d, h, mi] = m;
+  return `${y}-${mo}-${d} ${h}:${mi}`;
+};
+
 function CheckpointPortal({ host, children }) {
   return host ? createPortal(children, host) : children;
 }
@@ -190,7 +201,12 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   // done (until a fresh run of the SAME base+variant archives the folder). See
   // loadRunLog below.
   const [logViewerOpen, setLogViewerOpen] = useState(false);
-  const [runLog, setRunLog] = useState({ exists: false, lines: [] });
+  const [runLog, setRunLog] = useState({ exists: false, lines: [], logs: [] });
+  // Which attempt's log to show — undefined = the current run's training.log.
+  // Repo owner report: a retry after an OOM used to share ONE training.log
+  // across every attempt (truncated/concatenated); each launch now keeps its
+  // own file (see backend _archive_existing_log), this picks which to view.
+  const [selectedLogFile, setSelectedLogFile] = useState(undefined);
   // Réglages ai-toolkit avancés éditables (rank / resolution / save_every /
   // sample_every / sample_prompts), chargés depuis base-info ; persistés par POST
   // /train/settings via ds.setTrainSettings.
@@ -930,19 +946,24 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     if (checkpointTrainType) qs.set('train_type', checkpointTrainType);
     if (checkpointBase !== undefined && checkpointBase !== null) qs.set('base_model', checkpointBase);
     if (checkpointVariant) qs.set('variant', checkpointVariant);
+    if (selectedLogFile) qs.set('file', selectedLogFile);
     try {
       const r = await fetch(`/api/dataset/${ds.currentId}/train/log?${qs.toString()}`,
         { credentials: 'include' });
       if (r.ok) setRunLog(await r.json());
     } catch { /* best-effort */ }
   };
+  // Reset to "current attempt" whenever the browse filter's run changes — a
+  // filename picked in a DIFFERENT run's scope wouldn't exist here anyway.
+  useEffect(() => { setSelectedLogFile(undefined); },
+    [ds.currentId, checkpointTrainType, checkpointBase, checkpointVariant]);
   useEffect(() => {
     if (!logViewerOpen) return undefined;
     loadRunLog();
     const id = setInterval(loadRunLog, 3000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [logViewerOpen, ds.currentId, checkpointTrainType, checkpointBase, checkpointVariant]);
+  }, [logViewerOpen, ds.currentId, checkpointTrainType, checkpointBase, checkpointVariant, selectedLogFile]);
   // The manager is "open" when portaled to its sidebar host, or expanded inline.
   const checkpointManagerOpen = Boolean(checkpointHost) || checkpointsOpen;
   // Auto-load the lineage the moment the graph view is the one showing (default),
@@ -2463,11 +2484,25 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
 
           {logViewerOpen && (
             <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface-raised p-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {/* More than one attempt on record (a retry after an OOM etc.) —
+                    pick which one to view. A single entry (or none yet) skips
+                    the selector entirely, unchanged from before this existed. */}
+                {runLog.logs?.length > 1 && (
+                  <select value={selectedLogFile ?? 'training.log'}
+                    onChange={(e) => setSelectedLogFile(
+                      e.target.value === 'training.log' ? undefined : e.target.value)}
+                    title="Pick which attempt's log to view — every launch keeps its own"
+                    className="rounded-md border border-border bg-surface px-1.5 py-0.5 text-content text-[0.625rem]">
+                    {runLog.logs.map((f) => (
+                      <option key={f.filename} value={f.filename}>{logFileLabel(f.filename)}</option>
+                    ))}
+                  </select>
+                )}
                 <span className="text-content-subtle text-[0.625rem]">
                   {runLog.exists
-                    ? `training.log — last ${runLog.lines.length} lines, refreshes every 3s`
-                    : 'no training.log for this run yet'}
+                    ? `${runLog.filename || 'training.log'} — last ${runLog.lines.length} lines, refreshes every 3s`
+                    : 'no log for this run yet'}
                 </span>
                 <button type="button" onClick={loadRunLog}
                   className="ml-auto px-2 py-0.5 rounded-md border border-border bg-surface text-content text-[0.625rem]">
