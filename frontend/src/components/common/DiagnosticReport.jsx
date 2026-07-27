@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { apiFetch } from '../../api/fetchClient'
 import { useToast } from './Toast'
 import { formatDiagnostic } from './diagnosticFormat'
+import { copyToClipboard } from '../../utils/clipboard'
 
 export { formatDiagnostic }
 
@@ -12,7 +13,7 @@ export default function DiagnosticReport() {
     setBusy(true)
     try {
       const d = await apiFetch('/api/diagnostic')
-      await navigator.clipboard.writeText(formatDiagnostic(d))
+      await copyToClipboard(formatDiagnostic(d))
       toast.success('Diagnostic report copied — paste it into your bug report.')
     } catch (err) {
       toast.error(`Could not build the report: ${err.message}`)

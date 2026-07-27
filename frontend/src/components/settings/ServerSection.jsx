@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { postJson } from '../../api/fetchClient'
 import { useToast } from '../common/Toast'
+import { copyToClipboard } from '../../utils/clipboard'
 import { INPUT_CLASS, Card } from './primitives'
 
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1']
@@ -73,18 +74,18 @@ export default function ServerSection({ config, setField, runtime, handleSave })
 
   const copyToken = async () => {
     try {
-      await navigator.clipboard.writeText(config.server.access_token || '')
+      await copyToClipboard(config.server.access_token || '')
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
-    } catch { /* clipboard unavailable (non-HTTPS remote origin) — token stays selectable */ }
+    } catch { /* clipboard unavailable — token stays selectable */ }
   }
 
   const copyUrl = async (key, url) => {
     try {
-      await navigator.clipboard.writeText(url)
+      await copyToClipboard(url)
       setCopiedUrl(key)
       setTimeout(() => setCopiedUrl(null), 1500)
-    } catch { /* clipboard unavailable (non-HTTPS remote origin) — URL stays selectable */ }
+    } catch { /* clipboard unavailable — URL stays selectable */ }
   }
 
   return (

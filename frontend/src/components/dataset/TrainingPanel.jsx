@@ -31,6 +31,7 @@ import {
   trainingPresetSnapshotScope,
 } from '../../utils/trainingPresets';
 import { runConfirmableTrainingRequest } from '../../utils/trainingConfirmations';
+import { copyToClipboard } from '../../utils/clipboard';
 import { HelpBadge } from '../../help/HelpMode';
 import { requestHelpTip } from '../../help/helpTips';
 import { useToast } from '../common/Toast';
@@ -2473,7 +2474,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   ↻ Refresh
                 </button>
                 <button type="button"
-                  onClick={() => { try { navigator.clipboard.writeText(runLog.lines.join('')); } catch { /* ignore */ } }}
+                  onClick={() => { copyToClipboard(runLog.lines.join('')).catch(() => { /* ignore */ }); }}
                   disabled={!runLog.lines.length}
                   className="px-2 py-0.5 rounded-md border border-border bg-surface text-content text-[0.625rem] disabled:opacity-40">
                   📋 Copy all

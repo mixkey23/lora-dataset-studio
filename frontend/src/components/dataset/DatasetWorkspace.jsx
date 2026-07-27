@@ -5,6 +5,7 @@ import ReferencePanel from './ReferencePanel';
 import VariationCatalog from './VariationCatalog';
 import TrainingPanel from './TrainingPanel';
 import { fmt } from '../../utils/studioFormat';
+import { copyToClipboard } from '../../utils/clipboard';
 import ImportDropzone from './ImportDropzone';
 import ConceptSourcesPanel from './ConceptSourcesPanel';
 import { isDatasetImportBlocked } from './scraperState';
@@ -695,7 +696,7 @@ export default function DatasetWorkspace({ ds, onBack }) {
           </span>
         ) : (
           <button type="button"
-            onClick={() => { try { navigator.clipboard.writeText(d.trigger_word || ''); } catch { /* ignore */ } }}
+            onClick={() => { copyToClipboard(d.trigger_word || '').catch(() => { /* ignore */ }); }}
             title="Copy the trigger word (to put in your prompts)"
             className="flex items-center gap-1 px-2 py-0.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 text-[0.6875rem]">
             <span className="text-content-subtle">trigger:</span>

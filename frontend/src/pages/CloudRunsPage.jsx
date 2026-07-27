@@ -94,13 +94,16 @@ const FAMILY_SHORT = { zimage: 'Z-Image', krea: 'Krea', sdxl: 'SDXL', flux: 'FLU
 
 /** Card thumbnail: the LAST sample the run generated (backend stamps
  * `preview_url` when one exists on disk). Fallback: a quiet family tile —
- * runs that never sampled (crashed early, purged staging) stay scannable. */
-function RunThumb({ run, broken, onBroken }) {
+ * runs that never sampled (crashed early, purged staging) stay scannable.
+ * `small` shrinks it for the compact finished-run row (repo owner request:
+ * minimize done rows, leave in-progress ones as-is). */
+function RunThumb({ run, broken, onBroken, small }) {
+  const size = small ? 'h-9 w-9' : 'h-16 w-16 sm:h-20 sm:w-20';
   if (run.preview_url && !broken) {
     return (
       <a href={run.preview_url} target="_blank" rel="noreferrer"
         title="Last sample this run generated (open full size)"
-        className="relative block h-16 w-16 sm:h-20 sm:w-20 shrink-0 overflow-hidden rounded-lg border border-border hover:border-indigo-400">
+        className={`relative block ${size} shrink-0 overflow-hidden rounded-lg border border-border hover:border-indigo-400`}>
         <img src={run.preview_url} loading="lazy" onError={onBroken}
           alt={`Last training sample of ${run.dataset_name || run.run_name || 'this run'}`}
           className="h-full w-full object-cover" />
@@ -109,11 +112,13 @@ function RunThumb({ run, broken, onBroken }) {
   }
   return (
     <div aria-hidden
-      className="flex h-16 w-16 sm:h-20 sm:w-20 shrink-0 flex-col items-center justify-center gap-1 rounded-lg border border-border bg-app/60 text-content-subtle">
-      <span className="text-base opacity-50">🖼</span>
-      <span className="px-1 text-center text-[0.5625rem] uppercase tracking-wide leading-tight">
-        {FAMILY_SHORT[run.train_type] || 'LoRA'}
-      </span>
+      className={`flex ${size} shrink-0 flex-col items-center justify-center gap-1 rounded-lg border border-border bg-app/60 text-content-subtle`}>
+      <span className={small ? 'text-xs opacity-50' : 'text-base opacity-50'}>🖼</span>
+      {!small && (
+        <span className="px-1 text-center text-[0.5625rem] uppercase tracking-wide leading-tight">
+          {FAMILY_SHORT[run.train_type] || 'LoRA'}
+        </span>
+      )}
     </div>
   );
 }
@@ -235,6 +240,16 @@ export default function CloudRunsPage() {
   // Thumbnails whose image 404'd/broke since load — fall back to the family
   // tile instead of a broken-image glyph. Keyed by the run's share_key.
   const [brokenThumbs, setBrokenThumbs] = useState({});
+
+  // Recent-history rows are all FINISHED runs (done/error/stopped — actives
+  // live in their own section above) — repo owner report: the full card
+  // (thumb + several meta lines + full button row) stayed just as heavy after
+  // "Clean finished runs" freed their disk space, so a long history still felt
+  // cluttered. Collapsed to one compact line by default; expand per-row for
+  // the secondary details (settings line, error text, share/lineage, etc.).
+  // Keyed like lineageOpen (run_id for cloud, else the same fallback key
+  // renderRunCard already uses).
+  const [runDetailsOpen, setRunDetailsOpen] = useState({});
 
   // 🌳 Lineage: which run cards have their genealogy tree expanded, and the
   // fetched tree per record id (loaded lazily on first expand; refetched only
@@ -496,11 +511,15 @@ export default function CloudRunsPage() {
     setContinueRunTarget(target);
   };
 
-  /* One HISTORY card. Visual hierarchy: rank 1 = thumbnail + identity chip +
-     name + a strong status pill; rank 2 = the metrics that matter (duration,
-     steps, saves, GPU, cost); rank 3 = the de-emphasized settings line. Every
-     per-run warning (Z-Image legacy recipe, kept pod billing) renders INSIDE
-     its card. Primary actions are filled buttons, Share config stays ghost. */
+  /* One HISTORY row — every row here is a FINISHED run (done/error/stopped;
+     actives get their own bigger cards above). Repo owner report: these
+     stayed as heavy as an in-progress card even once "Clean finished runs"
+     had freed their disk space, so a long history read as cluttered. Default
+     view is ONE compact line (thumb + identity + name + status + family +
+     time + the couple of primary actions someone actually wants at a glance);
+     everything else (settings line, error text, cost/GPU/saves, recipe
+     warning, kept-pod note, lineage/graph, share config) moves behind a
+     per-row "▾" details toggle, mirroring the existing lineageOpen pattern. */
   const renderRunCard = (run, i) => {
     const ident = runIdentityOf(run);
     const key = run.run_id ? `c${run.run_id}` : `l${run.record_id || `${run.dataset_id}-${run.created_at || i}`}`;
@@ -509,13 +528,18 @@ export default function CloudRunsPage() {
     const duration = formatDuration(runDurationSeconds(run));
     const line = settingsLine(run);
     const thumbKey = run.share_key || key;
+    const detailsOpen = !!runDetailsOpen[key];
+    const hasDetails = !!(line || (run.error && (run.status === 'error' || run.status === 'error_pod_kept'))
+      || run.status === 'error_pod_kept' || baseLabel?.custom || run.version != null
+      || run.gpu || run.cost_estimate != null || (run.source === 'cloud' && run.saves > 0)
+      || run.share_key || (run.record_id != null && (run.lineage || run.checkpoint_ready)));
     return (
       <div key={key} id={ident ? runRowDomId(ident.source, ident.id) : undefined}
-        className={`flex gap-2.5 sm:gap-3 rounded-lg border border-border border-l-2 bg-app/40 p-2.5 ${cardAccent(run.status)}`}>
-        <RunThumb run={run} broken={!!brokenThumbs[thumbKey]}
-          onBroken={() => setBrokenThumbs((m) => ({ ...m, [thumbKey]: true }))} />
-        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        className={`flex flex-col gap-1.5 rounded-lg border border-border border-l-2 bg-app/40 p-2 ${cardAccent(run.status)}`}>
+        <div className="flex items-center gap-2">
+          <RunThumb run={run} broken={!!brokenThumbs[thumbKey]}
+            onBroken={() => setBrokenThumbs((m) => ({ ...m, [thumbKey]: true }))} small />
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
             {ident ? (
               <RunIdChip source={ident.source} id={ident.id} />
             ) : (
@@ -525,63 +549,25 @@ export default function CloudRunsPage() {
             )}
             <button type="button" onClick={() => openDataset(run.dataset_id)}
               title="Open this dataset"
-              className="max-w-full truncate text-content text-sm font-semibold hover:underline">
+              className="max-w-[16rem] truncate text-content text-sm font-semibold hover:underline">
               {run.dataset_name || run.run_name || `Dataset #${run.dataset_id}`}
             </button>
             <StatusBadge status={run.status} />
             <AutoRetryBadges run={run} />
+            <span className="whitespace-nowrap text-content-subtle text-[0.625rem]">
+              {famLabel(run.train_type)}{variantLabel ? ` · ${variantLabel}` : ''}
+            </span>
+            {duration && (
+              <span className="whitespace-nowrap text-content-muted text-[0.6875rem] tabular-nums"
+                title="Wall-clock run duration (launch → finish)">
+                ⏱ {duration}
+              </span>
+            )}
             <span className="ml-auto whitespace-nowrap text-content-subtle text-[0.625rem]">
               {timeAgo(run.finished_at || run.created_at)}
             </span>
           </div>
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.6875rem] text-content-muted">
-            <span className="text-[0.625rem] uppercase tracking-wide">
-              {famLabel(run.train_type)}{variantLabel ? ` · ${variantLabel}` : ''}
-            </span>
-            {/* Official bases are already spelled by the family·variant above;
-                only a CUSTOM base adds new info here (which checkpoint file). */}
-            {baseLabel?.custom && <BaseModelChip label={baseLabel} />}
-            <DatasetVersionChip version={run.version} />
-            {run.resumed_from != null && (
-              <button type="button"
-                onClick={() => run.record_id != null && toggleLineage(run.record_id)}
-                title="This run resumed from an earlier checkpoint — open its lineage"
-                className="rounded border border-border px-1 py-0.5 text-content-subtle text-[0.5625rem] hover:text-content">
-                ↳ from step {run.resumed_from}
-              </button>
-            )}
-            {duration && (
-              <span className="tabular-nums" title="Wall-clock run duration (launch → finish)">
-                ⏱ {duration}
-              </span>
-            )}
-            {run.steps ? <span className="tabular-nums">{run.steps} steps</span> : null}
-            {run.source === 'cloud' && run.saves > 0 && (
-              <span className="tabular-nums" title="Checkpoints this run saved (synced locally)">
-                💾 {run.saves} save{run.saves > 1 ? 's' : ''}
-              </span>
-            )}
-            {run.gpu && <span>{run.gpu}</span>}
-            {run.cost_estimate != null && (
-              <span className="tabular-nums" title="Estimated cost (price/h × run time)">
-                ${run.cost_estimate}
-              </span>
-            )}
-          </div>
-          {run.error && (run.status === 'error' || run.status === 'error_pod_kept') && (
-            <p className="m-0 truncate text-rose-300/90 text-[0.6875rem]" title={run.error}>
-              {run.error}
-            </p>
-          )}
-          {line && (
-            <p className="m-0 truncate text-content-subtle text-[0.625rem]"
-              title="The effective ai-toolkit settings this launch used">
-              ⚙ {line}
-            </p>
-          )}
-          <RecipeWarning run={run} />
-          {run.status === 'error_pod_kept' && <PodKeptNote />}
-          <div className="mt-0.5 flex flex-wrap items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1.5">
             {run.status === 'error' && (
               <button type="button" onClick={() => retry(run)}
                 disabled={isTrainingRecipeReplayBlocked(run) || !!retrying[runRetryKey(run)]}
@@ -590,8 +576,8 @@ export default function CloudRunsPage() {
                   : run.source === 'local'
                     ? 'Relaunch this run locally with the same settings'
                     : 'Relaunch this run with the same settings on a fresh pod'}
-                className="px-3 py-1.5 rounded-lg bg-primary/90 hover:bg-primary text-white text-xs font-semibold disabled:opacity-40">
-                {retrying[runRetryKey(run)] ? '↻ Retrying…' : '↻ Retry'}
+                className="px-2.5 py-1 rounded-lg bg-primary/90 hover:bg-primary text-white text-xs font-semibold disabled:opacity-40">
+                {retrying[runRetryKey(run)] ? '↻…' : '↻ Retry'}
               </button>
             )}
             {run.source === 'cloud' && run.status === 'done' && run.checkpoint_ready && (
@@ -600,59 +586,113 @@ export default function CloudRunsPage() {
                 title={isTrainingRecipeReplayBlocked(run)
                   ? 'Disabled: this legacy/incompatible Z-Image checkpoint cannot be continued safely; start a fresh run'
                   : "Resume from any of this run's checkpoints for more steps, on a fresh pod"}
-                className="px-3 py-1.5 rounded-lg bg-sky-600/80 hover:bg-sky-600 text-white text-xs font-semibold disabled:opacity-40">
-                {continuing[run.run_id] ? '▶ Continuing…' : '▶ Continue…'}
+                className="px-2.5 py-1 rounded-lg bg-sky-600/80 hover:bg-sky-600 text-white text-xs font-semibold disabled:opacity-40">
+                {continuing[run.run_id] ? '▶…' : '▶ Continue'}
               </button>
             )}
             {run.checkpoint_ready && (
               <a href={checkpointHref(run)}
                 title="Download this run's LoRA checkpoint"
-                className="px-3 py-1.5 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-white text-xs font-semibold no-underline">
+                className="px-2.5 py-1 rounded-lg bg-emerald-600/80 hover:bg-emerald-600 text-white text-xs font-semibold no-underline">
                 ⬇ LoRA
               </a>
             )}
-            {/* The graph opens for ANY run with saved checkpoints (a single run
-                already shows its epochs), and labels as Lineage once it has a
-                parent or a branch. */}
-            {run.record_id != null && (run.lineage || run.checkpoint_ready) && (
-              <button type="button" onClick={() => toggleLineage(run.record_id)}
-                aria-expanded={!!lineageOpen[run.record_id]}
-                title={run.lineage
-                  ? "Show this run's lineage — the runs it continued from or that branched off it"
-                  : "Show this run's checkpoints as a graph — import / generate / download / continue from any of them"}
-                className={'rounded-lg border px-2 py-1 text-xs font-semibold transition-colors '
-                  + (lineageOpen[run.record_id]
-                    ? 'border-indigo-400/60 bg-indigo-500/20 text-indigo-100 '
-                    : 'border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 ')}>
-                {lineageOpen[run.record_id]
-                  ? (run.lineage ? '🌳 Hide lineage' : '◉ Hide graph')
-                  : (run.lineage ? '🌳 Lineage' : '◉ Graph')}
-              </button>
-            )}
-            {run.share_key && (
-              <button type="button" onClick={() => shareConfig(run)}
-                title="Download this run's full settings as a paste-safe text file (recipe / help thread)"
-                className="ml-auto rounded-lg border border-transparent px-2 py-1 text-content-muted hover:border-border hover:text-content text-xs font-medium">
-                ⎘ Share config
+            {hasDetails && (
+              <button type="button"
+                onClick={() => setRunDetailsOpen((m) => ({ ...m, [key]: !m[key] }))}
+                aria-expanded={detailsOpen}
+                title={detailsOpen ? 'Hide details' : 'Show details (settings, cost, lineage, share…)'}
+                className="px-2 py-1 rounded-lg border border-border text-content-muted hover:text-content text-xs">
+                {detailsOpen ? '▴' : '▾'}
               </button>
             )}
           </div>
-          {run.record_id != null && (run.lineage || run.checkpoint_ready) && lineageOpen[run.record_id] && (
-            <RunLineageTree
-              tree={lineageData[run.record_id]?.tree}
-              loading={lineageData[run.record_id]?.loading}
-              error={lineageData[run.record_id]?.error}
-              onSelect={jumpToRun}
-              onContinueCheckpoint={continueFromCheckpoint}
-              refetchTree={async () => {
-                const r = await fetch(`/api/dataset/train/runs/${run.record_id}/lineage`, { credentials: 'include' });
-                if (!r.ok) throw new Error('unavailable');
-                const tree = await r.json();
-                setLineageData((m) => ({ ...m, [run.record_id]: { tree } }));
-                return tree;
-              }} />
-          )}
         </div>
+        {detailsOpen && (
+          <div className="flex flex-col gap-1.5 pl-2 border-l border-border ml-4">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.6875rem] text-content-muted">
+              {/* Official bases are already spelled by the family·variant above;
+                  only a CUSTOM base adds new info here (which checkpoint file). */}
+              {baseLabel?.custom && <BaseModelChip label={baseLabel} />}
+              <DatasetVersionChip version={run.version} />
+              {run.resumed_from != null && (
+                <button type="button"
+                  onClick={() => run.record_id != null && toggleLineage(run.record_id)}
+                  title="This run resumed from an earlier checkpoint — open its lineage"
+                  className="rounded border border-border px-1 py-0.5 text-content-subtle text-[0.5625rem] hover:text-content">
+                  ↳ from step {run.resumed_from}
+                </button>
+              )}
+              {run.steps ? <span className="tabular-nums">{run.steps} steps</span> : null}
+              {run.source === 'cloud' && run.saves > 0 && (
+                <span className="tabular-nums" title="Checkpoints this run saved (synced locally)">
+                  💾 {run.saves} save{run.saves > 1 ? 's' : ''}
+                </span>
+              )}
+              {run.gpu && <span>{run.gpu}</span>}
+              {run.cost_estimate != null && (
+                <span className="tabular-nums" title="Estimated cost (price/h × run time)">
+                  ${run.cost_estimate}
+                </span>
+              )}
+            </div>
+            {run.error && (run.status === 'error' || run.status === 'error_pod_kept') && (
+              <p className="m-0 truncate text-rose-300/90 text-[0.6875rem]" title={run.error}>
+                {run.error}
+              </p>
+            )}
+            {line && (
+              <p className="m-0 truncate text-content-subtle text-[0.625rem]"
+                title="The effective ai-toolkit settings this launch used">
+                ⚙ {line}
+              </p>
+            )}
+            <RecipeWarning run={run} />
+            {run.status === 'error_pod_kept' && <PodKeptNote />}
+            <div className="flex flex-wrap items-center gap-2">
+              {/* The graph opens for ANY run with saved checkpoints (a single run
+                  already shows its epochs), and labels as Lineage once it has a
+                  parent or a branch. */}
+              {run.record_id != null && (run.lineage || run.checkpoint_ready) && (
+                <button type="button" onClick={() => toggleLineage(run.record_id)}
+                  aria-expanded={!!lineageOpen[run.record_id]}
+                  title={run.lineage
+                    ? "Show this run's lineage — the runs it continued from or that branched off it"
+                    : "Show this run's checkpoints as a graph — import / generate / download / continue from any of them"}
+                  className={'rounded-lg border px-2 py-1 text-xs font-semibold transition-colors '
+                    + (lineageOpen[run.record_id]
+                      ? 'border-indigo-400/60 bg-indigo-500/20 text-indigo-100 '
+                      : 'border-indigo-400/40 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20 ')}>
+                  {lineageOpen[run.record_id]
+                    ? (run.lineage ? '🌳 Hide lineage' : '◉ Hide graph')
+                    : (run.lineage ? '🌳 Lineage' : '◉ Graph')}
+                </button>
+              )}
+              {run.share_key && (
+                <button type="button" onClick={() => shareConfig(run)}
+                  title="Download this run's full settings as a paste-safe text file (recipe / help thread)"
+                  className="ml-auto rounded-lg border border-transparent px-2 py-1 text-content-muted hover:border-border hover:text-content text-xs font-medium">
+                  ⎘ Share config
+                </button>
+              )}
+            </div>
+            {run.record_id != null && (run.lineage || run.checkpoint_ready) && lineageOpen[run.record_id] && (
+              <RunLineageTree
+                tree={lineageData[run.record_id]?.tree}
+                loading={lineageData[run.record_id]?.loading}
+                error={lineageData[run.record_id]?.error}
+                onSelect={jumpToRun}
+                onContinueCheckpoint={continueFromCheckpoint}
+                refetchTree={async () => {
+                  const r = await fetch(`/api/dataset/train/runs/${run.record_id}/lineage`, { credentials: 'include' });
+                  if (!r.ok) throw new Error('unavailable');
+                  const tree = await r.json();
+                  setLineageData((m) => ({ ...m, [run.record_id]: { tree } }));
+                  return tree;
+                }} />
+            )}
+          </div>
+        )}
       </div>
     );
   };

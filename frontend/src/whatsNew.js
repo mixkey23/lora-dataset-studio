@@ -47,6 +47,22 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-27-cloud-runs-compact-history',
+    date: '2026-07-27',
+    title: '🗜 A long training history is easier to scan now',
+    blurb:
+      'Finished runs on the Training runs page now collapse to one compact line (thumbnail, name, status, family, duration) instead of a full card — click "▾" on any row for its settings, cost, lineage and share-config. Runs still in progress are unchanged.',
+    to: '/cloud',
+  },
+  {
+    id: '2026-07-27-copy-buttons-work-without-https',
+    date: '2026-07-27',
+    title: '📋 Copy buttons now work when the app isn\'t on HTTPS',
+    blurb:
+      '"Copy diagnostic report" and every other copy-to-clipboard button used to fail silently ("Cannot read properties of undefined") when reaching the app over plain HTTP (e.g. a LAN address) — the browser only exposes the modern clipboard API on a secure origin. They now fall back to the classic copy method automatically.',
+    to: '/settings/maintenance',
+  },
+  {
     id: '2026-07-27-checkpoints-live-log',
     date: '2026-07-27',
     title: '📄 Read a training run\'s raw CLI output, live or long after it\'s done',

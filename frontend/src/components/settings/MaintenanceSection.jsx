@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { apiFetch, postJson } from '../../api/fetchClient'
 import DiagnosticReport from '../common/DiagnosticReport'
+import { copyToClipboard } from '../../utils/clipboard'
 import { Card, TextField } from './primitives'
 import { installMode, zipUpdateHeadline, progressLabel, progressPercent } from './updateStatus'
 
@@ -206,7 +207,7 @@ function LogViewer() {
     const id = setInterval(load, 5000)
     return () => clearInterval(id)
   }, [open])
-  const copy = () => { try { navigator.clipboard.writeText(lines.join('\n')) } catch { /* ignore */ } }
+  const copy = () => { copyToClipboard(lines.join('\n')).catch(() => { /* ignore */ }) }
   return (
     <section className="rounded-xl border border-border bg-surface p-5">
       <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}

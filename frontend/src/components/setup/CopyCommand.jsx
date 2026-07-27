@@ -1,10 +1,11 @@
 import { useState } from 'react'
+import { copyToClipboard } from '../../utils/clipboard'
 
 export default function CopyCommand({ command }) {
   const [copied, setCopied] = useState(false)
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(command)
+      await copyToClipboard(command)
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch { /* clipboard blocked — the command is visible to copy by hand */ }
