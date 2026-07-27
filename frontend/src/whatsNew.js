@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-caption-mismatch-names-real-family',
+    date: '2026-07-26',
+    title: '🏷️ Caption-style warning now names the model you\'re actually training',
+    blurb:
+      'Training a Krea, FLUX, or Qwen-Image LoRA with mismatched captions used to show "this Z-Image dataset..." no matter which family you picked — confusing and easy to second-guess. The warning now names the real family.',
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-26-slider-mode-musubi-conflict',
     date: '2026-07-26',
     title: '🎚 Slider LoRA now flags when it can\'t actually run',

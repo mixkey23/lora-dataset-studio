@@ -194,7 +194,11 @@ def test_build_job_config_qwen_image_edit_default_and_base_optin(app, tmp_path):
 
 def test_qwen_image_expects_prose_captions(app):
     """Everything != sdxl expects prose: booru-tag captions on a qwen_image
-    dataset trip the MISMATCH_CAPTION guard (forceable, like the others)."""
+    dataset trip the MISMATCH_CAPTION guard (forceable, like the others). The
+    message must name the REAL family (bug fixed 2026-07-26: it was hardcoded
+    to say "Z-Image" regardless of ttype, confusing anyone training a
+    different family — Qwen-Image included — into thinking the app had
+    somehow lost track of what it was training)."""
     from app.services import lora_training as lt
     from app.services import face_dataset_service as svc
     from app.models import FaceDatasetImage
@@ -208,8 +212,9 @@ def test_qwen_image_expects_prose_captions(app):
             svc.db.session.add(FaceDatasetImage(dataset_id=ds.id, status='keep',
                                                 filename='x.webp', caption=booru))
         svc.db.session.commit()
-        with pytest.raises(ValueError, match='MISMATCH_CAPTION'):
+        with pytest.raises(ValueError, match=r'MISMATCH_CAPTION: this Qwen-Image dataset') as exc:
             lt.assert_trainable(ds.id, train_type='qwen_image')
+        assert 'Z-Image' not in str(exc.value)
         lt.assert_trainable(ds.id, train_type='qwen_image', allow_caption_mismatch=True)
 
 

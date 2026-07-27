@@ -5228,11 +5228,11 @@ def assert_trainable(dataset_id, train_type=None, allow_caption_mismatch=False,
         if actual != expected:
             if expected == 'booru':
                 raise ValueError(
-                    "MISMATCH_CAPTION: this SDXL dataset has PROSE captions, but a booru "
+                    f"MISMATCH_CAPTION: this {label} dataset has PROSE captions, but a booru "
                     "model (bigLove type) is prompted with tags. Re-caption in 'Booru tags' mode "
                     "before training, or force the training.")
             raise ValueError(
-                "MISMATCH_CAPTION: this Z-Image dataset has booru TAG captions, but Z-Image "
+                f"MISMATCH_CAPTION: this {label} dataset has booru TAG captions, but {label} "
                 "expects prose. Re-caption in 'Prose' mode, or force the training.")
 
 
