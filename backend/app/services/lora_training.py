@@ -261,6 +261,52 @@ def _aitoolkit_supports_qwen_image() -> bool:
     return False
 
 
+def _aitoolkit_supports_qwen_image_edit() -> bool:
+    """L'ai-toolkit installé connaît-il l'arch DÉDIÉE `qwen_image_edit` ?
+
+    Bug réel corrigé (2026-07-26) : Qwen-Image et Qwen-Image-Edit ne sont PAS
+    la même arch côté ai-toolkit malgré leur DiT quasi-identique — ce sont deux
+    classes DISTINCTES (extensions_built_in/diffusion_models/qwen_image/
+    qwen_image.py: `QwenImageModel, arch = "qwen_image"` vs .../qwen_image_edit.py:
+    `QwenImageEditModel(QwenImageModel), arch = "qwen_image_edit"`, vérifié sur
+    ostris/ai-toolkit upstream). SEULE la classe Edit lit `batch.control_tensor`
+    (elle concatène le control latent à l'input : `torch.cat((latents,
+    control_latent), dim=1)`) — la classe de base l'ignore silencieusement.
+    `_build_job_config_qwen_image` émettait TOUJOURS `arch: 'qwen_image'`, même
+    pour la cible Edit-2511 : le `control_path` qu'on écrit dans le dataset
+    (cf. _qwen_edit_control_fields) n'a donc JAMAIS été exploité par ai-toolkit,
+    exactement le même bug de fond que celui corrigé côté musubi (LoRA entraîné
+    comme du texte-à-image pur, jamais via le chemin conditionné par l'image de
+    contrôle) — mais ici la cause est la MAUVAISE CLASSE de modèle, pas
+    l'absence de control image.
+
+    Même garde CRITIQUE que _aitoolkit_supports_qwen_image (lire son
+    commentaire) : arch EXACTE `arch = "qwen_image_edit"`, jamais une
+    sous-chaîne. Un ai-toolkit installé AVANT que cette classe existe (Edit
+    ajouté après la base Qwen-Image) passerait _aitoolkit_supports_qwen_image
+    (la base existe) mais PAS celle-ci → refus actionnable au lieu du
+    fallback silencieux vers la mauvaise classe."""
+    root = cfg.aitoolkit_path('dir')
+    if not root:
+        return False
+    pat = re.compile(r'arch\s*=\s*[\'"]qwen_image_edit[\'"]')
+    for subdir in ('extensions_built_in', 'toolkit'):
+        scan_root = root / subdir
+        if not scan_root.is_dir():
+            continue
+        for dp, _dn, files in os.walk(str(scan_root)):
+            for fn in files:
+                if not fn.endswith('.py'):
+                    continue
+                try:
+                    with open(os.path.join(dp, fn), encoding='utf-8', errors='ignore') as fh:
+                        if pat.search(fh.read()):
+                            return True
+                except OSError:
+                    continue
+    return False
+
+
 def _safe_trigger(ds) -> str:
     t = (ds.trigger_word or f'dataset{ds.id}').strip()
     return ''.join(c if (c.isalnum() or c in '_-') else '_' for c in t) or f'dataset{ds.id}'
@@ -3073,19 +3119,28 @@ def _build_job_config_flux2klein(ds, dataset_folder: str, steps: int, training_f
 
 
 def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_folder=None) -> dict:
-    """Job-config ai-toolkit pour Qwen-Image (arch='qwen_image'). Deux cibles selon
-    `train_variant` (cf. _qwen_image_is_edit) : Qwen-Image-Edit-2511 (instruction-
-    edit, défaut) ou base Qwen-Image (T2I). Modelé sur _build_job_config_flux2klein
-    (même stratégie basse-VRAM quantize+low_vram+qfloat8, même CFG réel non distillé)
-    faute de recette Qwen-Image dédiée dans ce repo — TOUTES les valeurs ci-dessous
-    sont EXTRAPOLÉES (jamais mesurées sur un run réel) : rank/timestep (cf.
+    """Job-config ai-toolkit pour Qwen-Image. Deux cibles selon `train_variant`
+    (cf. _qwen_image_is_edit) : Qwen-Image-Edit-2511 (instruction-edit, défaut,
+    arch='qwen_image_edit') ou base Qwen-Image (T2I, arch='qwen_image'). Modelé
+    sur _build_job_config_flux2klein (même stratégie basse-VRAM
+    quantize+low_vram+qfloat8, même CFG réel non distillé) faute de recette
+    Qwen-Image dédiée dans ce repo — TOUTES les valeurs ci-dessous sont
+    EXTRAPOLÉES (jamais mesurées sur un run réel) : rank/timestep (cf.
     _DEFAULT_RANK/_DEFAULT_TIMESTEP), guidance_scale/sample_steps. À réviser dès
     qu'un run réel révèle un sous/sur-entraînement ou un déséquilibre VRAM.
 
-    ⚠️ Comme flux2_klein_*, `qwen_image` peut être une arch d'EXTENSION selon la
-    version d'ai-toolkit installée → garde de version obligatoire
-    (_aitoolkit_supports_qwen_image) sinon get_model_class retombe en silence sur
-    le loader SD legacy (LoRA corrompu)."""
+    ⚠️ `arch` DIFFÈRE selon la cible (bug corrigé 2026-07-26, cf.
+    _aitoolkit_supports_qwen_image_edit) : Qwen-Image et Qwen-Image-Edit sont
+    deux CLASSES ai-toolkit distinctes (QwenImageModel vs QwenImageEditModel,
+    cette dernière seule lit `batch.control_tensor`) — mettre 'qwen_image' pour
+    la cible Edit chargerait la classe de base, qui ignore silencieusement le
+    control_path qu'on écrit dans le dataset (_qwen_edit_control_fields),
+    entraînant un LoRA "Edit" jamais passé par le chemin conditionné. Comme
+    flux2_klein_*, les deux arch peuvent être des EXTENSIONS selon la version
+    d'ai-toolkit installée → garde de version obligatoire
+    (_aitoolkit_supports_qwen_image / _aitoolkit_supports_qwen_image_edit)
+    sinon get_model_class retombe en silence sur le loader SD legacy (LoRA
+    corrompu)."""
     trigger = _safe_trigger(ds)
     is_edit = _qwen_image_is_edit(ds)
     _qirank = _lora_rank(ds, 'qwen_image')   # défaut 32 (extrapolé) ; éditable via train_settings
@@ -3093,7 +3148,7 @@ def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_f
     # TE (Qwen2.5-VL) and VAE stay official.
     _qibase = getattr(ds, 'train_base_model', None)
     model = {
-        'arch': 'qwen_image',
+        'arch': 'qwen_image_edit' if is_edit else 'qwen_image',
         'name_or_path': (_qibase if _is_custom_weights(_qibase)
                          else ('Qwen/Qwen-Image-Edit-2511' if is_edit
                                else 'Qwen/Qwen-Image')),
@@ -4605,6 +4660,17 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         raise ValueError(
             "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
             "update it (git pull) before training a Qwen-Image LoRA.")
+    # Qwen-Image-Edit-2511 (the default variant) is a SEPARATE ai-toolkit arch
+    # class from base Qwen-Image (cf. _aitoolkit_supports_qwen_image_edit) —
+    # an install that has the base class but not yet the Edit one would
+    # otherwise silently train through the wrong class (no control-image
+    # conditioning at all, ever).
+    if (_train_type(ds) == 'qwen_image' and launch_engine == 'aitoolkit'
+            and _qwen_image_is_edit(ds, variant) and not _aitoolkit_supports_qwen_image_edit()):
+        raise ValueError(
+            "ai-toolkit doesn't support Qwen-Image-Edit yet (qwen_image_edit arch missing) - "
+            "update it (git pull) before training a Qwen-Image-Edit LoRA, or switch "
+            "the variant to base Qwen-Image.")
     # Engine axis (Wave 2): musubi-tuner is scoped to qwen_image only. ai-toolkit
     # stays a blanket requirement regardless (checked unconditionally above) —
     # musubi only replaces the actual subprocess-launch step below.
@@ -5599,6 +5665,13 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
         raise ValueError(
             "ai-toolkit doesn't support Qwen-Image yet (qwen_image arch missing) - "
             "update it (git pull) before queuing a Qwen-Image LoRA.")
+    # Qwen-Image-Edit : même garde qu'au lancement (cf. _aitoolkit_supports_qwen_image_edit).
+    if (ttype == 'qwen_image' and eng == 'aitoolkit'
+            and _qwen_image_is_edit(ds, var) and not _aitoolkit_supports_qwen_image_edit()):
+        raise ValueError(
+            "ai-toolkit doesn't support Qwen-Image-Edit yet (qwen_image_edit arch missing) - "
+            "update it (git pull) before queuing a Qwen-Image-Edit LoRA, or switch "
+            "the variant to base Qwen-Image.")
     # Engine axis (Wave 2) : même garde qu'au lancement.
     if eng not in _valid_engines_for(ttype):
         raise ValueError(f"the '{eng}' engine isn't available for the {ttype} family")

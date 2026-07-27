@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-aitoolkit-qwen-image-edit-arch-fix',
+    date: '2026-07-26',
+    title: '🎯 Qwen-Image-Edit LoRAs trained with ai-toolkit now train correctly too',
+    blurb:
+      'ai-toolkit treats Qwen-Image and Qwen-Image-Edit as two different model classes — training the Edit-2511 target was silently using the wrong one, so control images were loaded but never actually used. An update-ai-toolkit prompt now appears if this is missing instead of training silently through the wrong class.',
+    to: '/settings/local-tools',
+  },
+  {
     id: '2026-07-26-musubi-profile-overrides-visible',
     date: '2026-07-26',
     title: '👁️ Training panel now shows what a GPU profile actually overrides',

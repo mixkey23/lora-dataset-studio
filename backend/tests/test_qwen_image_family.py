@@ -12,14 +12,23 @@ import os
 import pytest
 
 
-def _configure_aitoolkit(tmp_path, app, supports_qwen=True):
+def _configure_aitoolkit(tmp_path, app, supports_qwen=True, supports_qwen_edit=True):
     """Fake ai-toolkit install (venv python + run.py), with or without the
-    qwen_image arch under extensions_built_in — what the support guard
-    actually scans."""
+    qwen_image/qwen_image_edit archs under extensions_built_in — what the two
+    support guards actually scan. Qwen-Image and Qwen-Image-Edit are SEPARATE
+    ai-toolkit classes (QwenImageModel vs QwenImageEditModel) — a real install
+    can have one without the other if Edit support landed in a later ai-toolkit
+    version, hence the two independent flags."""
     from app import config as cfg
     root = tmp_path / 'aitoolkit'
-    (root / 'venv' / 'Scripts').mkdir(parents=True)
-    (root / 'venv' / 'Scripts' / 'python.exe').write_text('fake')
+    # POSIX venv layout (pre-existing bug fixed 2026-07-26: a hardcoded
+    # Windows-only 'venv/Scripts/python.exe' never resolved on a POSIX test
+    # runner — aitoolkit_path('venv_python') only looks under 'venv/bin/python'
+    # when os.name != 'nt', silently leaving every launch_training() call in
+    # this file raising "ai-toolkit is not configured" instead of exercising
+    # the arch guards these tests are actually about).
+    (root / 'venv' / 'bin').mkdir(parents=True)
+    (root / 'venv' / 'bin' / 'python').write_text('fake')
     (root / 'run.py').write_text('fake')
     ext = root / 'extensions_built_in' / 'diffusion_models' / 'qwen_image'
     ext.mkdir(parents=True)
@@ -31,6 +40,10 @@ def _configure_aitoolkit(tmp_path, app, supports_qwen=True):
         (ext / 'other_model.py').write_text(
             '# qwen support not merged yet\n'
             'class OtherModel:\n    arch = "other"\n', encoding='utf-8')
+    if supports_qwen_edit:
+        (ext / 'qwen_image_edit.py').write_text(
+            'class QwenImageEditModel(QwenImageModel):\n    arch = "qwen_image_edit"\n',
+            encoding='utf-8')
     with app.app_context():
         cfg.save_config({'aitoolkit': {'dir': str(root)}})
     return root
@@ -77,13 +90,62 @@ def test_launch_refuses_qwen_image_when_arch_missing(app, tmp_path, monkeypatch)
     monkeypatch.setattr(lt.shutil, 'disk_usage',
                         lambda p: type('u', (), {'free': 500e9})())
     with app.app_context():
+        # qwen_image defaults to the musubi ENGINE — force ai-toolkit explicitly
+        # so this actually exercises the ai-toolkit arch guard under test.
         ds = svc.create_dataset(LOCAL_USER, 'QI', 'zchar_qi', train_type='qwen_image')
         with pytest.raises(ValueError, match=r'update it \(git pull\)'):
-            lt.launch_training(LOCAL_USER, ds.id, check_captions=False)
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='aitoolkit')
         # Same guard on the queue path — no deferred job doomed to the fallback.
         monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
         with pytest.raises(ValueError, match=r'update it \(git pull\)'):
-            lt.enqueue_training(LOCAL_USER, ds.id, extra_steps=100)
+            lt.enqueue_training(LOCAL_USER, ds.id, extra_steps=100, engine='aitoolkit')
+
+
+def test_aitoolkit_supports_qwen_image_edit_scans_extension_archs(app, tmp_path):
+    from app.services import lora_training as lt
+    _configure_aitoolkit(tmp_path, app, supports_qwen=True, supports_qwen_edit=True)
+    with app.app_context():
+        assert lt._aitoolkit_supports_qwen_image_edit() is True
+
+
+def test_aitoolkit_supports_qwen_image_edit_false_without_arch(app, tmp_path):
+    """Base Qwen-Image present but the Edit class isn't (bug fixed 2026-07-26:
+    they're separate ai-toolkit classes) -> False, distinct from the base
+    guard which is True here."""
+    from app.services import lora_training as lt
+    _configure_aitoolkit(tmp_path, app, supports_qwen=True, supports_qwen_edit=False)
+    with app.app_context():
+        assert lt._aitoolkit_supports_qwen_image() is True
+        assert lt._aitoolkit_supports_qwen_image_edit() is False
+
+
+def test_launch_refuses_qwen_image_edit_when_edit_arch_missing_but_base_present(app, tmp_path, monkeypatch):
+    """Bug fixed 2026-07-26: an ai-toolkit with the base Qwen-Image class but
+    not yet the Edit one used to silently train the DEFAULT (edit) variant
+    through the wrong class (arch='qwen_image', which never reads
+    batch.control_tensor) instead of refusing. The base T2I variant, which
+    doesn't need the Edit class at all, must still be allowed to proceed past
+    this specific guard."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app, supports_qwen=True, supports_qwen_edit=False)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    with app.app_context():
+        # qwen_image defaults to the musubi ENGINE — force ai-toolkit explicitly
+        # so this actually exercises the ai-toolkit arch guard under test.
+        ds = svc.create_dataset(LOCAL_USER, 'QIE', 'zchar_qie', train_type='qwen_image')
+        with pytest.raises(ValueError, match=r'qwen_image_edit arch missing'):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='aitoolkit')
+        monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+        with pytest.raises(ValueError, match=r'qwen_image_edit arch missing'):
+            lt.enqueue_training(LOCAL_USER, ds.id, extra_steps=100, engine='aitoolkit')
+        # Base T2I variant doesn't need the Edit class -> a DIFFERENT failure
+        # further down the pipeline (no kept images), never this guard.
+        with pytest.raises(ValueError, match=r'no kept images'):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False,
+                              engine='aitoolkit', variant='image')
 
 
 # --- 3) job config: base default / Edit-2511 opt-in -----------------------------
@@ -91,7 +153,14 @@ def test_launch_refuses_qwen_image_when_arch_missing(app, tmp_path, monkeypatch)
 def test_build_job_config_qwen_image_edit_default_and_base_optin(app, tmp_path):
     """'edit' (Qwen-Image-Edit-2511) is the default (repo owner's product call,
     since musubi's Qwen-Image tooling here targets Edit-2511); 'image' (base
-    T2I) is the opt-out. Non-distilled base -> real CFG previews."""
+    T2I) is the opt-out. Non-distilled base -> real CFG previews.
+
+    `arch` DIFFERS between the two targets (bug fixed 2026-07-26): ai-toolkit
+    registers Qwen-Image and Qwen-Image-Edit as separate classes
+    (QwenImageModel/'qwen_image' vs QwenImageEditModel/'qwen_image_edit' -
+    only the latter reads batch.control_tensor), verified directly against
+    ai-toolkit's own extensions_built_in/diffusion_models/qwen_image/
+    qwen_image_edit.py source."""
     from app.services import lora_training as lt
     from app.services import face_dataset_service as svc
     from app.config import LOCAL_USER
@@ -104,7 +173,7 @@ def test_build_job_config_qwen_image_edit_default_and_base_optin(app, tmp_path):
         assert lt._qwen_image_is_edit(ds) is True           # no variant -> edit (default)
         p = lt.build_job_config(ds, str(folder), steps=1500)['config']['process'][0]
         m = p['model']
-        assert m['arch'] == 'qwen_image'
+        assert m['arch'] == 'qwen_image_edit'
         assert m['name_or_path'] == 'Qwen/Qwen-Image-Edit-2511'
         assert m['quantize'] is True and m['quantize_te'] is True
         assert m['low_vram'] is True and m['qtype'] == 'qfloat8'
