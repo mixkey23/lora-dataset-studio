@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-slider-mode-musubi-conflict',
+    date: '2026-07-26',
+    title: '🎚 Slider LoRA now flags when it can\'t actually run',
+    blurb:
+      'Slider LoRA training only works on the ai-toolkit engine — picking musubi-tuner for a slider-enabled Qwen-Image dataset used to fail with a confusing "extension missing" error, or silently train a normal LoRA instead. It now shows a clear warning and blocks Train until you switch the engine.',
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-26-aitoolkit-qwen-image-edit-arch-fix',
     date: '2026-07-26',
     title: '🎯 Qwen-Image-Edit LoRAs trained with ai-toolkit now train correctly too',

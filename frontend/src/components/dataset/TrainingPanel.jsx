@@ -487,6 +487,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const sliderOn = !!slider?.enabled;
   const sliderPromptsMissing = sliderOn
     && (!(slider?.positive || '').trim() || !(slider?.negative || '').trim());
+  // musubi-tuner has zero slider support (bug fixed 2026-07-26) — block Train
+  // instead of letting the click reach the backend refusal.
+  const sliderMusubiConflict = sliderOn && engine === 'musubi';
   const saveSlider = async (patch) => {
     setSliderBusy(true);
     try {
@@ -1261,10 +1264,11 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             </select>
           </>
         )}
-        <button type="button" disabled={!status.installed || belowFloor || status.in_progress || baseBlocksTrain || sdxlNeedsBase || customWeightsEmpty || sliderPromptsMissing}
+        <button type="button" disabled={!status.installed || belowFloor || status.in_progress || baseBlocksTrain || sdxlNeedsBase || customWeightsEmpty || sliderPromptsMissing || sliderMusubiConflict}
           title={baseBlocksTrain ? 'Convert the custom base first'
             : customWeightsEmpty ? 'Enter the path to your custom weights .safetensors'
             : sdxlNeedsBase ? 'Choose a base SDXL checkpoint'
+            : sliderMusubiConflict ? 'Slider LoRA training is ai-toolkit-only — switch the engine above'
             : sliderPromptsMissing ? 'Slider mode needs both a positive and a negative prompt'
             : belowFloor
               ? (sliderOn
@@ -1314,7 +1318,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             Finish / re-enable ComfyUI
           </button>
         )}
-        {status.in_progress && status.installed && (keptCount >= trainMinFloor || allowNotReady) && !sliderPromptsMissing && (
+        {status.in_progress && status.installed && (keptCount >= trainMinFloor || allowNotReady) && !sliderPromptsMissing && !sliderMusubiConflict && (
           <button type="button" disabled={queued || baseBlocksTrain} onClick={enqueue}
             title={baseBlocksTrain
               ? 'Convert the selected custom base first'
@@ -1358,6 +1362,13 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
           the kept images are only a denoising substrate). Test it at negative and positive
           strengths in the Test Studio. Experimental: expect to iterate.
         </p>
+        {sliderOn && engine === 'musubi' && (
+          <p className="m-0 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-amber-300 text-[0.6875rem]">
+            ⚠ Slider LoRA training is ai-toolkit-only — musubi-tuner has no slider support
+            and would train a normal LoRA instead. Switch the engine above to ai-toolkit
+            before training this dataset.
+          </p>
+        )}
         {sliderOn && (
           <>
             <div className="grid gap-2 sm:grid-cols-2">

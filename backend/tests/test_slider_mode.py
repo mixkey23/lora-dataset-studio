@@ -384,6 +384,68 @@ def test_launch_refuses_when_concept_slider_extension_missing(app, tmp_path, mon
         assert lt._aitoolkit_supports_concept_slider() is True
 
 
+def _configure_musubi(tmp_path, app):
+    """Fake musubi-tuner install (venv python + the 3 Qwen-Image scripts +
+    weight paths) — enough for is_installed()/describe_missing_qwen_image_weights()
+    to pass so a launch reaches the slider guard under test."""
+    from app import config as cfg
+    root = tmp_path / 'musubi-tuner'
+    (root / '.venv' / 'bin').mkdir(parents=True)
+    (root / '.venv' / 'bin' / 'python').write_text('fake')
+    scripts = root / 'src' / 'musubi_tuner'
+    scripts.mkdir(parents=True)
+    (scripts / 'qwen_image_cache_latents.py').write_text('fake')
+    (scripts / 'qwen_image_cache_text_encoder_outputs.py').write_text('fake')
+    (scripts / 'qwen_image_train_network.py').write_text('fake')
+    weights_dir = tmp_path / 'weights'
+    weights_dir.mkdir()
+    dit, vae, te = (weights_dir / n for n in
+                    ('dit.safetensors', 'vae.safetensors', 'te.safetensors'))
+    for p in (dit, vae, te):
+        p.write_text('fake')
+    with app.app_context():
+        cfg.save_config({'musubi_tuner': {
+            'dir': str(root), 'qwen_image_dit': str(dit),
+            'qwen_image_vae': str(vae), 'qwen_image_text_encoder': str(te)}})
+    return root
+
+
+def test_launch_refuses_slider_on_musubi_engine(app, tmp_path, monkeypatch):
+    """Bug fixed 2026-07-26: musubi_tuner.py has zero slider awareness (no
+    slider block, no ConceptSliderTrainer wiring) — a musubi launch must
+    refuse outright rather than silently training a normal LoRA while the
+    dataset still says "slider mode on"."""
+    from app.services import lora_training as lt
+    from app import config as cfg
+    root = tmp_path / 'aitoolkit'
+    (root / '.venv' / 'bin').mkdir(parents=True)
+    (root / '.venv' / 'bin' / 'python').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    ext = root / 'extensions_built_in' / 'diffusion_models' / 'qwen_image'
+    ext.mkdir(parents=True)
+    (ext / 'qwen_image_model.py').write_text(
+        'class QwenImageModel:\n    arch = "qwen_image"\n', encoding='utf-8')
+    (ext / 'qwen_image_edit.py').write_text(
+        'class QwenImageEditModel(QwenImageModel):\n    arch = "qwen_image_edit"\n',
+        encoding='utf-8')
+    _configure_musubi(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(root)}})
+        ds = _mk(app, n_keep=6, train_type='qwen_image', trigger='sl_musubi')
+        _enable_slider(ds)
+        with pytest.raises(ValueError, match=r'ai-toolkit-only'):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+        with pytest.raises(ValueError, match=r'ai-toolkit-only'):
+            lt.enqueue_training(LOCAL_USER, ds.id, engine='musubi')
+        # ai-toolkit engine on the SAME slider-enabled dataset must not trip
+        # this new guard (no concept_slider extension configured here, so it
+        # hits that PRE-EXISTING, unrelated refusal instead).
+        with pytest.raises(ValueError, match=r"doesn't ship the concept_slider trainer"):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='aitoolkit')
+
+
 # --- 5b) VRAM default: slider trains at 768 only unless overridden --------------
 
 def test_slider_defaults_to_768_only_resolution(app, tmp_path):

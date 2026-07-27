@@ -4688,10 +4688,22 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
             raise ValueError(
                 "musubi-tuner is missing Qwen-Image weight path(s): "
                 f"{', '.join(_missing_weights)} - set them in Settings → Local tools.")
-    # Slider mode (Beta) : the modern `concept_slider` trainer is an ai-toolkit
-    # EXTENSION — an older install would crash at job boot on the unknown process
-    # type. Refuse early with the fix, like the krea2/flux2klein arch guards.
-    if slider_mode_enabled(ds) and not _aitoolkit_supports_concept_slider():
+    # Slider mode (Beta) is ai-toolkit-only (bug fixed 2026-07-26): musubi_tuner.py
+    # has ZERO slider awareness (no slider block, no ConceptSliderTrainer wiring) —
+    # letting a musubi launch through would silently train a NORMAL LoRA while the
+    # UI still claimed "slider mode", which is worse than refusing outright (the
+    # old unconditional guard below at least stopped the launch, just for the
+    # wrong reason - demanding an ai-toolkit extension a musubi run never uses).
+    if launch_engine == 'musubi' and slider_mode_enabled(ds):
+        raise ValueError(
+            "Slider LoRA training is ai-toolkit-only - switch the engine to "
+            "ai-toolkit, or turn off Slider mode, before training this dataset.")
+    # The modern `concept_slider` trainer is an ai-toolkit EXTENSION — an older
+    # install would crash at job boot on the unknown process type. Refuse early
+    # with the fix, like the krea2/flux2klein arch guards. Only meaningful for
+    # an actual ai-toolkit launch (checked above).
+    if (launch_engine == 'aitoolkit' and slider_mode_enabled(ds)
+            and not _aitoolkit_supports_concept_slider()):
         raise ValueError(
             "ai-toolkit doesn't ship the concept_slider trainer - "
             "update it (git pull) before training a Slider LoRA.")
@@ -5672,6 +5684,16 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
             "ai-toolkit doesn't support Qwen-Image-Edit yet (qwen_image_edit arch missing) - "
             "update it (git pull) before queuing a Qwen-Image-Edit LoRA, or switch "
             "the variant to base Qwen-Image.")
+    # Slider mode : même garde qu'au lancement (musubi n'a aucune notion de slider).
+    if eng == 'musubi' and slider_mode_enabled(ds):
+        raise ValueError(
+            "Slider LoRA training is ai-toolkit-only - switch the engine to "
+            "ai-toolkit, or turn off Slider mode, before queuing this dataset.")
+    if (eng == 'aitoolkit' and slider_mode_enabled(ds)
+            and not _aitoolkit_supports_concept_slider()):
+        raise ValueError(
+            "ai-toolkit doesn't ship the concept_slider trainer - "
+            "update it (git pull) before queuing a Slider LoRA.")
     # Engine axis (Wave 2) : même garde qu'au lancement.
     if eng not in _valid_engines_for(ttype):
         raise ValueError(f"the '{eng}' engine isn't available for the {ttype} family")
