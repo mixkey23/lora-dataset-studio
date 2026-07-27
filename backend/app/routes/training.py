@@ -1096,6 +1096,26 @@ def _folder_scope_kwargs(args) -> dict:
     return kw
 
 
+@bp.get('/dataset/<int:dataset_id>/train/log')
+def dataset_train_log(dataset_id):
+    """Live tail of THIS run's training.log — the raw CLI output (ai-toolkit or
+    musubi-tuner), so a run can be watched end-to-end instead of only seeing a
+    log tail after a crash. Same run-scope query params as the folder browser
+    (train_type/base_model/variant)."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    try:
+        n = max(10, min(2000, int(request.args.get('n', 300))))
+    except ValueError:
+        n = 300
+    try:
+        data = lt.tail_run_log(LOCAL_USER, dataset_id, n=n,
+                               **_folder_scope_kwargs(request.args))
+    except Exception as e:
+        return _map_error(e)
+    return jsonify({'ok': True, **data})
+
+
 @bp.get('/dataset/<int:dataset_id>/train/folder/<target>/files')
 def dataset_train_folder_files(dataset_id, target):
     """In-app file browser: list one of the 3 server-resolved training

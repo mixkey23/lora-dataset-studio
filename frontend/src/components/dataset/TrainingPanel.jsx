@@ -184,6 +184,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const [checkpointVariant, setCheckpointVariant] = useState('turbo');
   const checkpointSelectionDataset = useRef(null);
   const checkpointRequest = useRef(0);
+  // Live CLI log viewer for the browse filter's run — see loadRunLog below.
+  const [logViewerOpen, setLogViewerOpen] = useState(false);
+  const [runLog, setRunLog] = useState({ exists: false, lines: [] });
   // Réglages ai-toolkit avancés éditables (rank / resolution / save_every /
   // sample_every / sample_prompts), chargés depuis base-info ; persistés par POST
   // /train/settings via ds.setTrainSettings.
@@ -913,6 +916,28 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     if (!r.ok) throw new Error('unavailable');
     return r.json();
   };
+  // 🖥 Live log: raw training.log tail for the browse filter's run, so the
+  // whole CLI process (ai-toolkit or musubi-tuner) can be watched end-to-end
+  // instead of only seeing a tail after a crash. Same run scope as the folder
+  // browser/open-folder buttons right next to it.
+  const loadRunLog = async () => {
+    const qs = new URLSearchParams({ n: '400' });
+    if (checkpointTrainType) qs.set('train_type', checkpointTrainType);
+    if (checkpointBase !== undefined && checkpointBase !== null) qs.set('base_model', checkpointBase);
+    if (checkpointVariant) qs.set('variant', checkpointVariant);
+    try {
+      const r = await fetch(`/api/dataset/${ds.currentId}/train/log?${qs.toString()}`,
+        { credentials: 'include' });
+      if (r.ok) setRunLog(await r.json());
+    } catch { /* best-effort */ }
+  };
+  useEffect(() => {
+    if (!logViewerOpen) return undefined;
+    loadRunLog();
+    const id = setInterval(loadRunLog, 3000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logViewerOpen, ds.currentId, checkpointTrainType, checkpointBase, checkpointVariant]);
   // The manager is "open" when portaled to its sidebar host, or expanded inline.
   const checkpointManagerOpen = Boolean(checkpointHost) || checkpointsOpen;
   // Auto-load the lineage the moment the graph view is the one showing (default),
@@ -2419,10 +2444,42 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
               className="px-2 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs">
               🗂
             </button>
+            <button type="button"
+              onClick={() => setLogViewerOpen((v) => !v)}
+              aria-expanded={logViewerOpen}
+              title="Watch this run's raw CLI output live (ai-toolkit or musubi-tuner), refreshes every 3s"
+              className="px-3 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs font-semibold">
+              🖥 {logViewerOpen ? 'Hide log' : 'Live log'}
+            </button>
             <span className="text-content-subtle text-[0.625rem]">
               import the checkpoint you like into ComfyUI to use (and test) the LoRA
             </span>
           </div>
+
+          {logViewerOpen && (
+            <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface-raised p-2">
+              <div className="flex items-center gap-2">
+                <span className="text-content-subtle text-[0.625rem]">
+                  {runLog.exists
+                    ? `training.log — last ${runLog.lines.length} lines, refreshes every 3s`
+                    : 'no training.log for this run yet'}
+                </span>
+                <button type="button" onClick={loadRunLog}
+                  className="ml-auto px-2 py-0.5 rounded-md border border-border bg-surface text-content text-[0.625rem]">
+                  ↻ Refresh
+                </button>
+                <button type="button"
+                  onClick={() => { try { navigator.clipboard.writeText(runLog.lines.join('')); } catch { /* ignore */ } }}
+                  disabled={!runLog.lines.length}
+                  className="px-2 py-0.5 rounded-md border border-border bg-surface text-content text-[0.625rem] disabled:opacity-40">
+                  📋 Copy all
+                </button>
+              </div>
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-app/60 p-2 text-[10.5px] leading-snug text-content-muted">
+                {runLog.lines.length ? runLog.lines.join('') : 'Log is empty.'}
+              </pre>
+            </div>
+          )}
 
           {/* ◉ Graph — the DEFAULT view: the dataset's runs + their checkpoints as
               one genealogy, where each pill can be imported / generated / downloaded

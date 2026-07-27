@@ -3444,6 +3444,28 @@ def list_folder_files(user_id, dataset_id, target='loras', family=None,
     return out
 
 
+def tail_run_log(user_id, dataset_id, n=300, family=None,
+                 base_model=_PERSISTED, variant=_PERSISTED) -> dict:
+    """Last `n` lines of THIS run's training.log — the in-app live viewer asked
+    for after a silent musubi-tuner failure left no checkpoint and no visible
+    error (the crash banner only shows a tail on a non-zero exit code; a run
+    that hangs or that a restarted server lost track of had nothing to show).
+    {'exists': bool, 'lines': [...]} — a missing log (nothing launched yet, or
+    an archived run) is normal, not an error."""
+    ds = fds.get_dataset(user_id, dataset_id)
+    if not ds:
+        raise ValueError('dataset not found')
+    path = os.path.join(_run_dir(user_id, dataset_id, base_model, family, variant),
+                        'training.log')
+    if not os.path.isfile(path):
+        return {'exists': False, 'lines': []}
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return {'exists': True, 'lines': fh.readlines()[-max(1, int(n)):]}
+    except OSError:
+        return {'exists': True, 'lines': ['(log unreadable)']}
+
+
 def folder_file_path(user_id, dataset_id, target, filename, family=None,
                      base_model=_PERSISTED, variant=_PERSISTED):
     """Absolute path of ONE file from list_folder_files, for a browser

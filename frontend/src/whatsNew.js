@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-27-checkpoints-live-log',
+    date: '2026-07-27',
+    title: '🖥 Watch a training run\'s raw CLI output live',
+    blurb:
+      'The "Checkpoints & LoRAs" panel now has a "Live log" button that tails this run\'s training.log in-app, refreshing every few seconds — so you can follow ai-toolkit or musubi-tuner end-to-end instead of only seeing a tail after a crash.',
+    to: '/datasets?section=checkpoints&panel=manager',
+  },
+  {
     id: '2026-07-26-custom-weights-diffusers-folder',
     date: '2026-07-26',
     title: '📁 Custom weights now accept an already-downloaded local model folder',
