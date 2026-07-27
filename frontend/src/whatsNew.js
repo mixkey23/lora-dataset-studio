@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-musubi-profile-overrides-visible',
+    date: '2026-07-26',
+    title: '👁️ Training panel now shows what a GPU profile actually overrides',
+    blurb:
+      'Picking a musubi-tuner GPU profile silently overrode the LoRA rank and Optimizer fields — they now grey out and show the profile\'s real value instead. LR schedule, EMA and Network (LoKr) also grey out whenever musubi-tuner is the selected engine, since it never reads any of the three.',
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-26-musubi-sample-resolution-cap',
     date: '2026-07-26',
     title: '🛡️ Fixed an out-of-memory crash on musubi-tuner’s high-VRAM profiles',

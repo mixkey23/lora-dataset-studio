@@ -198,6 +198,8 @@ Every non-Auto profile also switches `optimizer_type` to `AdaFactor` (with the a
 
 Two SECourses fields were deliberately **not** ported: `compile`/torch.compile and CPU-offloading the text-encoder caching step — SECourses runs their own musubi-tuner fork, and neither flag is confirmed present on the official kohya-ss scripts this app targets, so adding them could crash the launch outright instead of degrading.
 
+Picking a profile other than Auto **overrides** the LoRA rank and Optimizer controls above (musubi-tuner uses the profile's own values regardless of what those fields show) — both are disabled and show the profile's effective value while a profile is active. LR schedule/warmup, EMA and Network (LoKr) are disabled whenever the musubi-tuner engine is selected at all, profile or not — musubi-tuner doesn't read any of the three (always constant LR, no EMA, LoRA only); those controls only take effect on the ai-toolkit engine.
+
 Auto is byte-identical to how musubi-tuner ran before this setting existed. If you've validated different numbers on your own hardware, the per-dataset Advanced options above (rank, etc.) still let you override anything a profile sets.
 
 ## Captioning & quality

@@ -442,6 +442,15 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const advMusubiProfileChoices = adv?.musubi_profile_choices
     ?? ['vram48', 'vram29', 'rtx5090', 'vram22', 'vram11', 'vram5'];
   const advMusubiProfiles = adv?.musubi_profiles ?? {};
+  // A profile ≠ Auto silently OVERRIDES rank/optimizer at launch (see
+  // musubi_tuner.build_train_argv) — this drives disabling those two fields
+  // below and showing the effective value instead of the ignored one.
+  const advMusubiProfileObj = (engine === 'musubi' && advMusubiProfile !== 'auto')
+    ? advMusubiProfiles[advMusubiProfile] : null;
+  // These, in contrast, are ai-toolkit-only regardless of profile — musubi's
+  // build_train_argv never reads lr_scheduler/warmup, and EMA/LoKr have no
+  // musubi wiring at all (always LoRA, no EMA fields emitted).
+  const advMusubiEngineActive = engine === 'musubi';
   const advEma = adv?.ema ?? 0;
   const advEmaChoices = adv?.ema_choices ?? [0.99, 0.999];
   const advDualCaptions = Boolean(adv?.dual_captions);
@@ -1745,12 +1754,17 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                 <select value={String(advRankChoice)}
                   onChange={(e) => saveAdv({ rank: e.target.value === 'auto' ? 'auto' : Number(e.target.value) })}
                   aria-label="LoRA rank"
-                  className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                  disabled={!!advMusubiProfileObj}
+                  className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                   <option value="auto">Auto ({advDefaultRank})</option>
                   <option value="8">8</option><option value="16">16</option><option value="24">24</option>
                   <option value="32">32</option><option value="48">48</option><option value="64">64</option>
                 </select>
-                <span className="text-content-subtle text-[0.625rem] tabular-nums">→ rank {advEffRank} / alpha {advEffAlpha}</span>
+                <span className="text-content-subtle text-[0.625rem] tabular-nums">
+                  {advMusubiProfileObj
+                    ? `→ rank ${advMusubiProfileObj.rank} (set by GPU profile, this field is ignored)`
+                    : `→ rank ${advEffRank} / alpha ${advEffAlpha}`}
+                </span>
               </div>
               <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
                 <b className="text-content-muted font-medium">Why:</b> how much capacity the LoRA has to learn the
@@ -1877,11 +1891,15 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   <span className="text-content text-[0.75rem] w-28 shrink-0">Network</span>
                   <select value={advNetworkType} onChange={(e) => saveAdv({ network_type: e.target.value })}
                     aria-label="Network type"
-                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                    disabled={advMusubiEngineActive}
+                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                     {advNetworkChoices.map((n) => <option key={n} value={n}>{n === 'lora' ? 'LoRA (default)' : 'LoKr'}</option>)}
                   </select>
                   {advNetworkType === 'lokr' && !advNetworkSupported && (
                     <span className="text-amber-300 text-[0.625rem]" title={`LoKr isn't supported for ${trainType} — this run would fall back to LoRA.`}>⚠ not supported for {trainType}</span>
+                  )}
+                  {advMusubiEngineActive && (
+                    <span className="text-content-subtle text-[0.625rem]">→ musubi-tuner always uses LoRA</span>
                   )}
                 </div>
                 <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
@@ -1925,10 +1943,14 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   <select value={String(advEma)}
                     onChange={(e) => saveAdv({ ema: e.target.value === '0' ? 'off' : Number(e.target.value) })}
                     aria-label="EMA (exponential moving average)"
-                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                    disabled={advMusubiEngineActive}
+                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                     <option value="0">Off (default)</option>
                     {advEmaChoices.map((d) => <option key={d} value={String(d)}>{d}</option>)}
                   </select>
+                  {advMusubiEngineActive && (
+                    <span className="text-content-subtle text-[0.625rem]">→ not used by musubi-tuner</span>
+                  )}
                 </div>
                 <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
                   <b className="text-content-muted font-medium">Why:</b> exponential moving average of the weights —
@@ -2022,9 +2044,15 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   <span className="text-content text-[0.75rem] w-28 shrink-0">Optimizer</span>
                   <select value={advOptimizer} onChange={(e) => saveAdv({ optimizer: e.target.value })}
                     aria-label="Optimizer"
-                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                    disabled={!!advMusubiProfileObj}
+                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                     {advOptimizerChoices.map((o) => <option key={o} value={o}>{o}{o === 'adamw8bit' ? ' (default)' : ''}</option>)}
                   </select>
+                  {advMusubiProfileObj && (
+                    <span className="text-content-subtle text-[0.625rem]">
+                      → {advMusubiProfileObj.optimizer} (set by GPU profile, this field is ignored)
+                    </span>
+                  )}
                 </div>
                 <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
                   <b className="text-content-muted font-medium">Why:</b> how the weights are updated — the biggest training
@@ -2035,21 +2063,27 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   the ai-toolkit venv. Picking an auto-LR optimiser is the &quot;push further without cranking the LR&quot; move.
                 </span>
               </div>
-              {/* LR schedule (+ warmup, only for the warmup schedule) */}
+              {/* LR schedule (+ warmup, only for the warmup schedule) — ai-toolkit
+                  only: musubi-tuner's own build_train_argv never reads either. */}
               <div className="flex flex-col gap-0.5">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-content text-[0.75rem] w-28 shrink-0">LR schedule</span>
                   <select value={advLrSched} onChange={(e) => saveAdv({ lr_scheduler: e.target.value })}
                     aria-label="Learning-rate schedule"
-                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                    disabled={advMusubiEngineActive}
+                    className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                     {advLrSchedChoices.map((s) => <option key={s} value={s}>{LR_SCHED_LABELS[s] || s}</option>)}
                   </select>
                   {advLrSched === 'constant_with_warmup' && (
                     <select value={String(advWarmup || 100)} onChange={(e) => saveAdv({ warmup: Number(e.target.value) })}
                       aria-label="Warmup steps"
-                      className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                      disabled={advMusubiEngineActive}
+                      className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                       {advWarmupChoices.map((w) => <option key={w} value={String(w)}>{w} warmup</option>)}
                     </select>
+                  )}
+                  {advMusubiEngineActive && (
+                    <span className="text-content-subtle text-[0.625rem]">→ not used by musubi-tuner</span>
                   )}
                 </div>
                 <span className="text-content-subtle text-[0.6875rem] leading-relaxed">

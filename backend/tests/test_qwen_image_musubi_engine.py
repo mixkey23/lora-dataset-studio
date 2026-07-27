@@ -397,6 +397,23 @@ def test_launch_musubi_sample_resolution_not_bumped_up_for_vram5(app, tmp_path, 
     assert captured_samples == {'width': 768, 'height': 768}
 
 
+def test_effective_train_settings_exposes_profile_optimizer_for_ui_override_note(app, tmp_path):
+    """The panel disables Rank/Optimizer and shows the profile's effective value
+    instead when a GPU profile != Auto is active (repo owner's request,
+    2026-07-26) - it needs `optimizer` alongside `rank`/`label`/`note` per
+    profile, not just `rank` alone."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP4', 'zchar_qip4', train_type='qwen_image')
+        snap = lt.effective_train_settings(ds)
+        for name, profile in mt.MUSUBI_PROFILES.items():
+            assert snap['musubi_profiles'][name]['optimizer'] == profile['optimizer']
+            assert snap['musubi_profiles'][name]['rank'] == profile['rank']
+
+
 def test_update_train_settings_musubi_profile_validation():
     """Covered without app fixtures elsewhere in the suite; here we only check
     the choices constant lines up with what update_train_settings accepts."""

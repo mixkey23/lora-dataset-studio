@@ -1543,7 +1543,8 @@ def effective_train_settings(ds, family=None) -> dict:
             # second round-trip.
             'musubi_profile': s.get('musubi_profile') if s.get('musubi_profile') in musubi_tuner.MUSUBI_PROFILE_CHOICES else None,
             'musubi_profile_choices': list(musubi_tuner.MUSUBI_PROFILE_CHOICES),
-            'musubi_profiles': {k: {'label': v['label'], 'note': v['note'], 'rank': v['rank']}
+            'musubi_profiles': {k: {'label': v['label'], 'note': v['note'], 'rank': v['rank'],
+                                    'optimizer': v['optimizer']}
                                 for k, v in musubi_tuner.MUSUBI_PROFILES.items()},
             # LoKr is arch-generic in ai-toolkit → offered on every family. The flag
             # mirrors timestep_type_supported so the UI can gate a future family with
