@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-27-pinned-checkpoints-modals-fix',
+    date: '2026-07-27',
+    title: '🗂 The in-app folder browser and "Continue training" work from any section now',
+    blurb:
+      'Pinning "Checkpoints & LoRAs" to the sidebar made its 🗂 folder-browser and "▶ Continue" buttons reachable from anywhere — but clicking them while on a different section silently did nothing (they popped into view only after switching back). Both now render correctly no matter which section you\'re on.',
+    to: '/datasets?section=checkpoints&panel=manager',
+  },
+  {
     id: '2026-07-27-per-attempt-run-log',
     date: '2026-07-27',
     title: '📄 Every training attempt now keeps its own log',

@@ -13,6 +13,7 @@
  * (Prodigy) run. `settings` supplies optimizer + learning_rate so the LR hint and
  * the Prodigy-disabled state are truthful. */
 import { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { HelpBadge } from '../../help/HelpMode';
 
 const SAVE_CHOICES = [250, 500, 1000];
@@ -110,7 +111,13 @@ export default function ContinueDialog({
     return `step ${s}${tags.length ? ` — ${tags.join(', ')}` : ''}`;
   };
 
-  return (
+  // Portaled to document.body (repo owner report: the local Training panel's
+  // in-place buttons can be pinned/portaled to a sidebar host reachable from
+  // any workspace section, but THIS dialog rendered inline stayed inside the
+  // 'training' section's div — every inactive section is display:none, which
+  // hides descendants outright regardless of position:fixed/z-index. Same
+  // fix as TrainingFolderBrowserModal — see its comment for the full story).
+  return createPortal((
     <div role="dialog" aria-modal="true" aria-label="Continue training"
       className="fixed inset-0 z-[9990] bg-black/80 flex items-center justify-center p-3"
       onClick={(e) => { if (e.target === e.currentTarget) onResolve(null); }}>
@@ -252,5 +259,5 @@ export default function ContinueDialog({
         </div>
       </div>
     </div>
-  );
+  ), document.body);
 }

@@ -3,8 +3,22 @@
  * 📂 "Open folder" button when the OS has no file manager to hand off to
  * (xdg-open silently no-ops on a desktop-less/snap-confined Linux box; a
  * real repo-owner report). Lists filename/size/modified, each row downloads
- * straight from the browser — no OS shell-out involved. */
+ * straight from the browser — no OS shell-out involved.
+ *
+ * Repo owner report: clicking 🗂 from the Checkpoints panel while it's
+ * PORTALED to the sidebar (checkpointHost — pinned so it's reachable from any
+ * workspace section) silently did nothing, yet switching to the Training
+ * section made the very same modal pop into view. Root cause: this component
+ * is declared inside TrainingPanel's own render tree, which lives in the
+ * dataset workspace's 'training' section div — every inactive section is
+ * `className="hidden"` (display:none) rather than unmounted, and `display:
+ * none` hides ALL descendants outright, `position: fixed` or not, no matter
+ * how high its z-index. The buttons are reachable from anywhere (portaled),
+ * but this modal wasn't, so it rendered into a hidden subtree whenever the
+ * user wasn't already on the Training section. Portaling to `document.body`
+ * makes it immune to every ancestor's display/transform/overflow, always. */
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -47,7 +61,7 @@ export default function TrainingFolderBrowserModal({ datasetId, target, scope = 
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  return (
+  return createPortal((
     <div role="dialog" aria-modal="true" aria-label={label || 'Browse files'}
       className="fixed inset-0 z-[9990] bg-black/80 flex items-center justify-center p-3"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -96,5 +110,5 @@ export default function TrainingFolderBrowserModal({ datasetId, target, scope = 
         )}
       </div>
     </div>
-  );
+  ), document.body);
 }
