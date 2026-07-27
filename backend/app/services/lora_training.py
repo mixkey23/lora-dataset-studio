@@ -490,6 +490,41 @@ def _detect_safetensors_arch(keys) -> str | None:
     return None
 
 
+# diffusers `_class_name` -> family, for a LOCAL diffusers-format folder used as
+# `weights` (ai-toolkit's `name_or_path`/`extras_name_or_path` accept a HF repo id
+# OR a local folder interchangeably — verified against ai-toolkit's own
+# extensions_built_in/diffusion_models/qwen_image/qwen_image.py:
+# `QwenImageTransformer2DModel.from_pretrained(model_path, subfolder="transformer", ...)`
+# and the official config/examples/train_lora_qwen_image_edit_32gb.yaml, whose
+# `model.name_or_path` comment literally says "huggingface model name or path").
+# Only a CONFIRMED class name is mapped — an unmapped/unreadable config falls back
+# to the same confirmable "unverified" path as an undetectable .safetensors file,
+# never a guess.
+_DIFFUSERS_CLASS_ARCH = {'QwenImageTransformer2DModel': 'qwen_image'}
+
+
+def _detect_diffusers_dir_arch(path) -> str | None:
+    """Best-effort architecture family from a local diffusers-format folder's
+    transformer config `_class_name` — the folder equivalent of
+    `_detect_safetensors_arch` for a single-file checkpoint. Checks
+    `<path>/transformer/config.json` (the standard diffusers pipeline layout)
+    then `<path>/config.json` (a bare component folder). Returns None on any
+    missing/unreadable/unrecognized config — never raises."""
+    for rel in ('transformer/config.json', 'config.json'):
+        cfg_path = os.path.join(path, rel)
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        fam = _DIFFUSERS_CLASS_ARCH.get(data.get('_class_name'))
+        if fam:
+            return fam
+    return None
+
+
 # --- Trained-LoRA architecture detector (the deploy/Studio guardrail) ---------
 # The base sniff above targets full UNET checkpoints (a BASE); a TRAINED LoRA has
 # a different, prefixed key layout (lora_A/lora_B, lokr_w*, kohya lora_unet_*). A
@@ -612,9 +647,10 @@ def lora_arch_conflicts(detected, family) -> bool:
 
 
 _FAMILY_EXPECTED_ARCH = {'sdxl': 'sdxl', 'krea': 'krea2',
-                         'flux': 'flux', 'flux2klein': 'flux'}
+                         'flux': 'flux', 'flux2klein': 'flux',
+                         'qwen_image': 'qwen_image'}
 _ARCH_LABEL = {'sdxl': 'an SDXL', 'sd15': 'a Stable Diffusion 1.5',
-               'flux': 'a FLUX', 'krea2': 'a Krea 2'}
+               'flux': 'a FLUX', 'krea2': 'a Krea 2', 'qwen_image': 'a Qwen-Image'}
 _FAMILY_LABEL = {'sdxl': 'SDXL', 'krea': 'Krea 2',
                  'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein',
                  'qwen_image': 'Qwen-Image'}
@@ -636,18 +672,28 @@ def preflight_custom_paths(family, weights=None, vae_path=None, te_path=None,
                            allow_unverified_weights=False) -> None:
     """Validate the custom base/vae/te BEFORE any run dir or spawn (guardrail).
 
+    `weights` may be a single-file .safetensors merge OR a local diffusers-format
+    FOLDER (repo owner's request, 2026-07-26: ai-toolkit's own `name_or_path` /
+    `extras_name_or_path` accept a HF repo id or a local folder interchangeably —
+    diffusers' from_pretrained() resolves either transparently, and this app's own
+    job-config already just forwards `weights` as-is either way; only this
+    preflight ever rejected a folder outright).
+
     HARD failures (→ ValueError, mapped to 400): a provided path that does not
-    exist, or a .safetensors whose header can't be parsed. A file whose
+    exist, or a .safetensors whose header can't be parsed. A file/folder whose
     architecture can't be POSITIVELY matched to `family` raises a CONFIRMABLE
     ValueError (the _UNVERIFIED_MARKER) unless `allow_unverified_weights` — the
     same confirm-and-retry contract as UNCAPTIONED. vae_path/te_path are only
     ever passed for SDXL (the caller enforces the per-family whitelist)."""
     fam_label = _FAMILY_LABEL.get(family, family)
     if _is_custom_weights(weights):
-        if not os.path.isfile(weights):
-            raise ValueError(f'custom weights file not found: {weights}')
-        keys = _safetensors_tensor_keys(weights)   # raises on unreadable header
-        detected = _detect_safetensors_arch(keys)
+        if os.path.isdir(weights):
+            detected = _detect_diffusers_dir_arch(weights)
+        elif os.path.isfile(weights):
+            keys = _safetensors_tensor_keys(weights)   # raises on unreadable header
+            detected = _detect_safetensors_arch(keys)
+        else:
+            raise ValueError(f'custom weights path not found: {weights}')
         expected = _FAMILY_EXPECTED_ARCH.get(family)
         if expected is None or detected != expected:
             if not allow_unverified_weights:

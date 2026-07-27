@@ -143,6 +143,74 @@ def test_preflight_undetectable_arch_is_confirmable(tmp_path):
     lt.preflight_custom_paths('flux', weights=blob, allow_unverified_weights=True)
 
 
+def _mk_diffusers_dir(tmp_path, name, class_name, flat=False):
+    """A local diffusers-format folder stub: <root>/transformer/config.json with
+    `_class_name` (the standard pipeline layout), or <root>/config.json directly
+    when `flat` (a bare component folder)."""
+    root = tmp_path / name
+    sub = root if flat else root / 'transformer'
+    sub.mkdir(parents=True)
+    (sub / 'config.json').write_text(json.dumps({'_class_name': class_name}), encoding='utf-8')
+    return str(root)
+
+
+def test_detect_diffusers_dir_arch_qwen_image(tmp_path):
+    """Bug fixed 2026-07-26 (repo owner's request): ai-toolkit's own name_or_path
+    accepts a HF repo id OR a local diffusers-format folder interchangeably
+    (verified against its qwen_image.py source and the official 32gb example
+    config's own "huggingface model name or path" comment) — this app only
+    supported a single-file .safetensors merge before."""
+    from app.services import lora_training as lt
+    d = _mk_diffusers_dir(tmp_path, 'qwen-edit-2511', 'QwenImageTransformer2DModel')
+    assert lt._detect_diffusers_dir_arch(d) == 'qwen_image'
+    flat = _mk_diffusers_dir(tmp_path, 'qwen-edit-2511-flat', 'QwenImageTransformer2DModel', flat=True)
+    assert lt._detect_diffusers_dir_arch(flat) == 'qwen_image'
+
+
+def test_detect_diffusers_dir_arch_unrecognized_class_is_none(tmp_path):
+    """An unmapped class name (or a class this app has no signature for, e.g. a
+    FLUX/SDXL diffusers export) must fall back to None -> the same confirmable
+    'unverified' path as an undetectable .safetensors file, never a guess."""
+    from app.services import lora_training as lt
+    d = _mk_diffusers_dir(tmp_path, 'mystery', 'SomeOtherTransformer')
+    assert lt._detect_diffusers_dir_arch(d) is None
+
+
+def test_detect_diffusers_dir_arch_missing_or_corrupt_config_is_none(tmp_path):
+    from app.services import lora_training as lt
+    empty = tmp_path / 'empty-dir'
+    empty.mkdir()
+    assert lt._detect_diffusers_dir_arch(str(empty)) is None
+    corrupt = tmp_path / 'corrupt'
+    (corrupt / 'transformer').mkdir(parents=True)
+    (corrupt / 'transformer' / 'config.json').write_text('not json', encoding='utf-8')
+    assert lt._detect_diffusers_dir_arch(str(corrupt)) is None
+
+
+def test_preflight_diffusers_folder_matching_arch_passes(tmp_path):
+    """A verified local Qwen-Image-Edit diffusers folder is accepted outright —
+    no confirmation needed, exactly like a matching-arch .safetensors file."""
+    from app.services import lora_training as lt
+    d = _mk_diffusers_dir(tmp_path, 'qwen-edit-2511', 'QwenImageTransformer2DModel')
+    lt.preflight_custom_paths('qwen_image', weights=d)
+
+
+def test_preflight_diffusers_folder_unrecognized_is_confirmable(tmp_path):
+    from app.services import lora_training as lt
+    d = _mk_diffusers_dir(tmp_path, 'mystery', 'SomeOtherTransformer')
+    with pytest.raises(ValueError, match='CUSTOM_WEIGHTS_UNVERIFIED'):
+        lt.preflight_custom_paths('qwen_image', weights=d)
+    lt.preflight_custom_paths('qwen_image', weights=d, allow_unverified_weights=True)
+
+
+def test_preflight_missing_custom_weights_path_hard_refuse(tmp_path):
+    """Neither a file nor a folder exists at the path -> hard refuse, same as
+    the existing missing-.safetensors-file case."""
+    from app.services import lora_training as lt
+    with pytest.raises(ValueError, match='custom weights path not found'):
+        lt.preflight_custom_paths('qwen_image', weights=str(tmp_path / 'does-not-exist-anywhere'))
+
+
 def test_preflight_vae_and_te(tmp_path):
     from app.services import lora_training as lt
     # missing VAE file → hard refuse

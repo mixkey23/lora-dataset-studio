@@ -1083,7 +1083,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     : (vaePath || tePath)
       ? 'Custom VAE/text-encoder overrides are local-only — clear them in Advanced options to train in the cloud'
     : customWeightsEmpty
-      ? 'Enter the path to your custom weights .safetensors first'
+      ? 'Enter the path to your custom weights first'
     : baseBlocksTrain
       ? 'Convert the custom base first — the cloud lane pushes the converted copy to your Hugging Face account'
     : cloudTooFewImages
@@ -1676,13 +1676,16 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   spellCheck={false}
                   placeholder={trainType === 'sdxl'
                     ? 'C:\\path\\to\\your-sdxl-checkpoint.safetensors'
+                    : trainType === 'qwen_image'
+                    ? 'C:\\path\\to\\your-qwen-image-edit-2511-diffusers-folder'
                     : `C:\\path\\to\\your-${typeLabel.toLowerCase().replace(/[^a-z0-9]+/g, '')}-model.safetensors`}
                   aria-label="Custom weights path"
                   className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] font-mono w-full max-w-[520px]" />
                 <span className="text-content-subtle text-[0.625rem] leading-relaxed">
                   Local path to a <b className="text-content-muted font-medium">{typeLabel}</b> .safetensors
-                  (same architecture). The file is checked at launch (exists, valid, arch signature);
-                  an unrecognized file asks for confirmation. Local-only — cloud training refuses it.
+                  file{trainType === 'qwen_image' ? ', or a local diffusers-format folder (same as ai-toolkit\'s own name_or_path — already-downloaded model, no re-download needed)' : ''}
+                  (same architecture). Checked at launch (exists, valid, arch signature when recognized);
+                  an unrecognized file/folder asks for confirmation. Local-only — cloud training refuses it.
                 </span>
               </div>
             )}

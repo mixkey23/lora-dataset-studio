@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-custom-weights-diffusers-folder',
+    date: '2026-07-26',
+    title: '📁 Custom weights now accept an already-downloaded local model folder',
+    blurb:
+      'If you already have a model on disk in diffusers format (e.g. Qwen-Image-Edit-2511), you can now point "Custom weights…" straight at that folder instead of only a single merged .safetensors file — no re-download through ai-toolkit needed.',
+    to: '/settings/training',
+  },
+  {
     id: '2026-07-26-caption-mismatch-names-real-family',
     date: '2026-07-26',
     title: '🏷️ Caption-style warning now names the model you\'re actually training',
