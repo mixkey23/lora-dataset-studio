@@ -49,9 +49,9 @@ export const WHATS_NEW = [
   {
     id: '2026-07-27-checkpoints-live-log',
     date: '2026-07-27',
-    title: '🖥 Watch a training run\'s raw CLI output live',
+    title: '📄 Read a training run\'s raw CLI output, live or long after it\'s done',
     blurb:
-      'The "Checkpoints & LoRAs" panel now has a "Live log" button that tails this run\'s training.log in-app, refreshing every few seconds — so you can follow ai-toolkit or musubi-tuner end-to-end instead of only seeing a tail after a crash.',
+      'The "Checkpoints & LoRAs" panel now has a "Run log" button that tails this run\'s training.log in-app, refreshing every few seconds while it\'s running — and stays readable afterwards too, so you can follow ai-toolkit or musubi-tuner end-to-end instead of only seeing a tail after a crash.',
     to: '/datasets?section=checkpoints&panel=manager',
   },
   {

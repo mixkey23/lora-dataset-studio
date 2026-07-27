@@ -184,7 +184,10 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const [checkpointVariant, setCheckpointVariant] = useState('turbo');
   const checkpointSelectionDataset = useRef(null);
   const checkpointRequest = useRef(0);
-  // Live CLI log viewer for the browse filter's run — see loadRunLog below.
+  // Run log viewer for the browse filter's run — reads training.log straight off
+  // disk, so it works both while training is in progress AND long after it's
+  // done (until a fresh run of the SAME base+variant archives the folder). See
+  // loadRunLog below.
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [runLog, setRunLog] = useState({ exists: false, lines: [] });
   // Réglages ai-toolkit avancés éditables (rank / resolution / save_every /
@@ -916,10 +919,11 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
     if (!r.ok) throw new Error('unavailable');
     return r.json();
   };
-  // 🖥 Live log: raw training.log tail for the browse filter's run, so the
-  // whole CLI process (ai-toolkit or musubi-tuner) can be watched end-to-end
-  // instead of only seeing a tail after a crash. Same run scope as the folder
-  // browser/open-folder buttons right next to it.
+  // 📄 Run log: raw training.log tail for the browse filter's run, so the whole
+  // CLI process (ai-toolkit or musubi-tuner) can be watched end-to-end instead
+  // of only seeing a tail after a crash — and read back after the run is done,
+  // not just while it's live. Same run scope as the folder browser/open-folder
+  // buttons right next to it.
   const loadRunLog = async () => {
     const qs = new URLSearchParams({ n: '400' });
     if (checkpointTrainType) qs.set('train_type', checkpointTrainType);
@@ -2447,9 +2451,9 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             <button type="button"
               onClick={() => setLogViewerOpen((v) => !v)}
               aria-expanded={logViewerOpen}
-              title="Watch this run's raw CLI output live (ai-toolkit or musubi-tuner), refreshes every 3s"
+              title="This run's raw CLI output (ai-toolkit or musubi-tuner) — watch it live while training, or read it back any time after, done or not"
               className="px-3 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-xs font-semibold">
-              🖥 {logViewerOpen ? 'Hide log' : 'Live log'}
+              📄 {logViewerOpen ? 'Hide log' : 'Run log'}
             </button>
             <span className="text-content-subtle text-[0.625rem]">
               import the checkpoint you like into ComfyUI to use (and test) the LoRA
