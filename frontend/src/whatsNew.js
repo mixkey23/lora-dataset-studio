@@ -47,6 +47,14 @@ import { WORKSPACE_SECTIONS } from './components/dataset/workspaceSections.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-26-musubi-sample-resolution-cap',
+    date: '2026-07-26',
+    title: '🛡️ Fixed an out-of-memory crash on musubi-tuner’s high-VRAM profiles',
+    blurb:
+      'Training-time sample previews were rendering at the full training resolution (1328px on most GPU profiles), which could push a card already near its budget over the edge. Previews now cap at 1024px — the actual training recipe (rank, optimizer, fp8, block-swap) is untouched.',
+    to: '/settings/local-tools',
+  },
+  {
     id: '2026-07-26-training-crash-banner-engine-aware',
     date: '2026-07-26',
     title: '🩹 Clearer crash messages for musubi-tuner runs',

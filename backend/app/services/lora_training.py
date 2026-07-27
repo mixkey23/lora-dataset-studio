@@ -4690,10 +4690,23 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         # reuses the exact same prompt list ai-toolkit's own sample block
         # resolves, see _sample_prompts()) so the Runs-hub card gets a real
         # thumbnail instead of the generic family tile.
+        #
+        # Sample resolution capped at 1024 (bug reported 2026-07-26): sampling
+        # at the FULL training resolution (1328 on most profiles) adds a VAE
+        # decode-to-pixels pass at that size on top of an already near-full
+        # VRAM budget - a validated SECourses profile (e.g. rtx5090: fp8 +
+        # blocks_to_swap=20, ~30.6/31.4 GB used during plain training) OOM'd
+        # by <1 GB specifically on that decode, not during any actual training
+        # step. SECourses' own numbers were measured WITHOUT sampling (musubi
+        # produced none before we added it) - capping the preview size keeps
+        # every profile's rank/optimizer/lr/fp8/swap numbers untouched and
+        # only shrinks the thing we added on top. min() so a profile already
+        # BELOW 1024 (e.g. vram5 at 768) is never bumped up.
+        _musubi_sample_res = min(_musubi_res, 1024)
         _musubi_sample_prompts_path = musubi_tuner.write_sample_prompts(
             _sample_prompts(ds, _safe_trigger(ds)),
             f'{dataset_folder}_musubi_samples.txt',
-            width=_musubi_res, height=_musubi_res)
+            width=_musubi_sample_res, height=_musubi_sample_res)
     else:
         config_path = write_job_config(ds, dataset_folder, steps=steps)
     # The authoritative live-run check, identity state and PID publication are

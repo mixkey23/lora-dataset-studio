@@ -321,6 +321,82 @@ def test_launch_musubi_profile_vram5_overrides_resolution_in_dataset_toml(app, t
     assert captured_toml['resolution'] == mt.MUSUBI_PROFILES['vram5']['resolution']
 
 
+def test_launch_musubi_sample_resolution_capped_at_1024_for_rtx5090(app, tmp_path, monkeypatch):
+    """Bug reported 2026-07-26: sampling at the full 1328 training resolution
+    added a VAE decode-to-pixels pass that OOM'd a validated rtx5090 profile
+    (fp8 + blocks_to_swap=20 already left it at ~30.6/31.4 GB during plain
+    training). The preview must be capped at 1024 WITHOUT touching the
+    profile's own training resolution (still fed to write_dataset_toml)."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    captured_toml, captured_samples = {}, {}
+
+    def _fake_write_toml(dataset_folder, cache_dir, resolution, caption_ext='txt', control_dir=None):
+        captured_toml['resolution'] = resolution
+        return str(tmp_path / 'x.toml')
+
+    def _fake_write_samples(prompts, path, width=1024, height=1024, steps=20):
+        captured_samples.update(width=width, height=height)
+        return path
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP6', 'zchar_qip6', train_type='qwen_image')
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'rtx5090'})
+        with patch.object(mt, 'write_dataset_toml', side_effect=_fake_write_toml), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'write_sample_prompts', side_effect=_fake_write_samples), \
+             patch.object(mt, 'build_train_argv', return_value=['-m', 'accelerate.commands.launch']), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert mt.MUSUBI_PROFILES['rtx5090']['resolution'] == 1328   # training resolution untouched...
+    assert captured_toml['resolution'] == 1328                  # ...still reaches the dataset TOML
+    assert captured_samples == {'width': 1024, 'height': 1024}  # ...but the preview is capped
+
+
+def test_launch_musubi_sample_resolution_not_bumped_up_for_vram5(app, tmp_path, monkeypatch):
+    """A profile already BELOW 1024 (vram5: 768) must not have its preview
+    bumped UP to 1024 - the cap is a ceiling, not a fixed size."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    captured_samples = {}
+
+    def _fake_write_samples(prompts, path, width=1024, height=1024, steps=20):
+        captured_samples.update(width=width, height=height)
+        return path
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'QIP7', 'zchar_qip7', train_type='qwen_image')
+        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'vram5'})
+        with patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'x.toml')), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'write_sample_prompts', side_effect=_fake_write_samples), \
+             patch.object(mt, 'build_train_argv', return_value=['-m', 'accelerate.commands.launch']), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert mt.MUSUBI_PROFILES['vram5']['resolution'] == 768
+    assert captured_samples == {'width': 768, 'height': 768}
+
+
 def test_update_train_settings_musubi_profile_validation():
     """Covered without app fixtures elsewhere in the suite; here we only check
     the choices constant lines up with what update_train_settings accepts."""
