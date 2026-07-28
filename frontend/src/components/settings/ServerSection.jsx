@@ -4,6 +4,7 @@ import { postJson } from '../../api/fetchClient'
 import { useToast } from '../common/Toast'
 import { copyToClipboard } from '../../utils/clipboard'
 import { INPUT_CLASS, Card } from './primitives'
+import ResetToDefault from './ResetToDefault'
 
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1']
 
@@ -12,7 +13,7 @@ const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1']
    contrasts the SAVED config against `runtime` (what's actually bound right now,
    stamped by run.py) and offers a one-click save-then-restart, mirroring
    UpdatesCard's "poll /api/health, then hard-reload" pattern. */
-export default function ServerSection({ config, setField, runtime, handleSave }) {
+export default function ServerSection({ config, setField, runtime, handleSave, configDefaults }) {
   const toast = useToast()
   const [restarting, setRestarting] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -97,6 +98,11 @@ export default function ServerSection({ config, setField, runtime, handleSave })
           value={config.server.port ?? ''}
           onChange={(e) => setField('server', 'port', Math.max(1, Math.min(65535, Number(e.target.value) || 1)))}
           className={`${INPUT_CLASS} max-w-[8rem]`} />
+        {/* The shipped port is 5050 and nothing on this screen said so — a user
+            who typed 8080 to test something had no way back to the value
+            start.bat binds by default. */}
+        <ResetToDefault label="Port" section="server" field="port"
+          config={config} configDefaults={configDefaults} setField={setField} />
       </div>
 
       <div className="flex items-start justify-between gap-4 rounded-lg border border-border bg-surface-raised px-3 py-2.5">

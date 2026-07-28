@@ -3,6 +3,24 @@ from types import SimpleNamespace
 
 import pytest
 
+# Two kinds of timeout live in this file and they must never be confused.
+#
+# LIVENESS (`assert event.wait(LIVENESS)`, `thread.join(LIVENESS)`) — these are
+# NOT assertions about speed. Every one of them asserts an ORDER: "stop waits
+# until launch published the new pid", "the queue lock is held across the kill".
+# The number exists only so a genuinely deadlocked build fails instead of
+# hanging the runner forever. It was 1-2 s, which is fine on a dev machine and
+# too tight on a loaded CI runner: the release of 2026-07-28 failed twice here
+# with the suite taking 892 s in CI against 392 s locally, on tests that pass
+# 5/5 in a local loop. Raising it cannot weaken anything — a correct
+# implementation fires these events in milliseconds.
+#
+# BLOCKED (`assert not event.wait(BLOCKED_PROBE)`) — here the SHORT timeout IS
+# the assertion: it proves the other thread was still blocked at that instant.
+# Raising THIS one would silently destroy the test. Do not touch it.
+LIVENESS = 30.0
+BLOCKED_PROBE = 0.1
+
 
 class _CoordinatedQueue:
     """Force deux lecteurs à prendre le même snapshot sans verrou externe."""
@@ -45,10 +63,10 @@ def _run_threads(first, second, first_read):
     thread_a = threading.Thread(target=guarded, args=(first,))
     thread_b = threading.Thread(target=guarded, args=(second,))
     thread_a.start()
-    assert first_read.wait(timeout=1), 'first queue read never started'
+    assert first_read.wait(timeout=LIVENESS), 'first queue read never started'
     thread_b.start()
-    thread_a.join(timeout=2)
-    thread_b.join(timeout=2)
+    thread_a.join(timeout=LIVENESS)
+    thread_b.join(timeout=LIVENESS)
     assert not thread_a.is_alive() and not thread_b.is_alive()
     assert errors == []
 
@@ -164,7 +182,7 @@ def test_advance_and_dequeue_share_the_same_queue_lock(monkeypatch):
 
     def blocked_advance():
         advance_entered.set()
-        assert release_advance.wait(timeout=1)
+        assert release_advance.wait(timeout=LIVENESS)
         return 'advanced'
 
     def read_queue():
@@ -178,15 +196,15 @@ def test_advance_and_dequeue_share_the_same_queue_lock(monkeypatch):
     process_thread = threading.Thread(target=lt.process_training_queue)
     dequeue_thread = threading.Thread(target=lambda: lt.dequeue_training(1))
     process_thread.start()
-    assert advance_entered.wait(timeout=1)
+    assert advance_entered.wait(timeout=LIVENESS)
     dequeue_thread.start()
 
     # process_training_queue garde le verrou pendant _advance_training_queue :
     # dequeue ne doit donc pas pouvoir lire/réécrire le même snapshot en parallèle.
-    dequeue_was_blocked = not dequeue_read.wait(timeout=0.1)
+    dequeue_was_blocked = not dequeue_read.wait(timeout=BLOCKED_PROBE)
     release_advance.set()
-    process_thread.join(timeout=2)
-    dequeue_thread.join(timeout=2)
+    process_thread.join(timeout=LIVENESS)
+    dequeue_thread.join(timeout=LIVENESS)
 
     assert not process_thread.is_alive() and not dequeue_thread.is_alive()
     assert dequeue_was_blocked
@@ -204,7 +222,7 @@ def test_stop_and_dequeue_share_the_same_queue_lock(monkeypatch):
     def blocked_clear(items):
         assert items == []
         stop_clear_entered.set()
-        assert release_stop.wait(timeout=1)
+        assert release_stop.wait(timeout=LIVENESS)
 
     def read_queue():
         dequeue_read.set()
@@ -230,16 +248,16 @@ def test_stop_and_dequeue_share_the_same_queue_lock(monkeypatch):
     stop_thread = threading.Thread(target=lt.stop_training)
     dequeue_thread = threading.Thread(target=dequeue)
     stop_thread.start()
-    assert stop_clear_entered.wait(timeout=1)
+    assert stop_clear_entered.wait(timeout=LIVENESS)
     dequeue_thread.start()
-    assert dequeue_started.wait(timeout=1)
+    assert dequeue_started.wait(timeout=LIVENESS)
 
     # Stop garde le verrou pendant le clear et la transition des flags : une
     # suppression concurrente ne doit lire la file qu'après cette transition.
-    dequeue_was_blocked = not dequeue_read.wait(timeout=0.1)
+    dequeue_was_blocked = not dequeue_read.wait(timeout=BLOCKED_PROBE)
     release_stop.set()
-    stop_thread.join(timeout=2)
-    dequeue_thread.join(timeout=2)
+    stop_thread.join(timeout=LIVENESS)
+    dequeue_thread.join(timeout=LIVENESS)
 
     assert not stop_thread.is_alive() and not dequeue_thread.is_alive()
     assert dequeue_was_blocked
@@ -329,7 +347,7 @@ def test_stop_waits_until_launch_publishes_the_new_pid(
         identity['token'] = lt.queue_manager._get_system_state(
             'training_run_token', None)
         popen_entered.set()
-        assert release_popen.wait(timeout=2)
+        assert release_popen.wait(timeout=LIVENESS)
         kwargs['stdout'].close()
         return SimpleNamespace(pid=7878)
 
@@ -374,21 +392,90 @@ def test_stop_waits_until_launch_publishes_the_new_pid(
     launch_thread = threading.Thread(target=launch)
     stop_thread = threading.Thread(target=stop)
     launch_thread.start()
-    assert popen_entered.wait(timeout=2)
+    assert popen_entered.wait(timeout=LIVENESS)
     assert identity['token']
     stop_thread.start()
-    assert stop_started.wait(timeout=1)
+    assert stop_started.wait(timeout=LIVENESS)
 
-    stop_was_blocked = not stop_done.wait(timeout=0.1)
+    stop_was_blocked = not stop_done.wait(timeout=BLOCKED_PROBE)
     release_popen.set()
-    launch_thread.join(timeout=3)
-    stop_thread.join(timeout=3)
+    launch_thread.join(timeout=LIVENESS)
+    stop_thread.join(timeout=LIVENESS)
 
     assert not launch_thread.is_alive() and not stop_thread.is_alive()
     assert launch_errors == []
     assert stop_was_blocked
     assert stop_results == [True]
     assert any('7878' in args for args in killed)
+
+
+def test_vision_revoke_runs_outside_the_queue_lock(app, tmp_path, monkeypatch):
+    """Handing the warm vision model back must NOT happen under `_queue_lock`.
+
+    With a live keep-warm lease, `vision_keepalive.revoke()` is an HTTP POST to
+    Ollama with `timeout=(10, 30)`, retried once — up to ~80 s of blocking. Run
+    under the queue lock, it froze Stop, enqueue/dequeue and queue advancement
+    for that whole time: Stop pressed during a launch did nothing until Ollama
+    answered. It also made this file's launch/Stop test fail in a full suite
+    (an ordinary upload test leaves a 120 s lease behind, and the launch path
+    then pays for a real unload), which no liveness timeout can honestly fix.
+    """
+    from app import config as cfg
+    from app.config import LOCAL_USER
+    from app.services import checkpoint_registry
+    from app.services import face_dataset_service as svc
+    from app.services import lora_training as lt
+    from app.services import vision_keepalive
+
+    root = tmp_path / 'aitoolkit'
+    (root / 'venv' / 'Scripts').mkdir(parents=True)
+    (root / 'venv' / 'Scripts' / 'python.exe').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(root)}})
+        ds = svc.create_dataset(
+            LOCAL_USER, 'Revoke lock', 'revoke_lock', train_type='zimage')
+        dataset_id = ds.id
+        lt._clear_training_identity(ttl_seconds=None)
+
+    lock_free_during_revoke = []
+
+    def probing_revoke(_reason=''):
+        # Another thread — an operator pressing Stop — must be able to take the
+        # queue lock while the (potentially very slow) revoke is in flight.
+        def probe():
+            taken = lt._queue_lock.acquire(timeout=BLOCKED_PROBE)
+            lock_free_during_revoke.append(taken)
+            if taken:
+                lt._queue_lock.release()
+
+        prober = threading.Thread(target=probe)
+        prober.start()
+        prober.join(timeout=LIVENESS)
+        return False
+
+    def fake_popen(_args, **kwargs):
+        kwargs['stdout'].close()
+        return SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(vision_keepalive, 'revoke', probing_revoke)
+    monkeypatch.setattr(lt, 'assert_free_disk', lambda *_a, **_kw: None)
+    monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+    monkeypatch.setattr(lt, 'preflight_custom_paths', lambda *_a, **_kw: None)
+    monkeypatch.setattr(lt, 'find_run_collision', lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        lt, 'export_dataset_to_aitoolkit', lambda *_a, **_kw: str(tmp_path))
+    monkeypatch.setattr(
+        lt, 'write_job_config', lambda *_a, **_kw: str(tmp_path / 'job.json'))
+    monkeypatch.setattr(
+        checkpoint_registry, 'register_launch', lambda *_a, **_kw: None)
+    monkeypatch.setattr(lt.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(lt, '_watch_training', lambda *_a, **_kw: None)
+
+    with app.app_context():
+        lt.launch_training(LOCAL_USER, dataset_id, steps=500, masked=False)
+
+    assert lock_free_during_revoke == [True]
 
 
 def test_queued_continue_replays_captured_base_variant_and_confirmation(monkeypatch):
@@ -490,7 +577,7 @@ def test_stop_holds_queue_lock_during_kill_before_watcher_advance(monkeypatch):
 
     def blocked_kill(*_args, **_kwargs):
         kill_entered.set()
-        assert release_kill.wait(timeout=1)
+        assert release_kill.wait(timeout=LIVENESS)
 
     real_advance = lt._advance_training_queue
 
@@ -530,16 +617,16 @@ def test_stop_holds_queue_lock_during_kill_before_watcher_advance(monkeypatch):
     stop_thread = threading.Thread(target=guarded, args=(lt.stop_training,))
     watcher_thread = threading.Thread(target=guarded, args=(watcher,))
     stop_thread.start()
-    assert kill_entered.wait(timeout=1)
+    assert kill_entered.wait(timeout=LIVENESS)
     watcher_thread.start()
-    assert watcher_started.wait(timeout=1)
+    assert watcher_started.wait(timeout=LIVENESS)
 
     # Même si le watcher considère déjà l'ancien PID comme mort, il ne peut pas
     # avancer la file pendant que Stop est encore bloqué dans le kill.
-    advance_was_blocked = not advance_entered.wait(timeout=0.1)
+    advance_was_blocked = not advance_entered.wait(timeout=BLOCKED_PROBE)
     release_kill.set()
-    stop_thread.join(timeout=2)
-    watcher_thread.join(timeout=2)
+    stop_thread.join(timeout=LIVENESS)
+    watcher_thread.join(timeout=LIVENESS)
 
     assert not stop_thread.is_alive() and not watcher_thread.is_alive()
     assert errors == []

@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { buildLineageRows, resumeCaption } from '../../utils/lineageTree';
 import { famLabel, StatusDot, SavesChip } from './lineageChrome';
+import { runNumber, cloudNumber, runIdentityLabel } from '../../utils/runIdentity';
 import RunLineageGraph from './RunLineageGraph';
 
 /* 🌳 A run's lineage — the runs linked by continuations (run → continue →
@@ -68,9 +69,14 @@ function LineageNode({ row, onSelect, index }) {
           + (clickable ? 'cursor-pointer hover:border-indigo-400/60 hover:bg-app/70' : '')}>
         <div className="flex min-w-0 items-center gap-1.5">
           <StatusDot status={node.status} />
-          <span className="shrink-0 font-mono text-content-muted text-[0.625rem]">
+          {/* One run number across list, graph and inspector: the record id. */}
+          <span className="shrink-0 font-mono text-content-muted text-[0.625rem]"
+            title={runIdentityLabel(node)}>
             <span aria-hidden>{node.source === 'cloud' ? '☁' : '💻'}</span>{' '}
-            #{node.source === 'cloud' && node.run_id ? node.run_id : node.record_id}
+            {runNumber(node)}
+            {cloudNumber(node) != null && (
+              <span className="text-content-subtle"> · cloud #{cloudNumber(node)}</span>
+            )}
           </span>
           <span className={`min-w-0 truncate text-[0.75rem] font-semibold ${dim ? 'text-content-muted' : 'text-content'}`}
             title={`${famLabel(node.train_type)}${node.variant ? ` · ${node.variant}` : ''}`}>
@@ -141,7 +147,8 @@ function ViewToggle({ view, onChange }) {
   );
 }
 
-export default function RunLineageTree({ tree, loading, error, onSelect, onContinueCheckpoint, refetchTree }) {
+export default function RunLineageTree({ tree, loading, error, onSelect, onContinueCheckpoint,
+  refetchTree, bestSettingsLora = null }) {
   const [view, setView] = useState(readView);
   const changeView = useCallback((v) => {
     setView(v);
@@ -180,7 +187,8 @@ export default function RunLineageTree({ tree, loading, error, onSelect, onConti
         </div>
       </div>
       {view === 'graph'
-        ? <RunLineageGraph tree={tree} onSelect={onSelect} onContinueCheckpoint={onContinueCheckpoint} refetchTree={refetchTree} />
+        ? <RunLineageGraph tree={tree} onSelect={onSelect} onContinueCheckpoint={onContinueCheckpoint}
+            refetchTree={refetchTree} bestSettingsLora={bestSettingsLora} />
         : <LineageList rows={rows} onSelect={onSelect} />}
     </div>
   );

@@ -45,6 +45,19 @@ def _touch(*parts):
     return p
 
 
+def _weights(*parts):
+    """Like _touch, but a structurally valid safetensors container — for the checks
+    that now validate the file rather than just seeing it."""
+    import json
+    import struct
+    p = os.path.join(*parts)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    body = json.dumps({'w': {'dtype': 'F16', 'shape': [1], 'data_offsets': [0, 2]}}).encode()
+    with open(p, 'wb') as fh:
+        fh.write(struct.pack('<Q', len(body)) + body + b'\x00' * 64)
+    return p
+
+
 # --- Parser: canonical profile + base_path + relatives -----------------------
 def test_canonical_profile_with_base_path_and_relatives(app, tmp_path):
     from app import config as cfg
@@ -335,6 +348,7 @@ def test_klein_resolves_entirely_from_extra_paths(app, tmp_path):
         _touch(str(ext), 'vae', 'flux2-vae.safetensors')
         _touch(str(ext), 'text_encoders', 'qwen_3_8b_fp8mixed.safetensors')
         _touch(str(ext), 'loras', 'klein', 'Flux2-Klein-9B-consistency-V2.safetensors')
+        _touch(str(ext), 'loras', 'klein', 'realistic.safetensors')
         _write_yaml(base, f"""
             comfyui:
               diffusion_models: {ext / 'unet'}
@@ -386,22 +400,26 @@ def test_scan_models_extra_checkpoints_feed_sdxl(app, tmp_path):
 
 def test_setup_skip_download_when_asset_in_extra_path(app, tmp_path):
     """The Klein download worker skips (rc 0, no fetch) when the canonical file is
-    already present under an extra_model_paths root — no forced re-download."""
+    already present under an extra_model_paths root — no forced re-download.
+
+    The fixtures write REAL safetensors headers, not a placeholder byte: presence is
+    no longer enough to vouch for a file (see test_setup_presence_integrity), so a
+    one-byte stub is now correctly read as a corrupted download and does not skip."""
     from app import config as cfg, setup_installer
     with app.app_context():
         base = _comfy_base(tmp_path, cfg)
         ext = tmp_path / 'ext'
-        _touch(str(ext), 'vae', 'flux2-vae.safetensors')
-        _touch(str(ext), 'unet', 'klein', 'flux-2-klein-9b-fp8.safetensors')
+        _weights(str(ext), 'vae', 'flux2-vae.safetensors')
+        _weights(str(ext), 'unet', 'klein', 'flux-2-klein-9b-fp8.safetensors')
         _write_yaml(base, f"""
             comfyui:
               vae: {ext / 'vae'}
               diffusion_models: {ext / 'unet'}
         """)
-        assert setup_installer._klein_present_in_extra('klein_vae') is True
-        assert setup_installer._klein_present_in_extra('klein_model') is True
+        assert setup_installer._download_present_in_extra('klein_vae') is True
+        assert setup_installer._download_present_in_extra('klein_model') is True
         # text-encoder NOT provided -> still needs downloading.
-        assert setup_installer._klein_present_in_extra('klein_text_encoder') is False
+        assert setup_installer._download_present_in_extra('klein_text_encoder') is False
 
 
 # --- The no-break mandate: full Klein resolution WITHOUT yaml == today --------
@@ -416,6 +434,7 @@ def test_regression_full_klein_resolution_without_yaml_unchanged(app, tmp_path):
         _touch(str(base), 'models', 'vae', 'flux2-vae.safetensors')
         _touch(str(base), 'models', 'text_encoders', 'qwen_3_8b_fp8mixed.safetensors')
         _touch(str(base), 'models', 'loras', 'klein', 'Flux2-Klein-9B-consistency-V2.safetensors')
+        _touch(str(base), 'models', 'loras', 'klein', 'realistic.safetensors')
         cfg.save_config({'klein': {'consistency_lora': 'klein/Flux2-Klein-9B-consistency-V2.safetensors'}})
         assert not (base / 'extra_model_paths.yaml').exists()
         assert keh.resolve_klein_unet() == os.path.join('klein', 'flux-2-klein-9b-fp8.safetensors')

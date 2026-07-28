@@ -123,6 +123,35 @@ def test_pipeline_auto_reject_honors_flags_and_dedup(client, tmp_path, monkeypat
         assert rej >= 2
 
 
+def test_pipeline_never_bulk_rejects_on_a_non_verdict_flag():
+    """soft_detail and bars measure PROVENANCE, not quality: a crisp watermark
+    rescues an enlargement's detail ratio, a motion-blurred native shot sinks it,
+    and `bars` fires on dark-themed screenshots. Their own documentation says to
+    check before mass-rejecting — which unattended overnight auto-reject cannot
+    do, and it runs FIRST, so anything it drops never reaches the later passes.
+    They stay available on the standalone (attended, undoable) button."""
+    from app.services import image_bank_service as svc
+    assert 'soft_detail' in svc._QUALITY_FLAGS and 'bars' in svc._QUALITY_FLAGS
+    assert 'soft_detail' not in svc.PIPELINE_REJECT_FLAGS
+    assert 'bars' not in svc.PIPELINE_REJECT_FLAGS
+    # Everything else the CPU scan produces is still offered.
+    assert set(svc.PIPELINE_REJECT_FLAGS) == {'blur', 'noise', 'uniform', 'small',
+                                              'unreadable'}
+
+
+def test_pipeline_drops_a_non_verdict_flag_sent_by_an_old_client(client, tmp_path):
+    """A client (or a saved preset) that still asks for soft_detail must not be
+    refused — it is simply ignored, like any unknown flag."""
+    bank_id, _src = _mkbank(client, tmp_path, {'flat.jpg': _flat()})
+    r = client.post(f'/api/bank/{bank_id}/pipeline', json={
+        'steps': ['scan', 'auto_reject'],
+        'reject_flags': ['soft_detail', 'bars', 'uniform'], 'resolve_dups': False})
+    assert r.status_code == 202, r.get_json()
+    report = _report(client, bank_id)
+    ar = {s['step']: s for s in report['steps']}['auto_reject']
+    assert ar['status'] == 'done'
+
+
 def test_pipeline_auto_reject_skips_flags_when_not_requested(client, tmp_path):
     bank_id, _src = _mkbank(client, tmp_path, {'flat.jpg': _flat()})
     client.post(f'/api/bank/{bank_id}/pipeline', json={

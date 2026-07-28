@@ -26,7 +26,7 @@ export function formatDiagnostic(d) {
   L.push(`OS: ${d.os} · Python ${d.python}${pml.ml_supported === false ? ` (⚠ outside ML wheel range ${pml.ml_range})` : ''}`)
 
   L.push('── Engines ──')
-  L.push(`default=${cf.default_engine} · nanobanana=${yn(e.nanobanana)} chatgpt=${yn(e.chatgpt)} klein=${yn(e.klein)}`)
+  L.push(`default=${cf.default_engine} · nanobanana=${yn(e.nanobanana)} chatgpt=${yn(e.chatgpt)} openrouter=${yn(e.openrouter)} klein=${yn(e.klein)}`)
   if ((c.klein_missing || []).length) L.push(`  klein missing assets: ${c.klein_missing.join(', ')}`)
   if (c.chatgpt_subscription) L.push('  chatgpt: subscription connected')
   L.push(`Keys set: ${Object.entries(d.secrets_present || {}).filter(([, v]) => v).map(([k]) => k).join(', ') || 'none'}`)

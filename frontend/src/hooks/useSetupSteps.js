@@ -1,7 +1,29 @@
 // Pure derivation of the guided Setup wizard state from live capabilities.
 // No I/O — deterministic, so it is the single source of truth for card status.
+// Pure JS on purpose (no JSX): node --test drives it directly, which is what
+// keeps the capability destinations below honest.
+import { getHelpTopic } from '../help/helpRegistry.js'
+import { SETTINGS_SECTIONS } from '../components/settings/registry.js'
+// ONE answer to "is this local engine ready", shared with the generation panel and
+// the ✦ Edit modal. Setup asking a different question than the page that consumes
+// the model is exactly how ✓ and ⚠ ended up on the same install.
+import { localEngineReadiness } from '../utils/localEngineReason.js'
+import { blockingInvalid, integrityCause } from '../utils/modelIntegrityWords.js'
+import { KLEIN_REQUIRED_ASSETS, KLEIN_ASSET_LABELS, kleinMissingLabels } from '../utils/kleinAssets.js'
+
+// Re-exported from their leaf module (utils/kleinAssets.js) so existing importers
+// keep working; they moved down there to let this file import the readiness
+// verdict without an import cycle.
+export { KLEIN_ASSET_LABELS, kleinMissingLabels }
 
 export const SETUP_STEP_IDS = ['image', 'comfyui', 'ollama', 'quality', 'training']
+
+// Every wizard screen a /setup?step=<id> link may target. The tool steps PLUS
+// 'install' — the install/repair menu is a real destination (the one-click
+// engine installs live there), it just isn't a tool to configure. SetupPage's
+// SCREENS list is the display order; this one is the LINKABLE set, used by the
+// What's-new target validator and the help-registry contract test.
+export const SETUP_DEEP_LINK_STEPS = [...SETUP_STEP_IDS, 'install']
 
 // Tool reachable + its extra piece present -> ready; reachable only -> partial.
 function gateStatus(reachable, complete) {
@@ -12,35 +34,14 @@ function gateStatus(reachable, complete) {
 
 function imageStep(caps) {
   const e = caps.engines || {}
-  const ready = e.nanobanana || e.chatgpt || e.klein
+  const ready = e.nanobanana || e.chatgpt || e.openrouter || e.klein
   return {
     id: 'image', title: 'Image generation', recommended: true,
-    unlocks: ['Nano Banana (Gemini)', 'ChatGPT (gpt-image-2)', 'Klein (local)'],
+    unlocks: ['Nano Banana (Gemini)', 'ChatGPT (gpt-image-2)', 'OpenRouter', 'Klein (local)'],
     status: ready ? 'ready' : 'available',
-    engines: { nanobanana: !!e.nanobanana, chatgpt: !!e.chatgpt, klein: !!e.klein },
+    engines: { nanobanana: !!e.nanobanana, chatgpt: !!e.chatgpt,
+      openrouter: !!e.openrouter, klein: !!e.klein },
   }
-}
-
-// The Klein engine needs three weights on disk (UNET + text-encoder + VAE); the
-// consistency LoRA is only recommended, so it never gates readiness. The backend
-// lists the setup_installer action names still absent in comfyui.klein_missing —
-// that is the source of truth, mirroring capabilities.klein_ready. Older payloads
-// (pre-klein_missing) fall back to the UNET-only scan.
-const KLEIN_REQUIRED_ASSETS = ['klein_model', 'klein_text_encoder', 'klein_vae']
-
-// setup_installer action name -> the short human word used in Setup/picker hints.
-export const KLEIN_ASSET_LABELS = {
-  klein_model: 'model',
-  klein_text_encoder: 'text encoder',
-  klein_vae: 'VAE',
-}
-
-// Human names of the REQUIRED Klein weights still missing (recommended LoRA
-// excluded), in a stable canonical order — so both the Setup step header and the
-// picker's Klein hint can say exactly what to download. Empty => the trio is on disk.
-export function kleinMissingLabels(kleinMissing) {
-  const m = Array.isArray(kleinMissing) ? kleinMissing : []
-  return KLEIN_REQUIRED_ASSETS.filter((a) => m.includes(a)).map((a) => KLEIN_ASSET_LABELS[a])
 }
 
 function kleinMissingRequired(c) {
@@ -59,23 +60,42 @@ function kleinMissingRequired(c) {
 function comfyuiStep(caps) {
   const c = caps.comfyui || {}
   const missingRequired = kleinMissingRequired(c)
+  // The BACKEND's verdict on each local engine, plus the one sentence explaining
+  // it. Setup renders these; it no longer decides them. See localEngineReadiness.
+  const klein = localEngineReadiness('klein', caps)
+  const krea = localEngineReadiness('krea', caps)
   // Present-but-INVALID required assets (a licence-gate HTML page saved as
   // .safetensors, a truncated download): the file exists so it is NOT in
   // klein_missing, yet it can't load. Without this the step would go green and let
   // a doomed generate crash ComfyUI (the #help "Expecting value: line 1 column 1").
   // Only *blocking* invalids gate readiness; the advisory too_small does not.
   const kleinInvalid = Array.isArray(c.klein_invalid) ? c.klein_invalid : []
-  const blockingInvalid = kleinInvalid.filter(
-    (i) => i && i.blocking && KLEIN_REQUIRED_ASSETS.includes(i.asset))
-  // hasKlein now reflects FULL readiness (all three weights, each a real file), not
-  // just the UNET — so the step no longer goes "nothing to do" while the TE/VAE are
-  // still missing or while a present asset is actually an unusable stub.
-  const hasKlein = missingRequired.length === 0 && blockingInvalid.length === 0
+  const kleinBroken = blockingInvalid(kleinInvalid, KLEIN_REQUIRED_ASSETS)
+  // Widget values the graph pins that THIS ComfyUI doesn't offer. Every file can be
+  // in place and every node class present, and the first generation still dies on a
+  // raw ComfyUI 400 — that was the `beta57` scheduler, which the RES4LYF pack adds
+  // to ComfyUI's own list (reported by IndependentProcess0 on Reddit). The shipped
+  // graph is clean now; this remains the net. Nothing is substituted (a scheduler
+  // changes the render), so this step is where the user learns it. Empty on a
+  // capable install AND on an unreachable one — the probe fails open.
+  const unsupportedEnums = Array.isArray(c.klein_unsupported_enums)
+    ? c.klein_unsupported_enums : []
+  // The SAME conditions the backend applies — kept ONLY as the fallback for a
+  // payload that predates `engines.klein` (and for the unit tests that drive this
+  // module with a bare comfyui object). It is not the answer any more.
+  const derivedHasKlein = missingRequired.length === 0 && kleinBroken.length === 0
+    && unsupportedEnums.length === 0
+  // hasKlein IS the engine's readiness, straight from the backend — the same value
+  // the Generate page gates its Klein button on. Setup re-deriving it is what let
+  // this screen show ✓ while that one refused: a truncated 9.5 GB UNET is present
+  // (so nothing is "missing"), and only the integrity verdict tells them apart.
+  const hasKlein = typeof (caps.engines || {}).klein === 'boolean'
+    ? klein.ready : derivedHasKlein
   // Which assets to still offer a download for (required trio + recommended LoRA),
   // so each button can grey out on its own once its file lands.
   const kleinMissing = Array.isArray(c.klein_missing)
     ? c.klein_missing
-    : (hasKlein ? [] : ['klein_model'])
+    : (derivedHasKlein ? [] : ['klein_model'])
   // Skipped is neutral, not a warning — but only when there's genuinely nothing to
   // show (unreachable). It never overrides a reachable ComfyUI's real status.
   const skipped = !!c.skipped && !c.reachable
@@ -85,6 +105,28 @@ function comfyuiStep(caps) {
     unlocks: ['Klein engine', 'Test Studio'],
     status, reachable: !!c.reachable, hasKlein, kleinMissing, kleinInvalid, apiUrl: c.api_url || '',
     skipped,
+    // The ONE sentence for why each local engine is dark, identical to the one the
+    // generation panel shows — so the two screens can no longer name different
+    // causes for one gap. Null when the engine is ready.
+    kleinReason: hasKlein ? null : klein.reason,
+    kreaReason: krea.ready ? null : krea.reason,
+    // Blocking-invalid REQUIRED weights: on disk, right size, unreadable. Their fix
+    // is delete-then-download, not download — a different action from "missing",
+    // which is why they get their own field instead of being folded into it.
+    kleinBroken,
+    // Every required file is on disk and readable. Told apart from hasKlein because
+    // "the files are fine but ComfyUI is down" and "a file is broken" are different
+    // sentences with different fixes.
+    kleinFilesReady: missingRequired.length === 0 && kleinBroken.length === 0,
+    // Could the checks that NEED a live ComfyUI actually run? False = "not checked",
+    // which the UI must render as ⚠, never as ✓. The unsupported-value probe fails
+    // OPEN (an unreachable ComfyUI reports no gap rather than inventing one), so
+    // without this flag an empty list would read as a clean bill of health.
+    kleinVerified: !!c.reachable,
+    // [{node_id, class_type, input, value, pack, url}] — render with
+    // comfyEnumUnavailableReason(), which names the node pack when we know it and
+    // never invents a ComfyUI version number when we don't.
+    unsupportedEnums,
     // Whether comfyui.base_dir actually points at a ComfyUI install (main.py + models/):
     // a wrong/portable-wrapper path scans an empty models/ and finds no checkpoints.
     // baseDir = the path this verdict was PROBED against — the UI must not show the
@@ -109,7 +151,7 @@ export const COMFYUI_SKIP_LOST = [
 export const COMFYUI_SKIP_KEPT = [
   'Scraping and dataset curation',
   'Captioning (Ollama vision model or the API engines)',
-  'Nano Banana and ChatGPT image engines',
+  'Nano Banana, ChatGPT and OpenRouter image engines',
   'LoRA training — local ai-toolkit and cloud (vast.ai)',
   'Publishing datasets and LoRAs to Hugging Face',
 ]
@@ -123,25 +165,99 @@ export function comfyuiDirVerdict(check) {
   const c = check || {}
   const resolved = c.resolved || ''
   const suggestion = c.suggestion || ''
+  const note = inputFolderNote(c.input_check)
   switch (c.status) {
     case 'valid':
-      return { tone: 'ok', suggestion: '',
+      return { tone: 'ok', suggestion: '', note,
         message: resolved ? `ComfyUI found at ${resolved}.` : 'ComfyUI found.' }
     case 'nested':
-      return { tone: 'warn', suggestion,
+      return { tone: 'warn', suggestion, note,
         message: `This looks like the launcher/parent folder — did you mean ${suggestion}?` }
     case 'missing':
-      return { tone: 'warn', suggestion: '',
+      return { tone: 'warn', suggestion: '', note: '',
         message: "That folder doesn't exist yet — check the path." }
     case 'empty_dir':
-      return { tone: 'warn', suggestion: '',
+      return { tone: 'warn', suggestion: '', note: '',
         message: 'That folder is empty — point at the folder that holds main.py and a models/ folder.' }
     case 'not_comfyui':
-      return { tone: 'warn', suggestion: '',
+      return { tone: 'warn', suggestion: '', note: '',
         message: "This folder isn't a ComfyUI install — it must contain main.py and a models/ folder. "
           + 'For the portable build, point at the inner …\\ComfyUI_windows_portable\\ComfyUI.' }
     default:
-      return { tone: 'muted', suggestion: '', message: '' }
+      return { tone: 'muted', suggestion: '', note: '', message: '' }
+  }
+}
+
+// The SECOND half of "is this ComfyUI usable": every local engine hands its source
+// image over by COPYING it into ComfyUI's input/ folder. A URL that answers proves
+// nothing about that — with ComfyUI in another container the copy lands nowhere
+// ComfyUI can see, and the first generation used to die on a detail-free 500
+// (reported on Discord by nofaceman). So the wizard says it here, at configuration
+// time. Deliberately a NOTE, never a blocker: mounting the volumes afterwards is a
+// perfectly normal order of operations. Empty string = nothing to say (not probed,
+// or fine). The backend already redacted the path.
+export function inputFolderNote(inputCheck) {
+  const c = inputCheck || {}
+  if (c.ok !== false) return ''
+  return c.problem || 'The app cannot write into ComfyUI’s input folder.'
+}
+
+// ── ai-toolkit: what the wizard says about the folder it was pointed at ───────
+// The old copy said one thing — "set up its Python venv per the README" — which
+// names a CAUSE the app never verified and a remedy that is a dead end for whole
+// families of installs: conda, uv, the system Python, and the portable/embedded
+// bundles that ship a `python_embeded\python.exe` instead of a venv. Someone
+// running one of those reasonably concluded the app REQUIRED a venv and went
+// asking in public (reported on Reddit by Psyko_2000) instead of filling in a
+// setting that was three clicks away. So the copy below states the OBSERVATION
+// ("no interpreter found here") and opens both doors with equal weight — make
+// one, or name the one you already have. Pure strings + a shape: node --test
+// locks the wording, which is the part that was wrong.
+export const AITOOLKIT_PYTHON_SETTING = 'Settings ▸ Local tools ▸ ai-toolkit Python interpreter'
+
+// The install path, before any folder is configured. Same rule: the venv is ONE
+// way to give ai-toolkit a Python, not the definition of a working install.
+export const AITOOLKIT_INSTALL_STEPS = [
+  { text: 'Clone ai-toolkit, or install it with the script of your choice.',
+    command: 'git clone https://github.com/ostris/ai-toolkit' },
+  { text: 'Give it a Python. Its README walks through creating a venv in that '
+      + 'folder — or, if you already run it with a conda or uv environment, the '
+      + 'system Python, or a portable/embedded build, keep that one and name it '
+      + `in ${AITOOLKIT_PYTHON_SETTING}.` },
+  { text: 'Point the app at the folder that holds run.py, below.' },
+]
+
+export function aitoolkitVerdict(step, dir) {
+  const s = step || {}
+  const path = (dir || '').trim()
+  const base = { candidates: [], settingsSection: 'local-tools' }
+  if (s.valid) {
+    return { ...base, kind: 'ready', tone: 'ok',
+      headline: `ai-toolkit is set up at ${path}.`, body: 'Nothing to do here.' }
+  }
+  if (!path) return { ...base, kind: 'unconfigured', tone: 'muted', headline: '', body: '' }
+  if (!s.dirValid) {
+    return { ...base, kind: 'not_a_checkout', tone: 'warn',
+      headline: `No run.py in ${path}, so this isn't an ai-toolkit folder.`,
+      body: "Point at the folder ai-toolkit was installed into — the one holding run.py." }
+  }
+  return {
+    ...base,
+    kind: 'no_interpreter',
+    tone: 'warn',
+    // The finding, not a diagnosis. True for every install shape.
+    headline: `ai-toolkit is here, but no Python interpreter was found in ${path}.`,
+    body: "The app doesn't know which Python to run it with. Two ways forward, "
+      + "both fine: create a venv inside that folder (ai-toolkit's README walks "
+      + 'through it), or keep the Python you already run ai-toolkit with — a conda '
+      + 'or uv environment, your system Python, or the python.exe of a portable / '
+      + 'embedded build (python_embeded) — and tell the app where it is.',
+    action: `Set the interpreter in ${AITOOLKIT_PYTHON_SETTING}`,
+    // The action names ONE field, so the link lands on it (SettingsLink focus →
+    // SettingsPage's ?focus= deep link). Only this verdict carries an action, so
+    // only this one needs a target; the DOM id is LocalToolsSection's.
+    settingsFocus: 'aitoolkit-python',
+    candidates: s.pythonCandidates || [],
   }
 }
 
@@ -185,6 +301,10 @@ function trainingStep(caps) {
     unlocks: ['LoRA training', 'JoyCaption captioning (bonus)'],
     status: a.valid ? 'ready' : 'available',
     valid: !!a.valid,
+    // dirValid = run.py is there. Told apart from `valid` so the wizard can say
+    // WHICH of the two problems it hit instead of one blanket sentence.
+    dirValid: !!a.dir_valid,
+    pythonCandidates: Array.isArray(a.python_candidates) ? a.python_candidates : [],
   }
 }
 
@@ -207,25 +327,95 @@ export function deriveCapabilitySummary(caps) {
   const cu = c.comfyui || {}
   const comfyOff = !!cu.dir_valid && !cu.reachable
   const NOTE = 'launch ComfyUI to enable'
+  // `topic` = the help-registry topic that OWNS the control turning this
+  // capability on. It is not a second navigation table: the route + focus id
+  // are read back from the registry (capabilityDestination below), so a field
+  // that moves section moves the tile with it. `waitingTopic` is the door for
+  // the pending state — "the install is fine, the process isn't up" is not the
+  // same problem as "it isn't installed", so it must not lead to the same page.
+  const WAITING = 'comfyui.api_url'
+  // Krea's two distinct "not ready" causes, kept apart because the actions are
+  // different: something is genuinely absent from disk (install it) vs everything
+  // is installed and ComfyUI simply has not loaded the node pack yet (restart).
+  const kreaDiskGap = !!(Array.isArray(cu.krea_missing) && cu.krea_missing.length)
+    || !cu.krea_nodes_installed
+  const kreaRestartPending = kreaNeedsComfyuiRestart(c)
   return [
-    { label: 'Nano Banana (Gemini)', ok: !!e.nanobanana },
-    { label: 'ChatGPT (gpt-image-2)', ok: !!e.chatgpt },
+    { label: 'Nano Banana (Gemini)', ok: !!e.nanobanana, topic: 'GEMINI_API_KEY' },
+    { label: 'ChatGPT (gpt-image-2)', ok: !!e.chatgpt, topic: 'engines.chatgpt_auth' },
+    { label: 'OpenRouter', ok: !!e.openrouter, topic: 'OPENROUTER_API_KEY' },
     { label: 'Klein (local)', ok: !!e.klein,
+      topic: 'setup-comfyui', waitingTopic: WAITING,
       ...(!e.klein && comfyOff ? { pending: true, note: NOTE } : {}) },
-    { label: 'Captioning', ok: !!(cap.joycaption || cap.ollama) },
-    { label: 'Auto-framing & head-crop', ok: !!(o.reachable && o.vision_model_ready) },
-    { label: 'Face-similarity scoring', ok: !!c.face_scoring },
-    { label: 'Person masks', ok: !!c.masks },
-    { label: 'Watermark inpainting', ok: !!c.watermark_inpaint },
-    { label: 'LoRA training', ok: !!c.training_visible },
+    // Krea 2 Edit is COUNTED even though it is optional, and even though nothing
+    // else in Setup used to mention it. Leaving it out of the list was worse than
+    // showing it red: the final screen certified "11 of 11 capabilities ready" on
+    // a machine where a whole engine was missing, so the user finished setup
+    // believing there was nothing left — and met a dark engine card weeks later.
+    // A capability that is absent must be VISIBLE and counted, never removed from
+    // the denominator.
+    { label: 'Krea 2 Edit (local)', ok: !!e.krea,
+      topic: 'setup-krea-install', waitingTopic: WAITING,
+      // Two different "not yet": nothing is on disk (a real install to do, so a
+      // plain ✗ pointing at the install screen), or everything is there and only
+      // ComfyUI is down/not restarted — the pending note, which must not read as
+      // "install something".
+      ...(!e.krea && !kreaDiskGap && kreaRestartPending
+        ? { pending: true, note: 'restart ComfyUI to load its nodes' }
+        : !e.krea && !kreaDiskGap && comfyOff ? { pending: true, note: NOTE } : {}) },
+    { label: 'Captioning', ok: !!(cap.joycaption || cap.ollama), topic: 'setup-ollama' },
+    { label: 'Auto-framing & head-crop', ok: !!(o.reachable && o.vision_model_ready),
+      topic: 'setup-ollama' },
+    { label: 'Face-similarity scoring', ok: !!c.face_scoring, topic: 'setup-quality' },
+    { label: 'Person masks', ok: !!c.masks, topic: 'setup-quality' },
+    { label: 'Watermark inpainting', ok: !!c.watermark_inpaint, topic: 'setup-quality' },
+    { label: 'LoRA training', ok: !!c.training_visible, topic: 'setup-training' },
     { label: 'Test Studio', ok: !!c.studio_visible,
+      topic: 'setup-comfyui', waitingTopic: WAITING,
       ...(!c.studio_visible && comfyOff ? { pending: true, note: NOTE } : {}) },
   ]
 }
 
+// Human name of the screen a capability route lands on — derived, never typed
+// twice: the Settings rail owns its section titles, the wizard owns its own.
+function destinationName(route) {
+  const id = (route.match(/^\/settings\/([a-z0-9-]+)/) || [])[1]
+  if (id) {
+    const s = SETTINGS_SECTIONS.find((x) => x.id === id)
+    return s ? s.title : null
+  }
+  return route.startsWith('/setup') ? 'Setup wizard' : null
+}
+
+/* Resolve ONE capability row to the door that turns it on:
+     { topic, href, where, announce }
+   - href     in-app path, focus hint appended so the field is scrolled to and
+              ringed on arrival (SettingsPage's ?focus= deep-link);
+   - where    the screen's human name, for the visible/accessible wording;
+   - announce the full accessible label — state FIRST (the sr-only "(ready)" /
+              "(not available)" this replaces must not be lost), then where the
+              row leads, because a link whose name hides its destination is a
+              trap for anyone not looking at the grid.
+   `getTopic` is injectable so the contract test can drive it explicitly. */
+export function capabilityDestination(entry, getTopic = getHelpTopic) {
+  if (!entry) return null
+  const id = (entry.pending && entry.waitingTopic) ? entry.waitingTopic : entry.topic
+  const t = id ? getTopic(id) : null
+  if (!t || !t.app || !t.app.route) return null
+  const { route, focus } = t.app
+  const href = focus ? `${route}${route.includes('?') ? '&' : '?'}focus=${focus}` : route
+  const where = destinationName(route)
+  if (!where) return null
+  // Ready rows still lead somewhere — that screen is where the capability is
+  // managed (re-test a key, reinstall a helper), so "manage in" not "fix in".
+  const state = entry.pending ? (entry.note || 'waiting') : (entry.ok ? 'ready' : 'not available')
+  const verb = entry.pending || entry.ok ? 'manage in' : 'configure in'
+  return { topic: id, href, where, announce: `${entry.label} — ${state}, ${verb} ${where}` }
+}
+
 export function recommendedMet(caps) {
   const e = (caps && caps.engines) || {}
-  return !!(e.nanobanana || e.chatgpt || e.klein)
+  return !!(e.nanobanana || e.chatgpt || e.openrouter || e.klein)
 }
 
 // --- "Install everything" plan -------------------------------------------------
@@ -238,6 +428,16 @@ export function recommendedMet(caps) {
 // ComfyUI folder is set. It never installs ComfyUI/Ollama themselves or pastes API keys
 // (those are external tools / credentials), so those stay on the step-by-step path.
 
+/** The install actions a component needs: absent from disk, OR present but not
+ *  loadable. Mirrors setup_installer._needs_install — the backend authority, which
+ *  now also REPLACES a blocking-invalid file instead of returning "already
+ *  present" and doing nothing (the trap that made "download it again" a no-op). */
+export function brokenOrMissing(missing, invalid) {
+  const out = Array.isArray(missing) ? [...missing] : []
+  blockingInvalid(invalid).forEach((i) => { if (!out.includes(i.asset)) out.push(i.asset) })
+  return out
+}
+
 // Setup-installer action -> the short human label shown in the Install-everything list.
 export const INSTALL_ALL_ACTION_LABELS = {
   face_scoring: 'Face-similarity scoring',
@@ -248,6 +448,55 @@ export const INSTALL_ALL_ACTION_LABELS = {
   klein_text_encoder: 'Klein text encoder',
   klein_vae: 'Klein VAE',
   klein_lora: 'Klein consistency LoRA',
+  krea_nodes: 'Krea 2 Edit node pack',
+  krea_model: 'Krea 2 base model (Turbo)',
+  krea_text_encoder: 'Krea 2 text encoder',
+  krea_vae: 'Krea 2 VAE',
+  krea_identity_lora: 'Krea 2 Identity Edit LoRA',
+}
+
+// The Krea 2 Edit engine, installable in ONE click but deliberately NOT part of
+// "Install everything": a second local engine is ~20 GB, and downloading it for
+// someone who never picked it would be hostile. Mirrors the backend's
+// setup_installer._INSTALL_GROUPS['krea'] — node pack first (a ~1 MB clone, so
+// the only thing left to wait for is bytes), then the four weights.
+export const KREA_INSTALL_ORDER = [
+  'krea_nodes', 'krea_model', 'krea_text_encoder', 'krea_vae', 'krea_identity_lora',
+]
+
+/** What the "Install Krea 2 Edit" button would queue for these capabilities —
+ *  the missing pieces only, so a user who already placed some files by hand sees
+ *  a shorter list instead of a re-download. Mirror of
+ *  setup_installer.install_group_plan('krea', caps), which stays the authority.
+ *
+ *  The node pack is queued only when it is neither loaded NOR on disk: on disk
+ *  but not loaded is a ComfyUI RESTART, not an install. */
+export function kreaInstallPlan(caps) {
+  const cu = (caps || {}).comfyui || {}
+  if (!cu.dir_valid) return []
+  // A file on disk that cannot be LOADED needs the same install as one that is
+  // absent — otherwise the one-click button silently plans nothing and the user is
+  // left with a green screen and a dark engine.
+  const missing = brokenOrMissing(cu.krea_missing, cu.krea_invalid)
+  // On disk -> nothing to install (missing nodes then mean a RESTART). Reported
+  // missing -> install. Reported present -> already there under another folder
+  // name, never clone a duplicate. No answer at all (ComfyUI stopped: the node
+  // probe fails OPEN) -> install it, rather than silently dropping it.
+  const nodesMissing = Array.isArray(cu.krea_nodes_missing) ? cu.krea_nodes_missing : []
+  const needsPack = cu.krea_nodes_installed ? false
+    : (nodesMissing.length ? true : !cu.reachable)
+  return KREA_INSTALL_ORDER.filter(
+    (a) => (a === 'krea_nodes' ? needsPack : missing.includes(a)))
+}
+
+/** The one thing an install cannot do for the user. ComfyUI registers custom
+ *  nodes at STARTUP only, so a pack that is on disk but absent from /object_info
+ *  means "restart ComfyUI" — never "install it", which is what the app said
+ *  before it could install the pack itself. */
+export function kreaNeedsComfyuiRestart(caps) {
+  const cu = (caps || {}).comfyui || {}
+  return !!(cu.krea_nodes_installed
+    && Array.isArray(cu.krea_nodes_missing) && cu.krea_nodes_missing.length)
 }
 
 // Grouped by capability area (ML extras → vision model → Klein weights). The backend
@@ -267,7 +516,9 @@ export function installAllPlan(caps) {
   const mlOk = !(c.python && c.python.ml_supported === false)
   const o = c.ollama || {}
   const cu = c.comfyui || {}
-  const kleinMissing = Array.isArray(cu.klein_missing) ? cu.klein_missing : []
+  // Broken counts as missing: an interrupted download leaves a file that every
+  // presence check calls installed and no loader can open.
+  const kleinMissing = brokenOrMissing(cu.klein_missing, cu.klein_invalid)
   const needed = (a) => {
     if (a === 'face_scoring' || a === 'masks') return mlOk && !c[a]
     if (a === 'watermark_inpaint') return !c.watermark_inpaint
@@ -302,10 +553,42 @@ export function installCatalog(caps) {
   const dirValid = !!cu.dir_valid
   const kleinMissing = Array.isArray(cu.klein_missing) ? cu.klein_missing : []
   const kleinHint = 'Point the app at a valid ComfyUI folder first (the ComfyUI step).'
-  const item = (action, present, available, hint) => ({
-    action, label: INSTALL_ALL_ACTION_LABELS[action] || action,
-    present: !!present, available: !!available, hint: available ? '' : hint,
-  })
+  const kreaMissing = Array.isArray(cu.krea_missing) ? cu.krea_missing : []
+  // action -> the blocking integrity verdict for a file that IS on disk. This row
+  // used to read "✓ Installed" purely because the file existed — which is how a
+  // truncated 9.5 GB UNET certified itself on the very screen the user opened to
+  // check (zigzag4794, Discord). Presence is not readability, and the validator
+  // that tells them apart already ran; this screen simply never asked it.
+  const brokenBy = {}
+  blockingInvalid(cu.klein_invalid).forEach((i) => { brokenBy[i.asset] = i })
+  blockingInvalid(cu.krea_invalid).forEach((i) => { brokenBy[i.asset] = i })
+  // Present = the folder is there, OR a REACHABLE ComfyUI reports the nodes (a
+  // pack installed under another folder name). An unreachable ComfyUI proves
+  // nothing — its node probe fails open — so it must not read as installed.
+  const kreaNodesPresent = !!cu.krea_nodes_installed
+    || !!(cu.reachable && !(Array.isArray(cu.krea_nodes_missing) && cu.krea_nodes_missing.length))
+  const kreaRestart = kreaNeedsComfyuiRestart(c)
+  const item = (action, present, available, hint) => {
+    const bad = brokenBy[action]
+    // A THIRD state, like the Krea node pack's: neither ✓ (it cannot load) nor a
+    // bare ✗ (the file is right there, and "Not installed" invites the user to
+    // re-run a download that used to no-op on an existing file). It names the
+    // fault and the action — and `present: false` is what puts it back into the
+    // install plans so the button has something to do.
+    if (bad) {
+      return {
+        action, label: INSTALL_ALL_ACTION_LABELS[action] || action,
+        present: false, available: !!available, hint: available ? '' : hint,
+        state: 'broken', stateLabel: '⚠ On disk, unreadable',
+        brokenReason: `${bad.filename}: ${integrityCause(bad.verdict)}. `
+          + 'Reinstall replaces it.',
+      }
+    }
+    return {
+      action, label: INSTALL_ALL_ACTION_LABELS[action] || action,
+      present: !!present, available: !!available, hint: available ? '' : hint,
+    }
+  }
   const mlItem = (action) => {
     const present = mlOk ? !!c[action] : !!c[action]
     // Install fresh only when the app's Python supports the wheels; ALWAYS allow a
@@ -321,5 +604,21 @@ export function installCatalog(caps) {
         : !modelName ? 'Set a vision model name first (the Captioning step).' : ''),
     ...['klein_model', 'klein_text_encoder', 'klein_vae', 'klein_lora'].map(
       (a) => item(a, dirValid && !kleinMissing.includes(a), dirValid, kleinHint)),
+    // Krea 2 Edit. Same per-component repair path as everything else — the group
+    // button above installs the whole engine, this row is for fixing ONE piece.
+    // These rows did not exist at all before: Setup listed four Klein weights and
+    // not one Krea file, so a whole engine was invisible on the screen where the
+    // user decides they are done.
+    {
+      ...item('krea_nodes', dirValid && kreaNodesPresent && !kreaRestart, dirValid, kleinHint),
+      // The one component with a THIRD state. It is on disk but ComfyUI has not
+      // loaded it, so neither badge is true: "✓ Installed" would recreate the very
+      // lie this wave fixes (the app certifying something it cannot see), and
+      // "✗ Not installed" would invite a pointless re-install of a folder the user
+      // just watched appear. The row says what to DO instead.
+      ...(kreaRestart ? { state: 'restart', stateLabel: '⟳ Restart ComfyUI' } : {}),
+    },
+    ...['krea_model', 'krea_text_encoder', 'krea_vae', 'krea_identity_lora'].map(
+      (a) => item(a, dirValid && !kreaMissing.includes(a), dirValid, kleinHint)),
   ]
 }

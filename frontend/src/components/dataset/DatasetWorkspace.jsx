@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import CompositionBar from './CompositionBar';
+import ClassifyFramingButton from './ClassifyFramingButton';
 import ReferencePanel from './ReferencePanel';
 import VariationCatalog from './VariationCatalog';
 import TrainingPanel from './TrainingPanel';
@@ -8,13 +9,19 @@ import { fmt } from '../../utils/studioFormat';
 import { copyToClipboard } from '../../utils/clipboard';
 import ImportDropzone from './ImportDropzone';
 import ConceptSourcesPanel from './ConceptSourcesPanel';
-import { isDatasetImportBlocked } from './scraperState';
+import BankImportPanel from './BankImportPanel';
+import { isDatasetImportBlocked, isStopGenerationBlocked } from './scraperState';
+import { faceAnalysisState, faceAnalysisLabel } from './faceScoringGate.js';
 import DatasetGrid from './DatasetGrid';
 import SmallImageRescueReview from './SmallImageRescueReview';
 import CaptionToolsBar from './CaptionToolsBar';
 import CaptionOptionsPopover from './CaptionOptionsPopover';
 import { recaptionConfirmation } from './captionCategory';
 import CropModal from './CropModal';
+import ReferenceEditModal from './ReferenceEditModal';
+import { defaultEditEngine } from './referenceEdit';
+import { localEngineUnavailableReason, hasComfyui } from '../../utils/localEngineReason.js';
+import { extraRefCropSource } from './extraRefs';
 import DatasetLightbox from './DatasetLightbox';
 import DatasetSettingsModal from './DatasetSettingsModal';
 import PublishHfModal from './PublishHfModal';
@@ -30,14 +37,23 @@ import TrainingReadiness from './TrainingReadiness';
 import useGuidedFlow from '../../hooks/useGuidedFlow';
 import { filterImages, normalizeTag } from '../../utils/tagFilter';
 import {
+  GRID_STATUS_FILTERS, DEFAULT_GRID_STATUS_FILTER,
+  filterImagesByStatus, gridStatusFilterCounts, normalizeGridStatusFilter,
+} from '../../utils/gridStatusFilter';
+import {
+  DEFAULT_DATASET_SORT, datasetSortOptions, normalizeDatasetSort, sortDatasetImages,
+} from '../../utils/gridSort';
+import {
   buildSmallImageRescuePairs,
   filterSmallImageRescueGrid,
   isSmallImageRescueRow,
 } from '../../utils/smallImageRescue';
+import { describeDerivedComparison } from '../../utils/derivedCompare';
 import { WORKSPACE_SECTIONS, SECTION_FOR_TARGET } from './workspaceSections';
-import { putJson } from '../../api/fetchClient';
+import { postJson, putJson } from '../../api/fetchClient';
 import { HelpBadge } from '../../help/HelpMode';
 import { requestHelpTip } from '../../help/helpTips';
+import { openCollapsedAncestors } from '../../help/revealTarget';
 import {
   PANEL_STATUS,
   getWorkspacePanel,
@@ -48,6 +64,17 @@ import {
 } from './workspaceNavigation';
 
 const EMPTY_IMAGES = Object.freeze([]);
+
+// Grid decision filter (All / Undecided / Kept / Rejected / Improve candidates):
+// a VIEW preference, not dataset data, so it is persisted globally — same lazy-init
+// + effect pattern as `datasetGridTileSize` (DatasetGrid.jsx) / `cloudRunsRecentCollapsed`.
+// Because it SURVIVES a reload, the filtered-view banner above the grid is not
+// cosmetic: it is the only thing that stops a persisted filter from reading as
+// "my images are gone" when the workspace is reopened.
+const GRID_STATUS_FILTER_KEY = 'datasetGridStatusFilter';
+// Grid ordering (default / face similarity ↓ / ↑) — same persisted-view-preference
+// pattern. The KEY and the stored ids are stable handles: never rename either.
+const GRID_SORT_KEY = 'datasetGridSort';
 
 // Style partagé des items du menu « ⋯ More » du header (actions secondaires).
 const MENU_ITEM = 'w-full flex items-center gap-2 text-left px-2.5 py-1.5 rounded-md text-sm text-content hover:bg-surface-raised disabled:opacity-40';
@@ -81,12 +108,71 @@ function NavBadge({ badge }) {
   );
 }
 
+/* Decision filter above the grid — isolate what still needs a ✓/✕, what was kept
+   or rejected, or the Klein improvement candidates, without hunting through the
+   whole set. It narrows the list the grid receives, so auto-triage, "select all"
+   and every bulk action then operate on exactly what is on screen. Composes with
+   the caption tag filter (both apply). */
+function GridStatusFilter({ value, counts, onChange }) {
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap text-xs" role="group"
+      aria-label="Filter the grid by decision">
+      <span className="text-content-subtle shrink-0">Show</span>
+      {GRID_STATUS_FILTERS.map((f) => {
+        const on = f.id === value;
+        return (
+          <button key={f.id} type="button" onClick={() => onChange(f.id)}
+            aria-pressed={on} title={f.title}
+            className={`px-2 py-0.5 rounded-full border text-[0.6875rem] font-semibold tabular-nums ${
+              on ? 'border-indigo-400/60 bg-indigo-500/20 text-indigo-100'
+                : 'border-border bg-surface text-content-muted hover:text-content'}`}>
+            {f.label} ({counts[f.id] ?? 0})
+          </button>
+        );
+      })}
+      <HelpBadge topic="action-grid-status-filter" />
+    </div>
+  );
+}
+
+/* Order the grid on what was MEASURED instead of by arrival date — asked for by
+   nofaceman (Discord). A dataset row carries exactly one such number, the face
+   similarity to the reference, so that is the only thing offered here (the
+   aesthetic/sharpness scores live on bank images, which have their own sort).
+   Sorting NARROWS nothing: it composes with both grid filters, and since the
+   grid derives its tiles AND its "select all" from the same list, the selection
+   follows the order on screen. Unscored images go last, both ways; while nothing
+   is scored the options are greyed out naming the pass to run, rather than
+   silently reordering nothing. `shrink-0` + a bounded width keep it usable when
+   the toolbar wraps at 400 px. */
+function GridSortSelect({ value, images, onChange }) {
+  return (
+    <label className="flex shrink-0 items-center gap-1 text-xs text-content-subtle">
+      Sort
+      <select value={value} onChange={(e) => onChange(e.target.value)}
+        aria-label="Sort the grid"
+        title="Order the images by face similarity to your reference. Unscored images sink to the end."
+        className="max-w-[13rem] rounded-md border border-border bg-surface px-2 py-0.5 text-[0.6875rem] text-content">
+        {datasetSortOptions(images).map((o) => (
+          <option key={o.id} value={o.id} disabled={o.disabled} title={o.title}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <HelpBadge topic="action-grid-sort" />
+    </label>
+  );
+}
+
 /* Loud banner sitting directly above the grid whenever a tag filter is active,
    so the user can NEVER mistake a filtered view for "images disappeared". Shows
    every active exclusion (⊘) / inclusion (◉ only) as a removable chip, the live
    "showing N of M" count, and a one-click "clear all". Session-only state lives
    in the parent workspace (transient view, not persisted). */
-function GridFilterBar({ excludes, includes, shown, total, onRemoveExclude, onRemoveInclude, onClearAll }) {
+function GridFilterBar({
+  excludes, includes, statusLabel, shown, total,
+  onRemoveExclude, onRemoveInclude, onRemoveStatus, onClearAll,
+}) {
   return (
     <div role="status"
       className="flex items-center gap-2 flex-wrap rounded-lg border-2 border-amber-400/50 bg-amber-400/10 px-3 py-2">
@@ -95,6 +181,15 @@ function GridFilterBar({ excludes, includes, shown, total, onRemoveExclude, onRe
         showing {shown} of {total}
       </span>
       <div className="flex items-center gap-1.5 flex-wrap">
+        {statusLabel && (
+          <span
+            className="inline-flex items-center gap-1 rounded-full border border-amber-400/50 bg-amber-500/15 pl-2 pr-1 py-0.5 text-[0.6875rem] text-amber-100">
+            <span aria-hidden>◧</span> {statusLabel} only
+            <button type="button" onClick={onRemoveStatus}
+              aria-label="Show images with any decision again"
+              className="w-4 h-4 grid place-items-center rounded-full hover:bg-amber-500/30">✕</button>
+          </span>
+        )}
         {excludes.map((t) => (
           <span key={`x-${t}`}
             className="inline-flex items-center gap-1 rounded-full border border-rose-400/50 bg-rose-500/15 pl-2 pr-1 py-0.5 text-[0.6875rem] text-rose-200">
@@ -125,14 +220,29 @@ function GridFilterBar({ excludes, includes, shown, total, onRemoveExclude, onRe
 export default function DatasetWorkspace({ ds, onBack }) {
   const navigate = useNavigate();
   const toast = useToast();
-  const { caps, refresh: refreshCaps } = useCapabilities();
+  const { caps, loading: capsLoading, refresh: refreshCaps } = useCapabilities();
   const d = ds.data;
+  // 🎭 Analyze faces: state + tooltip derived from the SERVER's verdict
+  // (`face_scoring_blocked`, a sentence or null) — see faceScoringGate.js. The UI
+  // never decides on its own which subjects InsightFace can read.
+  const faceAnalysis = faceAnalysisState({
+    blockedReason: d?.face_scoring_blocked,
+    hasRef: !!d?.ref_filename,
+    busy: ds.busy,
+    // InsightFace/antelopev2 are an optional extra: without them the button used
+    // to look alive and only failed on click. Now it names the gap and links Setup.
+    capable: !!caps?.face_scoring,
+    capsLoading,
+  });
   const [cropImg, setCropImg] = useState(null);
   const [captionOptionsOpen, setCaptionOptionsOpen] = useState(false);
   // Frozen snapshot of the flagged queue when review mode opens (null = closed).
   const [reviewQueue, setReviewQueue] = useState(null);
   const zipInput = useRef(null);   // hidden input for "Import dataset (ZIP)"
   const [refCrop, setRefCrop] = useState(false);
+  const [refEdit, setRefEdit] = useState(false);
+  // Filename of the extra reference being cropped (extras have no numeric id).
+  const [extraRefCrop, setExtraRefCrop] = useState(null);
   const [viewImg, setViewImg] = useState(null);
   const [captionMode, setCaptionMode] = useState(null);   // null → défaut auto selon train_type
   const [showLeaks, setShowLeaks] = useState(false);       // liste dépliée des captions qui fuient
@@ -155,6 +265,30 @@ export default function DatasetWorkspace({ ds, onBack }) {
   // ONLY tags allowed through (include). Both are normalized (trim+lowercase).
   const [excludeTags, setExcludeTags] = useState([]);
   const [includeTags, setIncludeTags] = useState([]);
+  // Grid decision filter — PERSISTED (see GRID_STATUS_FILTER_KEY), unlike the
+  // session-only tag filter: isolating the undecided pile is a working mode you
+  // keep across reloads, not a one-off lookup.
+  const [statusFilter, setStatusFilter] = useState(() => {
+    try { return normalizeGridStatusFilter(localStorage.getItem(GRID_STATUS_FILTER_KEY)); }
+    catch { return DEFAULT_GRID_STATUS_FILTER; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(GRID_STATUS_FILTER_KEY, statusFilter); }
+    catch { /* ignore — private mode */ }
+  }, [statusFilter]);
+  // Grid sort — PERSISTED like the decision filter: "show me the least-alike
+  // first" is a working mode you keep across reloads, not a one-off lookup. The
+  // stored value is normalised on read, so an id from an older build (or a
+  // hand-edited localStorage) degrades to the default order instead of freezing
+  // the grid on a sort nothing implements.
+  const [gridSort, setGridSort] = useState(() => {
+    try { return normalizeDatasetSort(localStorage.getItem(GRID_SORT_KEY)); }
+    catch { return DEFAULT_DATASET_SORT; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(GRID_SORT_KEY, gridSort); }
+    catch { /* ignore — private mode */ }
+  }, [gridSort]);
   const [searchParams, setSearchParams] = useSearchParams();
   // "Allow auto-crop" is a persisted preference (Settings ▸ Watermark inpainting). The
   // batch Clean bar shows the SAME setting and writes it through here, so there's one
@@ -277,7 +411,16 @@ export default function DatasetWorkspace({ ds, onBack }) {
     const land = () => {
       if (finished) return true;
       const target = document.getElementById(destination.targetId);
-      if (!target || target.getClientRects().length === 0) return false;
+      if (!target) return false;
+      // A panel can live inside a collapsed disclosure (the "More ways out"
+      // <details> in Import & export). Chromium still reports a client rect for
+      // that subtree, so the landing below would happily scroll+ring something
+      // the user cannot see. Open the disclosures on the way up first, starting
+      // at the PARENT: a target that IS a <details> (Advanced options,
+      // Checkpoints) is React-controlled and stays driven by its own state,
+      // which the reveal guard right after this waits for.
+      openCollapsedAncestors(target.parentElement);
+      if (target.getClientRects().length === 0) return false;
       if ((destination.reveal === 'training-advanced'
           || destination.reveal === 'training-checkpoints') && !target.open) return false;
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -372,6 +515,19 @@ export default function DatasetWorkspace({ ds, onBack }) {
   useEffect(() => { if (leakingCount >= 1) requestHelpTip('leak-panel-visible'); }, [leakingCount]);
   useEffect(() => { if (settingsOpen) requestHelpTip('dataset-settings-open'); }, [settingsOpen]);
 
+  // ⏹ Stop generation: the cancel happens server-side WITHIN the request (the
+  // in-flight rows are dropped before it answers), so a local flag covering the
+  // round-trip is the honest feedback — without it the click looked like a no-op
+  // and users re-clicked, believing Stop was broken. The ✨ improve batch keeps
+  // its own longer-lived server `cancelling` (its worker unwinds asynchronously).
+  // Above the early return for the same hook-count reason as the tips above.
+  const [stoppingGeneration, setStoppingGeneration] = useState(false);
+  const stopGeneration = useCallback(async () => {
+    setStoppingGeneration(true);
+    // finally, not "on success": a failed cancel must give the button back.
+    try { await ds.cancelPending(); } finally { setStoppingGeneration(false); }
+  }, [ds]);
+
   if (!d) return <p className="text-content-subtle text-sm">Loading…</p>;
 
   const images = d.images || [];
@@ -423,14 +579,25 @@ export default function DatasetWorkspace({ ds, onBack }) {
   };
   const toggleExclude = toggleTag(setExcludeTags, setIncludeTags);
   const toggleInclude = toggleTag(setIncludeTags, setExcludeTags);
-  const clearFilters = () => { setExcludeTags([]); setIncludeTags([]); };
-  const filtersActive = excludeTags.length > 0 || includeTags.length > 0;
+  const clearFilters = () => {
+    setExcludeTags([]); setIncludeTags([]); setStatusFilter(DEFAULT_GRID_STATUS_FILTER);
+  };
+  const tagFiltersActive = excludeTags.length > 0 || includeTags.length > 0;
+  const statusFilterActive = statusFilter !== DEFAULT_GRID_STATUS_FILTER;
+  const filtersActive = tagFiltersActive || statusFilterActive;
+  const statusFilterLabel = GRID_STATUS_FILTERS.find((f) => f.id === statusFilter)?.label || '';
+  const statusFilterOpts = { unresolvedRescueIds };
+  const statusCounts = gridStatusFilterCounts(rescueGridImages, statusFilterOpts);
   // The list actually rendered by the grid. Filtering here means select-all,
   // auto-triage and every bulk action operate ONLY on the visible images. The
   // Caption-tools counts keep using the full `images` list (global, never lies).
-  const gridImages = filterImages(rescueGridImages, {
-    excludes: excludeTags, includes: includeTags, mode: effCaptionMode,
-  });
+  // Decision filter first, tag filter on top — the two compose, order-independent.
+  // The sort runs LAST and only reorders: membership is entirely the filters'
+  // business, so "shown / total" and every bulk action keep meaning what they say.
+  const gridImages = sortDatasetImages(filterImages(
+    filterImagesByStatus(rescueGridImages, statusFilter, statusFilterOpts),
+    { excludes: excludeTags, includes: includeTags, mode: effCaptionMode },
+  ), gridSort);
   const pending = images.filter((i) => i.status === 'pending' && !i.filename
     && !unresolvedRescueIds.has(i.id)).length;
   const triage = images.filter((i) => i.status === 'pending' && i.filename
@@ -493,6 +660,12 @@ export default function DatasetWorkspace({ ds, onBack }) {
       && image.status === 'pending'
       && !!image.filename
   )) : false;
+  // A candidate (manual improve, small-image rescue) can be judged NEXT TO the
+  // original it was made from. Resolved here because the parent is another row
+  // of the same payload, which the lightbox never receives.
+  const viewImgComparison = viewImgLive
+    ? describeDerivedComparison(viewImgLive, images)
+    : null;
   const canImproveViewImg = !!viewImgLive
     && !viewImgLive._rescueReviewPreview
     && !isSmallImageRescueRow(viewImgLive)
@@ -503,6 +676,23 @@ export default function DatasetWorkspace({ ds, onBack }) {
     && !viewImgLive._rescueReviewPreview
     && !isSmallImageRescueRow(viewImgLive)
     && viewImgLive.derivation_kind !== 'klein_image_improve';
+
+  // Import to bank — the reverse of promoting bank images into a dataset. The kept
+  // images are COPIED into a folder of the bank's own, so re-triaging there can
+  // never disturb this dataset. Named by the user, then we jump to it: the copy
+  // runs as a background job and the bank page is where its progress shows.
+  const importToBank = async () => {
+    const name = window.prompt('Name for the new bank:', ds.data?.name || '');
+    if (name === null) return;
+    const d = await postJson('/api/bank/from-dataset',
+      { dataset_id: ds.data?.id, name });
+    if (!d.ok) { toast.error(d.error || 'Could not create the bank'); return; }
+    toast.success(`Importing ${kept} image(s) into the bank — copying in the background`);
+    // The bank page picks its open bank from localStorage (it has no :id route),
+    // so preselect the new one before navigating rather than landing on the list.
+    try { localStorage.setItem('bankCurrentId', String(d.id)); } catch { /* ignore */ }
+    navigate('/bank');
+  };
 
   // Export ZIP — shared by the header CTA and the Import & export row.
   // Guard-rails: untriaged images are silently EXCLUDED from the zip. Style
@@ -551,7 +741,13 @@ export default function DatasetWorkspace({ ds, onBack }) {
           // ComfyUI, and the Klein case is obvious from the tiles appearing).
           const cpu = act.kind === 'analyze_faces'
             || (act.kind === 'watermark_clean' && !String(act.detail || '').includes('GPU'))
-            || act.kind === 'generate';
+            || act.kind === 'generate'
+            // Same reasoning as 'generate': the improve batch feeds ComfyUI, and
+            // the candidates appearing in the grid say so better than a claim.
+            || act.kind === 'improve'
+            // Editing the reference is an API call (ChatGPT / Nano Banana) — no GPU,
+            // ComfyUI is never touched, so never claim it is paused.
+            || act.kind === 'edit_reference';
           const label = {
             watermark_detect: `Scanning for watermarks…${prog}`,
             watermark_clean: `Cleaning watermarks…${prog}`,
@@ -560,6 +756,8 @@ export default function DatasetWorkspace({ ds, onBack }) {
             analyze_faces: `Analyzing faces…${prog}`,
             classify: `Classifying framing…${prog}`,
             generate: `Generating variations…${prog}`,
+            improve: `Queuing improvements…${prog}`,
+            edit_reference: 'Editing reference…',
           }[act.kind];
           if (label) {
             const detailed = act.detail || label;
@@ -673,6 +871,14 @@ export default function DatasetWorkspace({ ds, onBack }) {
       <span className="text-content-subtle text-[0.6875rem]">scan a gallery URL, pick images, import full-frame</span>
       <span aria-hidden className="ml-auto text-content-subtle">→</span>
     </button>
+  );
+
+  // Third source next to the dropzone and the scraper: an already-triaged bank.
+  // The server's promote path does the copying (normalize + dedup vs THIS
+  // dataset) in a background job — we only pick the bank and refresh at the end.
+  const bankImport = (
+    <BankImportPanel datasetId={d.id} disabled={importBusy}
+      onImported={() => ds.refresh()} />
   );
 
   return (
@@ -818,21 +1024,31 @@ export default function DatasetWorkspace({ ds, onBack }) {
             </div>
           )}
 
-          {pending > 0 && (
+          {/* Stop is also the batch's Stop: a server-side ✨ improve run keeps feeding
+              the queue, so the banner must stay reachable even between two waves
+              (a moment when nothing is in flight). */}
+          {(pending > 0 || act?.kind === 'improve') && (
             <div className="flex items-center gap-3 rounded-lg border-2 border-indigo-400/60 bg-indigo-500/15 px-3 py-2.5">
               <span className="animate-pulse text-lg" aria-hidden>⏳</span>
               <div className="flex flex-col">
                 <span className="text-content text-sm font-semibold">
-                  {pending} generation(s) in progress…
+                  {act?.kind === 'improve' && act.total
+                    ? `${act.done}/${act.total} improvement(s) queued — ${pending} generating…`
+                    : `${pending} generation(s) in progress…`}
                 </span>
                 <span className="text-content-subtle text-[0.6875rem]">
-                  First results look wrong? Stop now — the remaining API calls are skipped (not billed).
+                  {act?.kind === 'improve'
+                    ? 'Runs on the server — you can close this tab. Stop ends the whole batch, not just what is in flight.'
+                    : 'First results look wrong? Stop now — the remaining API calls are skipped (not billed).'}
                 </span>
               </div>
-              <button type="button" onClick={ds.cancelPending} disabled={ds.busy}
-                title="Cancels every generation still in flight; finished images stay."
+              <button type="button" onClick={stopGeneration}
+                disabled={isStopGenerationBlocked({
+                  busy: ds.busy, activity: act, cancelling: stoppingGeneration })}
+                title="Cancels every generation still in flight (and stops a running improvement batch); finished images stay."
                 className="ml-auto shrink-0 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-bold disabled:opacity-40">
-                ⏹ Stop generation
+                {stoppingGeneration || (act?.cancelling && act?.kind === 'improve')
+                  ? 'Stopping…' : '⏹ Stop generation'}
               </button>
             </div>
           )}
@@ -850,30 +1066,44 @@ export default function DatasetWorkspace({ ds, onBack }) {
               {watermarkDetected > 0 ? ` · ${watermarkDetected} watermark(s) flagged` : ''}
             </p>
             <div id="gf-images" className="scroll-mt-20 flex flex-col gap-2">
+              {rescueGridImages.length > 0 && (
+                // One wrapping row at 400 px: the decision chips flow, the Sort
+                // control drops onto its own line instead of forcing a scrollbar.
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                  <GridStatusFilter value={statusFilter} counts={statusCounts}
+                    onChange={setStatusFilter} />
+                  <GridSortSelect value={gridSort} images={rescueGridImages}
+                    onChange={setGridSort} />
+                </div>
+              )}
               {filtersActive && (
                 <GridFilterBar excludes={excludeTags} includes={includeTags}
+                  statusLabel={statusFilterActive ? statusFilterLabel : ''}
                   shown={gridImages.length} total={rescueGridImages.length}
                   onRemoveExclude={toggleExclude} onRemoveInclude={toggleInclude}
+                  onRemoveStatus={() => setStatusFilter(DEFAULT_GRID_STATUS_FILTER)}
                   onClearAll={clearFilters} />
               )}
               {filtersActive && gridImages.length === 0 ? (
                 // Filtered down to nothing: say so plainly (the grid's own "no images"
                 // empty-state would read as "everything's gone", which would be a lie).
                 <p className="rounded-lg border border-border bg-surface px-3 py-4 text-center text-content-subtle text-sm">
-                  No images match the active filter{excludeTags.length + includeTags.length > 1 ? 's' : ''} —{' '}
+                  No images match the active filters —{' '}
                   <button type="button" onClick={clearFilters} className="underline hover:text-content">clear all</button>{' '}
-                  to see all {images.length} again.
+                  to see all {rescueGridImages.length} again.
                 </p>
               ) : (
                 <DatasetGrid images={gridImages} datasetId={d.id} onStatus={ds.setStatus} onCaption={ds.setCaption}
                   onCrop={setCropImg} onDelete={ds.deleteImage}
                   onMirror={ds.mirrorImage} mirroringIds={ds.mirroringIds}
-                  onRegenerate={(id, loraStrength, prompt) => ds.regenerate(id, loraStrength, prompt)} onView={setViewImg}
+                  onRegenerate={(id, loraStrength, prompt) => ds.regenerate(id, loraStrength, prompt)}
+                  onReimprove={ds.reimproveImage} onView={setViewImg}
                   onBatch={ds.batchImages} busy={ds.busy}
-                  onImprove={ds.improveImage} onRefresh={ds.refresh}
+                  onImproveBatch={ds.improveBatch} activity={act}
                   kleinAvailable={Boolean(caps.engines?.klein)}
                   eligibilityImages={images}
                   nonces={ds.nonces} faceThresholds={d.face_thresholds} datasetKind={d.kind || 'character'}
+                  faceScoringBlocked={d.face_scoring_blocked}
                   dualCaptions={Boolean(d.dual_captions)} />
               )}
             </div>
@@ -892,6 +1122,7 @@ export default function DatasetWorkspace({ ds, onBack }) {
                 <div id="ds-add-import" tabIndex={-1} className="scroll-mt-20">
                   <ImportDropzone onImport={(f) => ds.importFiles(f)} busy={importBusy} visionBusy={visionImportBusy} />
                 </div>
+                {bankImport}
               </div>
             ) : (
               <>
@@ -901,14 +1132,22 @@ export default function DatasetWorkspace({ ds, onBack }) {
                       one clear photo of the face — every generated variation starts from it
                     </span>
                     <ReferencePanel refFilename={d.ref_filename} datasetId={d.id} onSetRef={ds.setRef}
-                      onCropRef={() => setRefCrop(true)} busy={ds.busy} importBusy={importBusy} visionBusy={visionImportBusy} nonce={ds.refNonce}
+                      onCropRef={() => setRefCrop(true)} onEditRef={() => setRefEdit(true)} busy={ds.busy} importBusy={importBusy} visionBusy={visionImportBusy} nonce={ds.refNonce}
                       extraRefs={d.ref_extra_filenames || []}
-                      onAddExtraRef={ds.addExtraRef} onRemoveExtraRef={ds.removeExtraRef} />
+                      onAddExtraRef={ds.addExtraRef} onRemoveExtraRef={ds.removeExtraRef}
+                      onCropExtraRef={(fn) => setExtraRefCrop(fn)}
+                      subjectType={d.subject_type || 'human'} />
                   </div>
                 </div>
 
                 <div id="gf-generate" className="scroll-mt-20 flex flex-col gap-2">
                   <CompositionBar composition={d.composition} upscaled={d.composition_upscaled} bodyFidelity={bodyFid} />
+                  {/* Images imported WITHOUT head-crop have no shot type, so they count
+                      for nothing in the bar above (the default on body-fidelity datasets:
+                      a whole drag-and-drop import can leave it at 0). The vision pass that
+                      fills them in lives right here, under the bar that shows the gap. */}
+                  <ClassifyFramingButton images={images} ollama={caps.ollama} capsLoading={capsLoading}
+                    busy={ds.busy} activity={act} onClassify={(n) => ds.classify(n)} />
                   <div id="ds-add-generate" tabIndex={-1} className="scroll-mt-20">
                     <VariationCatalog key={`vc-${d.id}-${bodyFid}`} busy={ds.busy}
                       generating={act && act.kind === 'generate' ? act : null}
@@ -920,11 +1159,18 @@ export default function DatasetWorkspace({ ds, onBack }) {
                         ds.generate(...args);
                       }}
                       hasRef={!!d.ref_filename} composition={d.composition} images={images}
+                      // Krea reproduces the reference's shape: the panel needs it to
+                      // warn about squeezed body/back shots BEFORE a batch, and a way
+                      // to offer the fix (the same ✂ editor, pre-set to a portrait).
+                      refWidth={d.ref_width} refHeight={d.ref_height}
+                      onCropRefTo={(aspect) => setRefCrop({ aspect })}
                       bodyFidelity={bodyFid}
                       promptSuffix={d.prompt_suffix || ''}
                       promptSuffixes={d.prompt_suffixes || null}
                       onSaveSuffixes={(patch) => ds.updateSettings(patch, { quiet: true })}
-                      renderStyle={d.render_style || 'photoreal'} />
+                      renderStyle={d.render_style || 'photoreal'}
+                      subjectType={d.subject_type || 'human'}
+                      onSaveSubjectType={(st) => ds.updateSettings({ subject_type: st }, { quiet: true })} />
                   </div>
                   {/* Head-crop optional: ON tags framing='face' at import (I2); OFF keeps
                       the original framing so bust/body photos import as-is. Body-fidelity
@@ -938,6 +1184,7 @@ export default function DatasetWorkspace({ ds, onBack }) {
                       link here so the build flow still surfaces it without burying the
                       reference/generate flow under a long accordion. */}
                   {scrapeLink}
+                  {bankImport}
                 </div>
               </>
             )}
@@ -967,13 +1214,25 @@ export default function DatasetWorkspace({ ds, onBack }) {
               <div className="flex items-center gap-2 flex-wrap rounded-lg border border-border bg-surface px-3 py-2">
                 {!isConceptual && (
                   <button id="ds-curation-face-analysis" type="button" data-workspace-focus
-                    onClick={ds.analyzeFaces} disabled={ds.busy || !d.ref_filename}
-                    title={d.ref_filename ? "Scores each image's facial resemblance vs the reference (deletes nothing)" : "Set a reference photo first"}
+                    onClick={ds.analyzeFaces} disabled={faceAnalysis.disabled}
+                    title={faceAnalysis.title}
                     className="px-3 py-1.5 rounded-lg bg-surface text-content text-sm disabled:opacity-40 border border-border scroll-mt-20">
                     {ds.analyzing
                       ? `🎭 Analyzing…${act?.kind === 'analyze_faces' && act.total ? ` ${act.done}/${act.total}` : ''}`
-                      : '🎭 Analyze faces'}
+                      : faceAnalysisLabel(d.face_scoring_scope)}
                   </button>
+                )}
+                {/* A greyed button whose reason lives in a tooltip is invisible on a
+                    phone (no hover) — the pass must SAY why it can't run, in place.
+                    When the reason is a missing install, the sentence is also the
+                    way OUT: a link to the Setup step that installs it. */}
+                {!isConceptual && faceAnalysis.blocked && (
+                  <p className="m-0 basis-full text-sky-300/90 text-[0.6875rem]">
+                    ℹ {faceAnalysis.reason}
+                    {faceAnalysis.setupRoute && (
+                      <> — <a href={faceAnalysis.setupRoute} className="underline">open Setup</a></>
+                    )}
+                  </p>
                 )}
                 <div id="ds-curation-watermarks" tabIndex={-1}
                   className="flex items-center gap-2 flex-wrap scroll-mt-20">
@@ -1007,7 +1266,8 @@ export default function DatasetWorkspace({ ds, onBack }) {
                       onClick={() => setWatermarkMethod('klein')} disabled={ds.busy || !caps.watermark_klein}
                       title={caps.watermark_klein
                         ? 'Klein: masked Flux.2 inpaint (crop-and-stitch). Better on skin/fabric/busy backgrounds and can clean marks ON the subject. Uses the GPU via ComfyUI — slower.'
-                        : 'Klein inpaint needs ComfyUI running + the Klein models installed (Setup ▸ ComfyUI).'}
+                        : (localEngineUnavailableReason('klein', caps)
+                          || 'Klein inpaint needs ComfyUI running + the Klein models installed (Setup ▸ ComfyUI).')}
                       className={`px-2.5 py-1 rounded-md font-semibold disabled:opacity-40 ${watermarkMethod === 'klein'
                         ? 'bg-amber-500/25 text-amber-100' : 'text-content-subtle hover:text-content'}`}>
                       Klein <span className="font-normal opacity-70">quality</span>
@@ -1377,10 +1637,10 @@ export default function DatasetWorkspace({ ds, onBack }) {
               )}
               {filtersActive && (
                 <p className="m-0 text-content-subtle text-[0.6875rem]">
-                  🔎 A tag filter is active — the filtered grid lives in{' '}
+                  🔎 A grid filter is active — the filtered grid lives in{' '}
                   <button type="button" onClick={() => setSection('images')}
                     className="underline hover:text-content">Images</button>
-                  {' '}(showing {gridImages.length} of {images.length}).
+                  {' '}(showing {gridImages.length} of {rescueGridImages.length}).
                 </p>
               )}
             </div>
@@ -1429,31 +1689,61 @@ export default function DatasetWorkspace({ ds, onBack }) {
                     kept images + captions, training-ready (kohya layout)
                   </span>
                 </div>
-                <div id="ds-export-backup" tabIndex={-1}
-                  className="flex items-center gap-2 flex-wrap scroll-mt-20">
-                  <button type="button" data-workspace-focus onClick={ds.exportBackup}
-                    title="Full portable backup: all images with statuses, captions, scores and settings — restore it on any machine from the Datasets page."
-                    className="px-3 py-1.5 rounded-lg bg-surface border border-border text-content text-sm">
-                    💾 Backup
-                  </button>
-                  <span className="text-content-subtle text-[0.6875rem]">
-                    portable copy — restore it on any machine from the Datasets page
-                  </span>
-                </div>
-                {caps.hf_publish && kept > 0 && (
-                  <div id="ds-export-hugging-face" tabIndex={-1}
-                    className="flex items-center gap-2 flex-wrap scroll-mt-20">
-                    <button type="button" data-workspace-focus
-                      onClick={() => setPublishHfOpen(true)}
-                      title="Publish this dataset (kept images + captions) as a dataset repo on the Hugging Face Hub. Private by default; you choose the license and confirm you have the right to share."
-                      className="px-3 py-1.5 rounded-lg bg-surface border border-border text-content text-sm">
-                      🤗 Publish to Hugging Face
-                    </button>
-                    <span className="text-content-subtle text-[0.6875rem]">
-                      dataset repo on the Hub — private by default
+                {/* One primary way out (the training ZIP) stays in the open; the
+                    other three are occasional, so they live behind one disclosure
+                    instead of four buttons competing for the same glance. A
+                    <details> and not a floating menu: the workspace landing
+                    (openCollapsedAncestors in `land`) opens collapsed ancestors on
+                    jump, so the sidebar links to Import to bank / Backup /
+                    Hugging Face keep working. Do NOT make this a controlled
+                    <details> without teaching `land` about it. */}
+                <details className="rounded-lg border border-border bg-surface-raised">
+                  <summary className="flex items-center gap-2 px-2.5 py-1.5 text-[0.6875rem] text-content-muted hover:text-content cursor-pointer select-none">
+                    ⋯ More ways out
+                    <span className="text-content-subtle">
+                      bank · portable backup{caps.hf_publish && kept > 0 ? ' · Hugging Face' : ''}
                     </span>
+                  </summary>
+                  <div className="flex flex-col gap-2 px-2.5 pb-2.5 pt-1">
+                    <div id="ds-export-to-bank" tabIndex={-1}
+                      className="flex items-center gap-2 flex-wrap scroll-mt-20">
+                      <button type="button" data-workspace-focus disabled={!kept}
+                        onClick={importToBank}
+                        title="Turn this dataset back into a bank: its kept images are COPIED into a bank of their own, so you can re-triage them with the bank tools (duplicate detection, framing, scores) without touching this dataset."
+                        className="px-3 py-1.5 rounded-lg bg-surface border border-border text-content text-sm disabled:opacity-40">
+                        ↑ Import to bank
+                      </button>
+                      <span className="text-content-subtle text-[0.6875rem]">
+                        kept images copied into a new bank — re-triage them without touching this dataset
+                      </span>
+                    </div>
+                    <div id="ds-export-backup" tabIndex={-1}
+                      className="flex items-center gap-2 flex-wrap scroll-mt-20">
+                      <button type="button" data-workspace-focus onClick={ds.exportBackup}
+                        title="Full portable backup: all images with statuses, captions, scores and settings — restore it on any machine from the Datasets page."
+                        className="px-3 py-1.5 rounded-lg bg-surface border border-border text-content text-sm">
+                        💾 Backup
+                      </button>
+                      <span className="text-content-subtle text-[0.6875rem]">
+                        portable copy — restore it on any machine from the Datasets page
+                      </span>
+                    </div>
+                    {caps.hf_publish && kept > 0 && (
+                      <div id="ds-export-hugging-face" tabIndex={-1}
+                        className="flex items-center gap-2 flex-wrap scroll-mt-20">
+                        <button type="button" data-workspace-focus
+                          onClick={() => setPublishHfOpen(true)}
+                          title="Publish this dataset (kept images + captions) as a dataset repo on the Hugging Face Hub. Private by default; you choose the license and confirm you have the right to share."
+                          className="px-3 py-1.5 rounded-lg bg-surface border border-border text-content text-sm">
+                          🤗 Publish to Hugging Face
+                        </button>
+                        <span className="text-content-subtle text-[0.6875rem]">
+                          dataset repo on the Hub — private by default
+                        </span>
+                      </div>
+                    )}
                   </div>
-                )}
+                </details>
               </div>
             </div>
           </div>
@@ -1535,18 +1825,53 @@ export default function DatasetWorkspace({ ds, onBack }) {
         // back out — not just tighten the already-cropped square. Legacy datasets with
         // no stored original fall back to the cropped ref (can only tighten, as before).
         <CropModal imageUrl={`/api/dataset/${d.id}/img/${encodeURIComponent(d.ref_original_filename || d.ref_filename)}`}
-          defaultAspect={1}
+          // 1:1 stays the historical default. `setRefCrop({aspect})` opens the same
+          // editor pre-set to another ratio — how the Krea framing advisory offers
+          // "crop to 3:4" without a second modal. The row of ratio buttons is still
+          // there, so the preset is a starting point, never a lock.
+          defaultAspect={(refCrop && refCrop.aspect) || 1}
           onCancel={() => setRefCrop(false)}
           onConfirm={async (box) => { await ds.cropRef(box); setRefCrop(false); }}
           onReset={d.ref_original_filename
             ? async () => { await ds.recropRefAuto(); setRefCrop(false); }
             : undefined} />
       )}
+      {refEdit && d.ref_filename && (
+        <ReferenceEditModal datasetId={d.id} refFilename={d.ref_filename} nonce={ds.refNonce}
+          // The local engines are free but not universal: the modal is handed the
+          // SAME capabilities the generation panel reads, so it can offer them
+          // when this ComfyUI can run them, explain the one missing action when it
+          // nearly can, and drop them entirely on an install that has no ComfyUI.
+          defaultEngine={defaultEditEngine(window.localStorage,
+            (e) => !localEngineUnavailableReason(e, caps))}
+          comfyuiConfigured={hasComfyui(caps)}
+          engineAvailable={caps.engines || {}}
+          engineReason={(e) => localEngineUnavailableReason(e, caps)}
+          datasetExtraCount={(d.ref_extra_filenames || []).length}
+          liveActivity={ds.activity} referenceEdit={d.reference_edit}
+          onEdit={ds.editReference} onKeep={ds.keepEditedReference} onDiscard={ds.discardEditedReference}
+          onClose={() => setRefEdit(false)} />
+      )}
+      {extraRefCrop && extraRefCropSource(d.ref_extra_filenames, d.ref_extra_crop_sources, extraRefCrop) && (
+        // Same editor as the primary reference, fed the extra's full-frame ORIGINAL
+        // when one is kept. No ratio preset: extras are bust/body shots kept in their
+        // own aspect, and nothing downstream needs a square. No "Reset to auto" —
+        // extras are deliberately imported without the head-crop vision pass.
+        <CropModal imageUrl={`/api/dataset/${d.id}/img/${encodeURIComponent(
+          extraRefCropSource(d.ref_extra_filenames, d.ref_extra_crop_sources, extraRefCrop))}${
+          ds.refNonce ? `?v=${ds.refNonce}` : ''}`}
+          onCancel={() => setExtraRefCrop(null)}
+          onConfirm={async (box) => { await ds.cropExtraRef(extraRefCrop, box); setExtraRefCrop(null); }} />
+      )}
       {viewImgLive && (
         <DatasetLightbox img={viewImgLive} datasetId={d.id}
           nonce={(ds.nonces && ds.nonces[viewImgLive.id]) || 0}
+          compare={viewImgComparison}
+          parentNonce={(ds.nonces && viewImgComparison?.parent
+            && ds.nonces[viewImgComparison.parent.id]) || 0}
           onClose={() => setViewImg(null)}
           onMirror={viewImgLive._rescueReviewPreview ? undefined : ds.mirrorImage}
+          onRotate={viewImgLive._rescueReviewPreview ? undefined : ds.rotateImage}
           mirrorBusy={Boolean(ds.mirroringIds?.has(viewImgLive.id))}
           onImprove={canImproveViewImg ? ds.improveImage : undefined}
           improvePending={viewImgImproving}

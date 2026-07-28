@@ -753,6 +753,163 @@ def test_rescue_download_accepts_synced_save_completion_stays_strict(ct, app, tm
         assert ct._try_download_checkpoint(run, _BoomRemote()) is False
 
 
+def test_set_survives_a_transient_sqlite_write_lock(ct, app, monkeypatch):
+    """A monitor state write that loses the SQLite write lock retries.
+
+    Regression: two runs created their job on the pod, then died committing
+    status='training' with 'database is locked' three minutes in, and sat
+    abandoned for an hour of paid GPU time before an app restart resubmitted
+    the job and hit the pod's 409 on the duplicate name."""
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(ct, '_sleep', lambda s: None)
+    with app.app_context():
+        run = ct.CloudTrainingRun(dataset_id=1, status='provisioning',
+                                  job_name='j', vast_label='lds-1')
+        ct.db.session.add(run)
+        ct.db.session.commit()
+
+        real_commit = ct.db.session.commit
+        calls = {'n': 0}
+
+        def flaky_commit():
+            calls['n'] += 1
+            if calls['n'] <= 2:
+                raise OperationalError('UPDATE cloud_training_run ...', {},
+                                       Exception('database is locked'))
+            return real_commit()
+
+        monkeypatch.setattr(ct.db.session, 'commit', flaky_commit)
+        ct._set(run, status='training', phase_detail='Job queued on the pod',
+                remote_job_id='j-1')
+        monkeypatch.undo()
+
+        fresh = ct.CloudTrainingRun.query.get(run.id)
+        assert calls['n'] == 3                    # two refusals, then the write
+        assert fresh.status == 'training'         # fields survived the rollback
+        assert fresh.remote_job_id == 'j-1'
+        assert fresh.phase_detail == 'Job queued on the pod'
+
+
+def test_set_survives_a_write_lock_that_really_poisons_the_session(ct, app, monkeypatch):
+    """The retry must survive a lock raised by the REAL flush, not a stubbed commit.
+
+    Regression 2026-07-28, run #121: stubbing `db.session.commit` (as the test
+    above does) raises without ever putting the session into pending-rollback,
+    so the failure path could read `run.id` and the retry looked healthy. In
+    production the lock comes from the flush: the session is poisoned, the
+    instance's attributes were expired by the previous commit, and formatting
+    the retry's own log line fired a lazy load that raised PendingRollbackError
+    out of _set. The monitor thread died, the run stayed 'training' with no
+    error, and a rented RTX 5090 kept billing for ~36 min until a restart.
+
+    Refusing the UPDATE at the cursor reproduces that faithfully: the failure
+    goes through SQLAlchemy's real flush machinery.
+    """
+    import sqlite3
+
+    from sqlalchemy import event
+
+    monkeypatch.setattr(ct, '_sleep', lambda s: None)
+    with app.app_context():
+        run = ct.CloudTrainingRun(dataset_id=1, status='provisioning',
+                                  job_name='j', vast_label='lds-1')
+        ct.db.session.add(run)
+        ct.db.session.commit()        # expires every attribute, as in production
+        run_id = run.id
+        ct.db.session.expire(run)     # nothing left in __dict__ but the identity
+
+        engine = ct.db.session.get_bind()
+        refused = {'n': 0}
+
+        @event.listens_for(engine, 'before_cursor_execute')
+        def _refuse_the_first_updates(conn, cursor, statement, parameters,
+                                      context, executemany):
+            if statement.lstrip().upper().startswith('UPDATE') and refused['n'] < 2:
+                refused['n'] += 1
+                raise sqlite3.OperationalError('database is locked')
+
+        try:
+            ct._set(run, status='training', phase_detail='Job queued on the pod',
+                    remote_job_id='j-1')
+        finally:
+            event.remove(engine, 'before_cursor_execute', _refuse_the_first_updates)
+
+        assert refused['n'] == 2                  # two real refusals, then the write
+        fresh = ct.db.session.get(ct.CloudTrainingRun, run_id)
+        assert fresh.status == 'training'         # fields survived the rollbacks
+        assert fresh.remote_job_id == 'j-1'
+        assert fresh.phase_detail == 'Job queued on the pod'
+
+
+def test_set_leaves_a_usable_session_when_it_gives_up(ct, app, monkeypatch):
+    """A _set that raises must hand back a session its caller can still write on.
+
+    _monitor's failure path answers a raising _set by calling _finish() to mark
+    the run 'error' and destroy the pod. On 2026-07-28 that recovery inherited a
+    session in pending-rollback and failed too, which is why run #121 was left
+    'training' with error=None and a live pod instead of being closed.
+    """
+    import sqlite3
+
+    from sqlalchemy import event
+
+    monkeypatch.setattr(ct, '_sleep', lambda s: None)
+    with app.app_context():
+        run = ct.CloudTrainingRun(dataset_id=1, status='training',
+                                  job_name='j', vast_label='lds-1')
+        ct.db.session.add(run)
+        ct.db.session.commit()
+        run_id = run.id
+
+        engine = ct.db.session.get_bind()
+        refused = {'n': 0}
+
+        @event.listens_for(engine, 'before_cursor_execute')
+        def _refuse_every_update(conn, cursor, statement, parameters,
+                                 context, executemany):
+            if statement.lstrip().upper().startswith('UPDATE'):
+                refused['n'] += 1
+                raise sqlite3.OperationalError('database is locked')
+
+        try:
+            with pytest.raises(Exception):
+                ct._set(run, phase_detail='running: fetching transformer weights')
+        finally:
+            event.remove(engine, 'before_cursor_execute', _refuse_every_update)
+
+        assert refused['n'] == ct._COMMIT_RETRIES     # it really exhausted the budget
+        # The lock is gone; the caller's recovery write must now go through.
+        ct._set(run, status='error', error='pod unreachable')
+        fresh = ct.db.session.get(ct.CloudTrainingRun, run_id)
+        assert fresh.status == 'error'
+        assert fresh.error == 'pod unreachable'
+
+
+def test_set_still_raises_on_a_non_lock_database_error(ct, app, monkeypatch):
+    """Only the transient lock is retried — a real failure must stay loud."""
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(ct, '_sleep', lambda s: None)
+    with app.app_context():
+        run = ct.CloudTrainingRun(dataset_id=1, status='provisioning',
+                                  job_name='j', vast_label='lds-1')
+        ct.db.session.add(run)
+        ct.db.session.commit()
+
+        calls = {'n': 0}
+
+        def broken_commit():
+            calls['n'] += 1
+            raise OperationalError('UPDATE cloud_training_run ...', {},
+                                   Exception('no such column: nope'))
+
+        monkeypatch.setattr(ct.db.session, 'commit', broken_commit)
+        with pytest.raises(OperationalError):
+            ct._set(run, status='training')
+        assert calls['n'] == 1                    # no retry storm
+
+
 def test_cloud_progress_shape_matches_local(ct, app, client, monkeypatch):
     destroyed = []
     remote = FakeRemote(polls_to_complete=3)
@@ -836,6 +993,162 @@ def test_monitor_resume_skips_upload_and_submit(ct, app, client, monkeypatch):
         assert remote.uploaded == {}                 # upload_dataset never called
         assert remote.job_config is None              # create_job never called
         assert destroyed == ['777']
+
+
+# ── The create/record window: the pod holds the job, our row does not ────────
+# create_job succeeded, then the app died before remote_job_id reached the DB.
+# The resume then walked back into the creation branch and the pod refused the
+# duplicate name (409) — one hour of 5090 time destroyed, twice over, for a
+# run that was training fine (run #107).
+
+class ConflictingRemote(FakeRemote):
+    """Pod that already holds this run's job: a second create_job with the same
+    name is refused with the ai-toolkit 409, and the job list can name it."""
+
+    def __init__(self, existing_name, existing_id='j-existing', **kw):
+        super().__init__(**kw)
+        self.existing_name = existing_name
+        self.existing_id = existing_id
+        self.started = []
+        self.create_attempts = []
+        self.listed = 0
+
+    def create_job(self, name, job_config, gpu_ids='0'):
+        self.create_attempts.append(name)
+        if name == self.existing_name:
+            raise RuntimeError(
+                'create_job -> HTTP 409: {"error":"Job name already exists"}')
+        return super().create_job(name, job_config)
+
+    def find_job_by_name(self, name):
+        self.listed += 1
+        if name == self.existing_name:
+            return {'id': self.existing_id, 'name': name,
+                    'status': 'running', 'step': 120}
+        return None
+
+    def start_job(self, job_id, gpu_ids='0'):
+        self.started.append(job_id)
+
+    def get_job(self, job_id):
+        return super().get_job(job_id)
+
+
+def test_resume_adopts_the_job_already_created_on_the_pod(ct, app, client, monkeypatch):
+    """THE incident: create_job succeeded but the app restarted before
+    remote_job_id was written, so the resume re-enters the creation branch and
+    the pod answers 409. The run must ADOPT the existing job (the name proves
+    it is ours) and keep polling it — not die with the hour already paid."""
+    destroyed = []
+    remote = FakeRemote(polls_to_complete=3)
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    with app.app_context():
+        run = ct.CloudTrainingRun.query.get(run_id)
+        job_name = run.job_name
+        # The crash window: the pod holds the job, our row still says NULL.
+        ct._set(run, vast_instance_id='777', remote_job_id=None,
+                status='uploading', base_url='http://pod.invalid:40123',
+                auth_token='tok')
+    conflicting = ConflictingRemote(job_name, polls_to_complete=3)
+    monkeypatch.setattr(ct, '_make_remote', lambda run: conflicting)
+    with app.app_context():
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert run.status == 'done'                      # the run SURVIVES
+        assert run.remote_job_id == 'j-existing'         # adopted, not recreated
+        assert conflicting.listed == 1                   # resolved by name
+        # A job already at step 120 must never be re-queued under a live trainer
+        assert conflicting.started == []
+        assert destroyed == ['777']
+
+
+def test_remote_job_id_is_recorded_before_seeding_and_start(ct, app, client,
+                                                            monkeypatch, tmp_path):
+    """Remedy 1: the window itself. The id must be in the DB the instant the pod
+    accepts the job — before the (slow) checkpoint seeding and before start_job.
+    Simulated crash: seeding raises, and the row must still carry the id."""
+    destroyed = []
+    remote = FakeRemote(polls_to_complete=3)
+    seed = tmp_path / 'source.safetensors'
+    seed.write_bytes(b'CKPT')
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    with app.app_context():
+        run = ct.CloudTrainingRun.query.get(run_id)
+        params = json.loads(run.train_params)
+        params.update({'resume_ckpt_path': str(seed), 'resume_step': 500})
+        ct._set(run, train_params=json.dumps(params))
+
+    def boom(datasets_folder, dest_dir, remote_name, local_path):
+        raise RuntimeError('app died while seeding')
+
+    remote.seed_checkpoint = boom
+    with app.app_context():
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert run.status == 'error'
+        assert run.remote_job_id == 'j-1'    # recorded BEFORE the failure point
+
+
+class NeverStartedRemote(FakeRemote):
+    """Pod holding a job that was CREATED but never STARTED: ai-toolkit's
+    default row status is 'stopped' at step 0 until `start` queues it."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.started = []
+
+    def start_job(self, job_id, gpu_ids='0'):
+        self.started.append(job_id)
+
+    def get_job(self, job_id):
+        if not self.started:
+            return {'status': 'stopped', 'step': 0, 'info': 'created'}
+        return super().get_job(job_id)
+
+
+def test_resume_starts_a_job_that_was_created_but_never_launched(ct, app, client,
+                                                                 monkeypatch):
+    """The bug remedy 1 could trade in for: with the id recorded early, a crash
+    between create_job and start_job leaves a job sitting at 'stopped' — which
+    the poll loop reads as terminal. The resume must recognise 'created but not
+    started', start it for real, and let it train."""
+    destroyed = []
+    remote = NeverStartedRemote(polls_to_complete=3)
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    with app.app_context():
+        run = ct.CloudTrainingRun.query.get(run_id)
+        # Exactly what the DB holds after the create/start crash under remedy 1.
+        ct._set(run, vast_instance_id='777', remote_job_id='j-1',
+                status='uploading', base_url='http://pod.invalid:40123',
+                auth_token='tok')
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert remote.started == ['j-1']      # started for real, not declared dead
+        assert run.status == 'done'
+        assert destroyed == ['777']
+
+
+def test_unadoptable_conflict_says_what_to_do_and_what_happens_to_the_pod(
+        ct, app, client, monkeypatch):
+    """When the pod refuses the name AND will not say which job owns it, the run
+    still fails — but the message must name the next move and the fate of the
+    pod, because this failure costs real money."""
+    destroyed = []
+    remote = FakeRemote(polls_to_complete=3)
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    with app.app_context():
+        job_name = ct.CloudTrainingRun.query.get(run_id).job_name
+    conflicting = ConflictingRemote(job_name, polls_to_complete=3)
+    conflicting.find_job_by_name = lambda name: None      # listing resolves nothing
+    monkeypatch.setattr(ct, '_make_remote', lambda run: conflicting)
+    with app.app_context():
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert run.status == 'error'
+        msg = (run.error or '').lower()
+        assert 'retry' in msg                       # what to do
+        assert 'terminated' in msg                  # what happens to the pod
+        assert destroyed == ['777']                 # and it really is
 
 
 class FrozenRemote(FakeRemote):
@@ -1082,3 +1395,64 @@ def test_boot_timeout_fresh_run_not_charged_for_stale_created_at(ct, app, client
         ct._monitor(app, run_id)
         assert ct.CloudTrainingRun.query.get(run_id).status == 'done'
         assert destroyed == ['777']
+
+
+# ── A close decided elsewhere wins over the monitor's terminal write ─────────
+# _assert_run_open at the top of the poll loop only protects the loop. Every
+# terminal branch then works for minutes (stop the job, pull the checkpoint,
+# import, mirror) before it writes — and the supervisor runs in another thread,
+# on another session. These two tests close the run INSIDE that window and
+# require the monitor to stand down rather than rewrite the row.
+
+def test_completed_branch_does_not_resurrect_a_run_closed_mid_download(
+        ct, app, client, monkeypatch):
+    """The pod completed, and while we were importing the result the supervisor
+    force-stopped the run and destroyed the instance. The monitor must NOT flip
+    that row back to 'done' — the pod it would be reporting on is gone."""
+    destroyed = []
+    remote = FakeRemote(polls_to_complete=2)
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    real_mirror = ct._mirror_into_local_run
+
+    def mirror_then_supervisor_closes(run, *a, **kw):
+        out = real_mirror(run, *a, **kw)
+        # what _force_stop writes once the vast API confirms the kill
+        ct._set(run, status='stopped', phase_detail='Stopped by the supervisor',
+                error='stop request not honoured in time',
+                finished_at=ct.datetime.utcnow())
+        return out
+
+    monkeypatch.setattr(ct, '_mirror_into_local_run', mirror_then_supervisor_closes)
+    with app.app_context():
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert run.status == 'stopped'
+        assert 'supervisor' in (run.phase_detail or '')
+        # the checkpoint pulled before the close is still on disk — standing
+        # down throws away the WRITE, never the work
+        assert run.checkpoint_local_path and os.path.exists(run.checkpoint_local_path)
+
+
+def test_pod_kept_is_not_announced_for_a_run_closed_mid_download(
+        ct, app, client, monkeypatch):
+    """The download failed, so the monitor wants to park the run in
+    'error_pod_kept' and point the user at the pod. If the supervisor already
+    destroyed that pod, that message sends them to an instance that no longer
+    exists — the close must win."""
+    destroyed = []
+    remote = FakeRemote(polls_to_complete=2, fail_downloads=True)
+    ds_id, run_id = _launch(ct, app, client, monkeypatch, remote, destroyed)
+    real_download = ct._try_download_checkpoint
+
+    def download_then_supervisor_closes(run, *a, **kw):
+        out = real_download(run, *a, **kw)
+        ct._set(run, status='stopped', phase_detail='Stopped by the supervisor',
+                finished_at=ct.datetime.utcnow())
+        return out
+
+    monkeypatch.setattr(ct, '_try_download_checkpoint', download_then_supervisor_closes)
+    with app.app_context():
+        ct._monitor(app, run_id)
+        run = ct.CloudTrainingRun.query.get(run_id)
+        assert run.status == 'stopped'
+        assert 'recover manually' not in (run.error or '')

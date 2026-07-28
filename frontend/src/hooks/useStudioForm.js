@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { DEFAULT_STRENGTHS } from '../components/dataset/studio/constants';
+import { defaultCfgFor, defaultStepsFor, mixedModelDefaults } from '../utils/studioModelDefaults';
 
 const rollSeed = () => Math.floor(Math.random() * 2 ** 31);
 
@@ -14,7 +15,14 @@ const rollSeed = () => Math.floor(Math.random() * 2 ** 31);
  * `d` = payload de useLoraTestStudio (peut être null au 1er render).
  * `datasetId` = id du dataset (namespace de persistance).
  */
-export function useStudioForm(d, datasetId, family = null) {
+/* `pinnedCheckpoints` (optionnel) : la liste de checkpoints est IMPOSÉE par
+   l'appelant au lieu d'être cochée dans le picker. C'est la seule chose que le
+   ◉ LoRA Canvas fait autrement que le Studio de test — là-bas les checkpoints se
+   choisissent en cliquant les pastilles des nœuds, éventuellement sur plusieurs
+   datasets. Tout le reste (modèle, format, cfg, steps, seed, ×N, réglages
+   globaux) passe par exactement ce hook et exactement ce composant, donc les
+   deux écrans ne peuvent pas diverger. */
+export function useStudioForm(d, datasetId, family = null, { pinnedCheckpoints = null } = {}) {
   // Persistance namespacée par dataset ET par famille : chaque pipeline (ZIT/SDXL/Krea)
   // garde ses propres axes (checkpoints/strengths/modèle…). Le composant studio est
   // remonté quand la famille change → ce hook re-lit la bonne clé au montage.
@@ -49,14 +57,23 @@ export function useStudioForm(d, datasetId, family = null) {
   const checkpoints = d?.checkpoints || [];
   const allFns = checkpoints.map((c) => c.filename);
   // Filtre les checkpoints persistés qui n'existent plus (dataset modifié depuis).
-  const chosenCps = (selCps ?? allFns).filter((fn) => allFns.includes(fn));
+  // Checkpoints imposés (canvas) → ils sont la sélection, telle quelle. Ne PAS
+  // les filtrer sur `allFns` : ils viennent de plusieurs datasets, alors que
+  // `d.checkpoints` est la liste d'un seul.
+  const chosenCps = pinnedCheckpoints ?? (selCps ?? allFns).filter((fn) => allFns.includes(fn));
   const effectivePrompt = promptText ?? (d?.prompt || '');
   // Défaut = 1re entrée de la liste — y compris « Official » (value '' , Krea) pour
   // que la puce par défaut apparaisse pressée ; le backend mappe '' → défaut câblé.
   const effectiveModels = selModels ?? (d?.z_models?.length ? [d.z_models[0].value] : []);
   const effectiveAspects = selAspects ?? (d?.default_aspect ? [d.default_aspect] : ['9:16']);
-  const effectiveCfgs = selCfgs ?? (d?.default_cfg != null ? [d.default_cfg] : [1.0]);
-  const effectiveSteps = selSteps ?? (d?.default_steps != null ? [d.default_steps] : [8]);
+  // CFG/steps par MODÈLE DE BASE (bobba84, GitHub #18) : Z-Image Base n'est pas
+  // distillé et ne doit pas hériter des réglages Turbo (cfg 1, 8 steps), qui ruinent
+  // son rendu. `selCfgs`/`selSteps` non nuls = l'utilisateur a choisi → jamais
+  // réécrit ; le défaut par modèle ne s'applique qu'à l'axe encore intact.
+  const modelDefaultCfg = defaultCfgFor(d, effectiveModels);
+  const modelDefaultSteps = defaultStepsFor(d, effectiveModels);
+  const effectiveCfgs = selCfgs ?? [modelDefaultCfg];
+  const effectiveSteps = selSteps ?? [modelDefaultSteps];
   // Pass 2 (detail daemon) : SDXL uniquement. Z-Image → default_steps2 null → axe vide
   // (×1 dans le compteur, pas envoyé au backend).
   const effectiveSteps2 = selSteps2 ?? (d?.default_steps2 != null ? [d.default_steps2] : []);
@@ -105,6 +122,9 @@ export function useStudioForm(d, datasetId, family = null) {
   return {
     selSts, seed, seedLocked, genCount, promptText, selModels,
     chosenCps, effectivePrompt, effectiveModels, effectiveAspects, effectiveCfgs, effectiveSteps, effectiveSteps2, total,
+    // Défauts DU MODÈLE sélectionné (pour l'étiquette « default … » des pickers).
+    modelDefaultCfg, modelDefaultSteps,
+    mixedModelDefaults: mixedModelDefaults(d, effectiveModels),
     setSelSts, setSeed, setSeedLocked, setGenCount, setPromptText,
     toggleCp, toggleSt, toggleAspect, toggleCfg, toggleStep, toggleStep2, toggleModel, rollSeed, nextSeed,
   };

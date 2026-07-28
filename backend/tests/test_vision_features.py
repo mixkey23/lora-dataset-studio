@@ -81,6 +81,139 @@ def test_window_ownership_prevents_flag_stomp_on_re_acquisition(app, monkeypatch
         queue_manager._set_system_state('vision_in_progress', None)
 
 
+def _configure_aitoolkit(tmp_path, app):
+    """Minimal fake ai-toolkit install, so launch_training gets past is_installed()
+    and reaches the GPU guards we actually want to exercise."""
+    from app import config as cfg
+    root = tmp_path / 'aitoolkit'
+    (root / 'venv' / 'Scripts').mkdir(parents=True)
+    (root / 'venv' / 'Scripts' / 'python.exe').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(root)}})
+    return root
+
+
+def test_direct_training_launch_refused_while_a_vision_pass_holds_the_gpu(
+        app, tmp_path, monkeypatch):
+    """The reciprocal half of the GPU-exclusive window.
+
+    The window refuses to OPEN while a training runs. The mirror image — a
+    training refusing to START while a vision pass holds the card — existed only
+    on the QUEUE path (_advance_training_queue skips a due item while
+    vision_in_progress); a direct launch walked straight through.
+
+    That gap is not theoretical. Measured on a 24 GB card: with ~19 GB held by
+    ComfyUI, Ollama cannot fit the 7.5 GB vision model and silently spills 43 %
+    of it to the CPU — the vision pass runs 13.5x slower and the resident GPU
+    work collapses 20-150x. Nothing OOMs, so nothing reports a failure: a
+    training started here would just crawl for hours. Refuse it instead.
+    """
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.gpu_window import GpuBusyError
+    from app.job_queue import queue_manager
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'GW', 'zchar_gw')
+        queue_manager._set_system_state('vision_in_progress', 'tok', ttl_seconds=300)
+        try:
+            with pytest.raises(GpuBusyError, match='vision pass'):
+                lt.launch_training(LOCAL_USER, ds.id, check_captions=False)
+            # ...but QUEUING stays legal: the queue exists precisely to hold work
+            # until the card is free, and _advance_training_queue already refuses
+            # to launch a due item while vision_in_progress. Refusing the enqueue
+            # too would remove the only graceful way out the error message offers.
+            assert lt.enqueue_training(LOCAL_USER, ds.id,
+                                       extra_steps=100)['queued'] is True
+        finally:
+            queue_manager._set_system_state('vision_in_progress', None)
+            lt.dequeue_training(ds.id)
+
+
+def test_training_launch_not_blocked_once_the_vision_pass_released(
+        app, tmp_path, monkeypatch):
+    """Non-regression: no vision flag (or an expired one) must never be the thing
+    that refuses a launch — the guard is a lock, not a latch."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.gpu_window import GpuBusyError
+    from app.job_queue import queue_manager
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'GW2', 'zchar_gw2')
+        queue_manager._set_system_state('vision_in_progress', None)
+        try:
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False)
+        except GpuBusyError:                       # pragma: no cover - the bug
+            pytest.fail('a released vision window must not block a launch')
+        except Exception:
+            pass  # any later failure (no real ai-toolkit to spawn) is fine here
+
+
+def test_queue_advance_leaves_a_due_item_queued_while_a_vision_pass_runs(
+        app, monkeypatch):
+    """The other half of the same guarantee, on the queue path: a due item is
+    NOT launched while the window is held, and — critically — it stays in the
+    queue rather than being consumed, so it still runs once the pass ends."""
+    from app.services import lora_training as lt
+    from app.job_queue import queue_manager
+    launched = []
+    monkeypatch.setattr(lt, '_launch_queued_item',
+                        lambda item: launched.append(item))
+    with app.app_context():
+        queue_manager._set_system_state('training_in_progress', None)
+        lt._save_queue([{'dataset_id': 4242, 'user_id': 'local', 'extra_steps': None}])
+        try:
+            queue_manager._set_system_state('vision_in_progress', 'tok', ttl_seconds=300)
+            assert lt._advance_training_queue() is None
+            assert launched == [], 'a vision pass must hold the training queue'
+            assert len(lt.get_train_queue()) == 1, 'the item must not be consumed'
+            # window released -> the SAME item goes, nothing was lost
+            queue_manager._set_system_state('vision_in_progress', None)
+            assert lt._advance_training_queue() == 'launched:4242'
+            assert [i['dataset_id'] for i in launched] == [4242]
+        finally:
+            queue_manager._set_system_state('vision_in_progress', None)
+            lt._save_queue([])
+
+
+def test_train_route_answers_503_gpu_busy_during_a_vision_pass(
+        app, client, tmp_path, monkeypatch):
+    """User-visible contract: the ▶ button gets the same 503 'GPU busy' the
+    vision routes return when training holds the card — symmetric, and never a
+    silent launch that would crawl behind the pass."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.job_queue import queue_manager
+    from app.config import LOCAL_USER
+    _configure_aitoolkit(tmp_path, app)
+    monkeypatch.setattr(lt.shutil, 'disk_usage',
+                        lambda p: type('u', (), {'free': 500e9})())
+    monkeypatch.setattr(lt, 'assert_trainable', lambda *_a, **_kw: None)
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'GW3', 'zchar_gw3')
+        ds_id = ds.id
+        queue_manager._set_system_state('vision_in_progress', 'tok', ttl_seconds=300)
+    try:
+        r = client.post(f'/api/dataset/{ds_id}/train', json={})
+        assert r.status_code == 503, r.get_data(as_text=True)
+        body = r.get_json()
+        assert body['error'] == 'GPU busy'
+        assert 'vision pass' in body['detail']
+    finally:
+        with app.app_context():
+            queue_manager._set_system_state('vision_in_progress', None)
+
+
 def test_boot_recovery_clears_persisted_vision_lock(app):
     """A request dies with the server process, but its DB flag survives unless
     startup explicitly removes it. Restarting must never strand "GPU busy"."""

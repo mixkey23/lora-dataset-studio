@@ -76,7 +76,7 @@
       "steps": 8,
       "cfg": 1,
       "sampler_name": "euler",
-      "scheduler": "beta57",
+      "scheduler": "simple",
       "denoise": 1.0,
       "model": ["102", 0],
       "positive": ["92", 0],

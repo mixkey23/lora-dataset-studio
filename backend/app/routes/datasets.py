@@ -22,7 +22,12 @@ from ..services.dataset_storage import dataset_path, ensure_dataset_dir
 from ..services import lora_test_studio as lts
 from ..services import studio_grid_export as sge
 from ..services.face_variations import (NSFW_VARIATION_CATALOG, VARIATION_CATALOG,
-                                        is_nsfw_label, select_preset)
+                                        is_nsfw_label, select_preset,
+                                        normalize_subject_type, variation_catalog,
+                                        nsfw_variation_catalog, presets_for,
+                                        preset_meta_for, all_catalog_labels,
+                                        sanitize_custom_shots,
+                                        MAX_CUSTOM_SHOTS_PER_SUBJECT)
 from ..utils.comfyui import KREA_ALLOWED_SAMPLERS, KREA_ALLOWED_SCHEDULERS, get_krea_loras
 from ._common import (_map_error, _require_comfyui, _studio_arch_mismatch_response,
                       _studio_missing_response)
@@ -95,7 +100,8 @@ def dataset_create():
                                 fidelity=data.get('fidelity'),
                                 prompt_suffix=data.get('prompt_suffix'),
                                 prompt_suffixes=data.get('prompt_suffixes'),
-                                render_style=data.get('render_style'))
+                                render_style=data.get('render_style'),
+                                subject_type=data.get('subject_type'))
     except ValueError as e:
         # concept dataset without a concept description -> 400 (not a 500)
         return jsonify({'error': str(e)}), 400
@@ -124,7 +130,11 @@ def dataset_set_train_type(dataset_id):
 @bp.post('/dataset/<int:dataset_id>/settings')
 def dataset_update_settings(dataset_id):
     """Edit name / trigger word / (concept) description / KIND after creation. Changing
-    the trigger is safe (it's prepended at export — no re-caption). Changing a concept
+    the trigger needs no re-caption (it's prepended at export), but it IS the on-disk
+    naming key, so the artefacts it already produced — deployed LoRAs, run folder,
+    export, job config — are renamed with it and the rows naming them are repointed;
+    the response carries `trigger_rename` {ok, files, rows, conflicts} for the UI, and
+    the edit is refused (409) while a run is live. Changing a concept
     dataset's description resets the caption avoid-list cache; re-caption to apply it
     to existing captions (response flags concept_desc_changed for the UI hint).
     Changing the **kind** (character/concept/style) flips the caption strategy and the
@@ -144,7 +154,8 @@ def dataset_update_settings(dataset_id):
             kind=data.get('kind'),
             prompt_suffix=data.get('prompt_suffix'),
             prompt_suffixes=data.get('prompt_suffixes'),
-            render_style=data.get('render_style'))
+            render_style=data.get('render_style'),
+            subject_type=data.get('subject_type'))
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except RuntimeError as e:
@@ -155,11 +166,55 @@ def dataset_update_settings(dataset_id):
 
 @bp.get('/dataset/variations')
 def dataset_variations():
-    return jsonify({'catalog': VARIATION_CATALOG,
-                    # NSFW entries ship separately: the UI only shows them behind
-                    # the 🔞 toggle, and ONLY for the local Klein engine.
-                    'nsfw_catalog': NSFW_VARIATION_CATALOG,
-                    'presets': {n: [e['id'] for e in select_preset(n)] for n in _PRESET_NAMES}})
+    # subject_type steers WHICH catalog/presets are served (?subject_type=animal…).
+    # The human response is byte-identical to the pre-feature payload (no extra
+    # keys); non-human types add `preset_meta` + `subject_type` so the UI can
+    # render their preset cards and relabel the framing headers.
+    st = normalize_subject_type(request.args.get('subject_type'))
+    if st == 'human':
+        return jsonify({'catalog': VARIATION_CATALOG,
+                        # NSFW entries ship separately: the UI only shows them behind
+                        # the 🔞 toggle, and ONLY for the local Klein engine.
+                        'nsfw_catalog': NSFW_VARIATION_CATALOG,
+                        'presets': {n: [e['id'] for e in select_preset(n)] for n in _PRESET_NAMES}})
+    return jsonify({'catalog': variation_catalog(st),
+                    'nsfw_catalog': nsfw_variation_catalog(st),
+                    'presets': {n: [e['id'] for e in select_preset(n, st)] for n in presets_for(st)},
+                    'preset_meta': preset_meta_for(st),
+                    'subject_type': st})
+
+
+@bp.get('/dataset/shot-catalog')
+def dataset_shot_catalog():
+    """The user's imported shots for a subject type + the labels an import may NOT
+    re-use. `reserved_labels` is the union of EVERY catalog plus the legacy aliases,
+    not just this subject's: the by-label resolvers search that whole union, so a
+    label borrowed from another subject type would resolve to the wrong entry."""
+    st = normalize_subject_type(request.args.get('subject_type'))
+    shots = sanitize_custom_shots(cfg.get('custom_shots') or {})
+    return jsonify({'subject_type': st, 'shots': shots.get(st, []),
+                    'reserved_labels': all_catalog_labels(),
+                    'max_shots': MAX_CUSTOM_SHOTS_PER_SUBJECT})
+
+
+@bp.put('/dataset/shot-catalog')
+def dataset_shot_catalog_save():
+    """Replace the imported shots of ONE subject type. The whole list is sent, so a
+    removal is just a shorter list; the other subjects are untouched (config
+    _deep_merge replaces the list under this key only). Sanitized again here — the
+    client validates on import, but this endpoint is the one that writes."""
+    body = request.get_json(force=True, silent=True) or {}
+    st = normalize_subject_type(body.get('subject_type'))
+    shots = body.get('shots')
+    if not isinstance(shots, list):
+        return jsonify({'error': "'shots' must be a list"}), 400
+    if len(shots) > MAX_CUSTOM_SHOTS_PER_SUBJECT:
+        return jsonify({'error': f'too many shots (max {MAX_CUSTOM_SHOTS_PER_SUBJECT})'}), 400
+    kept = sanitize_custom_shots({st: shots}).get(st, [])
+    cfg.save_config({'custom_shots': {st: kept}})
+    # Report what actually landed: a shot dropped here (a label shadowing a
+    # built-in, a framing outside the enum) must not look like it was saved.
+    return jsonify({'subject_type': st, 'shots': kept, 'dropped': len(shots) - len(kept)})
 
 
 @bp.get('/dataset/list')
@@ -226,14 +281,14 @@ def dataset_set_ref(dataset_id):
     # widen back out later — the auto head-crop is only the default framing, not a
     # one-way lossy door (the old behavior discarded it and re-crops could only tighten).
     orig_fn = f"{LOCAL_USER}_datasetreforig_{uuid.uuid4().hex[:8]}.webp"
-    with open(os.path.join(dsdir, orig_fn), 'wb') as fh:
-        fh.write(svc.normalize_to_webp(raw, size=2048))
+    svc.write_image_atomic(os.path.join(dsdir, orig_fn),
+                           svc.normalize_to_webp(raw, size=2048))
     fn = f"{LOCAL_USER}_datasetref_{uuid.uuid4().hex[:8]}.webp"
-    with open(os.path.join(dsdir, fn), 'wb') as fh:
-        fh.write(webp)
+    svc.write_image_atomic(os.path.join(dsdir, fn), webp)
     ds.ref_original_filename = orig_fn
     ds.ref_filename = fn
     svc.db.session.commit()
+    svc.invalidate_reference_edit(dataset_id)   # any pending Before/After is now stale
     resp = {'ok': True, 'ref_filename': fn, 'head_crop': head_detected}
     if want_auto and not head_detected:
         # GUARD-RAIL: don't silently ship a body-centered crop when auto WAS asked.
@@ -275,6 +330,20 @@ def dataset_remove_extra_ref(dataset_id):
     return (jsonify({'ok': True}), 200) if ok else (jsonify({'error': 'not found'}), 404)
 
 
+@bp.post('/dataset/<int:dataset_id>/ref/extra/crop')
+def dataset_crop_extra_ref(dataset_id):
+    """Crop ONE extra reference. Identified by filename like the delete route (extras
+    have no numeric id); the service rejects any name that isn't in this dataset's
+    stored extras, which is also the path-traversal guard."""
+    data = request.get_json(silent=True) or {}
+    try:
+        ok = svc.crop_extra_ref(LOCAL_USER, dataset_id, data.get('filename') or '',
+                                int(data['x']), int(data['y']), int(data['w']), int(data['h']))
+    except (KeyError, ValueError, TypeError):
+        return jsonify({'error': 'invalid crop box'}), 400
+    return (jsonify({'ok': True}), 200) if ok else (jsonify({'error': 'not found'}), 404)
+
+
 @bp.post('/dataset/<int:dataset_id>/ref/crop')
 def dataset_ref_crop(dataset_id):
     data = request.get_json(silent=True) or {}
@@ -310,6 +379,79 @@ def dataset_ref_recrop_auto(dataset_id):
             "Couldn't detect a face — used a centered crop. Use Crop to adjust it manually."
         )
     return jsonify(resp)
+
+
+@bp.post('/dataset/<int:dataset_id>/ref/edit')
+def dataset_ref_edit(dataset_id):
+    """START a background reference-edit job and return AT ONCE (202). The edit is
+    a slow (1-3 min) PAID call; running it in the client's fetch let a backgrounded
+    mobile tab kill it ('Failed to fetch') AND lose the paid result. Now the worker
+    fills a server-side CANDIDATE and the client rediscovers it through the dataset
+    payload's `reference_edit` (survives a tab sleep and a reload). The uploaded
+    images are read HERE (snapshot in the request thread), never in the worker.
+
+    Editable engines are svc.editable_engines(), DERIVED — not a second hardcoded
+    list. The API dispatch (svc._edit_engine_call) is engine-parametric over
+    API_ENGINES, so a private copy here is a route that refuses an engine the
+    service already supports: exactly what kept OpenRouter out of the ✦ Edit modal
+    after it shipped for generation, and then kept BOTH local engines out of it —
+    the two that cost nothing to run, on the most exploratory gesture in the app.
+
+    A local engine (Klein / Krea 2 Edit) does not block the worker either: it is
+    queued on the ComfyUI job queue and answered by its completion callback. A
+    missing weight or node pack comes back as the same actionable 409 the generate
+    route returns, not as a spinner that dies three minutes later."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    prompt = (request.form.get('prompt') or '').strip()
+    engine = (request.form.get('engine') or '').strip()
+    if engine not in svc.editable_engines():
+        return jsonify({'error': svc.edit_engine_choice_message()}), 400
+    # Transient edit-reference images added in the modal — ride along as identity
+    # anchors for THIS call only, never persisted as dataset extra refs. The local
+    # engines refuse them rather than drop them silently (see
+    # svc.LOCAL_EDIT_REF_SUPPORT); the modal hides the picker for those engines.
+    extra_bytes = [f.read() for f in request.files.getlist('ref') if f and f.filename]
+    try:
+        svc.start_reference_edit(current_app._get_current_object(), LOCAL_USER,
+                                 dataset_id, engine, prompt, extra_edit_ref_bytes=extra_bytes)
+    except Exception as e:
+        from ..services.klein_edit_helper import KleinModelsMissing
+        from ..services.krea_edit_helper import KreaModelsMissing
+        if isinstance(e, KleinModelsMissing):
+            return _klein_missing_response(e.missing)
+        if isinstance(e, KreaModelsMissing):
+            return _krea_missing_response(e)
+        return _map_error(e)
+    return jsonify({'ok': True, 'status': 'running'}), 202
+
+
+@bp.post('/dataset/<int:dataset_id>/ref/edit/keep')
+def dataset_ref_edit_keep(dataset_id):
+    """Keep the ready candidate: promote it to BE the reference via the atomic,
+    fail-safe commit (writes+verifies the new files before unlinking the old ones),
+    then delete the candidate. 409 when there is no ready candidate to keep."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    try:
+        fn = svc.keep_reference_edit(LOCAL_USER, dataset_id)
+    except Exception:
+        logger.exception('reference edit keep failed (dataset %s)', dataset_id)
+        return jsonify({'error': "Couldn't save the edited reference — the previous "
+                                 'reference is unchanged.'}), 500
+    if fn is None:
+        return jsonify({'error': 'no edited reference is ready to keep'}), 409
+    return jsonify({'ok': True, 'ref_filename': fn})
+
+
+@bp.post('/dataset/<int:dataset_id>/ref/edit/discard')
+def dataset_ref_edit_discard(dataset_id):
+    """Discard a pending edit (running=abandon or ready) and delete its candidate.
+    The engine call already sent is still billed — no 'refund' is implied."""
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    svc.discard_reference_edit(dataset_id)
+    return jsonify({'ok': True})
 
 
 _KLEIN_ASSET_LABELS = {
@@ -383,6 +525,102 @@ def _klein_missing_response(missing, missing_nodes=None):
                     'klein_nodes_missing': missing_nodes}), 409
 
 
+def _krea_missing_response(e):
+    """Turn a KreaModelsMissing into a structured 409.
+
+    The generate route's client surfaces `error` as a toast, so that STRING has
+    to be actionable on its own — it names the node pack, every missing weight,
+    the exact path it belongs at and where to get it. The itemized payload uses
+    the same `{files, nodes, node_packs}` vocabulary as `_studio_missing_response`
+    (path/kind/class_type/pack/url/search) so a future banner can render both
+    engines with one component, but it is published under its OWN key: claiming
+    to be a `studio_missing` would make the Studio banner announce a "test
+    pipeline" failure for a generation engine.
+
+    AUTO-INSTALLS, exactly like Klein's 409: the four weights are wired into
+    setup_installer and the custom-node pack is git-cloned into this user's own
+    ComfyUI. Selecting the engine and pressing Generate is the intent; the
+    message then reports what is being fetched instead of listing five manual
+    gestures. The manual paths stay in the payload (and in the message when
+    nothing could be started), so a machine that can't download is never left
+    without an answer — and the node pack always adds "restart ComfyUI", which
+    no download can do for the user."""
+    from .. import capabilities, config as cfg
+    from ..services import krea_edit_helper as keh
+    files = keh.missing_file_entries(e.missing)
+    node_packs = keh.krea_node_hints(e.missing_nodes)
+    # Picking the Krea engine and pressing Generate IS the request to install it —
+    # the same intent Klein's 409 acts on. Nothing can be downloaded without a real
+    # ComfyUI tree to put it in, so that case keeps the "configure it first" answer.
+    dir_valid = capabilities.resolve_comfyui_base(cfg.get('comfyui.base_dir') or '')['valid']
+    started = _autostart_krea_install(e.missing, e.missing_nodes) if dir_valid else []
+    parts = ["Krea 2 Edit can't run yet."]
+    if not dir_valid:
+        parts.append('Point the app at your ComfyUI install folder in Setup ▸ ComfyUI '
+                     'and the app can install all of this for you; until then, by hand:')
+    if e.missing_nodes:
+        if keh.krea_node_pack_installed():
+            # On disk, absent from /object_info: the ONE thing no installer can do.
+            parts.append(
+                f"The “{keh.KREA_NODE_PACK['pack']}” node pack is already installed but "
+                "ComfyUI has not loaded it — RESTART ComfyUI (it only registers custom "
+                "nodes at startup).")
+        elif 'krea_nodes' in started:
+            parts.append(
+                f"I'm installing the “{keh.KREA_NODE_PACK['pack']}” custom-node pack "
+                "into your ComfyUI — you will have to RESTART ComfyUI once it lands, "
+                "it only loads custom nodes at startup.")
+        else:
+            parts.append(
+                f"Install the “{keh.KREA_NODE_PACK['pack']}” custom-node pack "
+                f"({keh.KREA_NODE_PACK['url']}) into ComfyUI/custom_nodes and restart "
+                f"ComfyUI — it provides {', '.join(e.missing_nodes)}.")
+    downloading = [a for a in started if a != 'krea_nodes']
+    if downloading:
+        names = ', '.join(keh.KREA_ASSETS[a]['kind'] for a in downloading
+                          if a in keh.KREA_ASSETS)
+        parts.append(f"I've started downloading {names} into your ComfyUI folder "
+                     "(~20 GB in total) — watch progress in Setup ▸ ComfyUI.")
+    else:
+        # Nothing could be started: the by-hand answer is still owed in full.
+        for f in files:
+            parts.append(f"Missing {f['kind']}: place it at {f['path']} inside your "
+                         f"ComfyUI folder (from {f['source']}).")
+    parts.append('Then retry the generation.')
+    return jsonify({'ok': False, 'error': ' '.join(parts),
+                    'downloading': started,
+                    'krea_missing': {'assets': e.missing, 'files': files,
+                                     'nodes': e.missing_nodes,
+                                     'node_packs': node_packs}}), 409
+
+
+def _autostart_krea_install(missing, missing_nodes):
+    """Kick off the installs that close a Krea preflight miss: the node pack (a
+    small git clone) and each missing weight. Returns the action names actually
+    started. Never raises — an install that can't start (already running, disk
+    precondition) is simply absent from the list, and the message degrades to the
+    manual instructions."""
+    from .. import setup_installer
+    from ..services import krea_edit_helper as keh
+    started = []
+    # A pack already ON DISK but not exposed by /object_info needs a ComfyUI
+    # restart, not another install — re-running it would only log "already
+    # installed" and teach the user nothing.
+    want_pack = bool(missing_nodes) and not keh.krea_node_pack_installed()
+    actions = (['krea_nodes'] if want_pack else []) + list(missing or [])
+    for action in actions:
+        if action not in setup_installer.INSTALL_ACTIONS:
+            continue
+        try:
+            setup_installer.start(action)
+            started.append(action)
+        except setup_installer.AlreadyRunning:
+            started.append(action)   # already in flight still counts as "installing"
+        except Exception:
+            pass                     # Precondition (disk) — the message says what to do
+    return started
+
+
 def _autostart_optional_klein():
     """Fire-and-forget: fetch any still-missing OPTIONAL Klein asset (the
     consistency LoRA) after a successful generate, so it's present next time.
@@ -393,79 +631,165 @@ def _autostart_optional_klein():
         _autostart_klein_downloads(optional)
 
 
+def _parse_engine_batches(data):
+    """Normalise the multi-engine payload into [(generator, variations)].
+
+    `engine_batches` (new, optional) is a list of {generator, variations}: the
+    workspace can run one batch per selected engine, either sharing the shots
+    between them or sending every shot to every engine. It is computed client
+    side (the UI has to display the resulting count and cost anyway, and a second
+    implementation here would be a second truth to keep in sync) — so this route
+    validates every entry rather than trusting the split.
+
+    Absent → the historic single `generator` + `variations` shape, unchanged, so
+    a tab that was never reloaded keeps working."""
+    # `in`, not truthiness: an EMPTY list means "the user has no engine selected"
+    # and must be refused, not silently reinterpreted as a legacy Klein request.
+    if 'engine_batches' not in data:
+        return [(data.get('generator') or 'klein', data.get('variations') or [])]
+    raw = data.get('engine_batches')
+    if raw is None:
+        raise ValueError('no engine selected')
+    if not isinstance(raw, list):
+        raise ValueError('engine_batches must be a list')
+    batches = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError('engine_batches must be a list of {generator, variations}')
+        generator = entry.get('generator') or 'klein'
+        variations = entry.get('variations') or []
+        # Every entry is checked — not just the first one — or an unknown engine
+        # could ride along behind a valid one.
+        if generator not in svc.KNOWN_ENGINES:
+            raise ValueError(f'unknown engine: {generator}')
+        if not isinstance(variations, list):
+            raise ValueError('engine_batches variations must be a list')
+        if variations:
+            batches.append((generator, variations))
+    if not batches:
+        raise ValueError('no variations selected — pick at least one engine and one shot')
+    return batches
+
+
 @bp.post('/dataset/<int:dataset_id>/generate')
 def dataset_generate(dataset_id):
     data = request.get_json(silent=True) or {}
-    generator = data.get('generator') or 'klein'
-    variations = data.get('variations') or []
-    # Route-level fail-closed: NSFW variations never reach an API engine — they
-    # exist only on the local Klein path (the service re-checks, defense in depth).
-    if generator in svc.API_ENGINES and any(
-            v.get('nsfw') or is_nsfw_label(v.get('label')) for v in variations):
-        return jsonify({'ok': False,
-                        'error': 'NSFW variations run on the local Klein engine only — '
-                                 'switch the generator to Klein.'}), 400
     try:
-        if generator in svc.API_ENGINES:
-            # API path (Gemini Nano Banana Pro or OpenAI ChatGPT gpt-image-2):
-            # no GPU, rows filled by a background thread — the existing polling
-            # UI tracks them.
-            from flask import current_app
-            ids = svc.generate_variations_nanobanana(
-                current_app._get_current_object(), LOCAL_USER, dataset_id,
-                data.get('variations') or [], data.get('multiplier', 1),
-                engine=generator)
-        elif generator == 'qwen_edit':
-            # Wave 4: general-purpose Qwen-Image-Edit-2511 engine, a LOCAL peer
-            # of Klein. Same node-preflight-then-enqueue shape as Klein below.
-            # NSFW shots run a COMPLETELY DIFFERENT graph (Rapid-AIO checkpoint,
-            # see qwen_edit_helper.py) — preflight it too when any are queued.
-            from ..services import qwen_edit_helper as qeh
-            has_nsfw = any(v.get('nsfw') or is_nsfw_label(v.get('label')) for v in variations)
-            missing_nodes = qeh.qwen_edit_missing_nodes()
+        batches = _parse_engine_batches(data)
+    except ValueError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+    multiplier = data.get('multiplier', 1)
+    # Route-level fail-closed, applied to EACH batch: NSFW variations never reach
+    # an API engine — they exist only on the local Klein path (the service
+    # re-checks, defense in depth). Refused before anything is created, so a bad
+    # entry in the middle of good ones cannot leave a half-dispatched run.
+    for generator, variations in batches:
+        if generator in svc.API_ENGINES and any(
+                v.get('nsfw') or is_nsfw_label(v.get('label')) for v in variations):
+            return jsonify({'ok': False,
+                            'error': 'NSFW variations run on a local engine only — '
+                                     'switch the generator to Klein or Krea 2 Edit.'}), 400
+    # Klein node preflight (once per request — /object_info is large, so never
+    # per-tile): if the workflow needs a custom node this ComfyUI lacks, answer
+    # one actionable 409 instead of a grid of tiles each failing ComfyUI
+    # validation. Fail-open when /object_info is unreachable. Combined with the
+    # model scan so a fresh install gets ONE 409 covering both (and the model
+    # downloads start in parallel with the user's node-pack install).
+    # The dataset must be checked BEFORE the Klein preflight below: that preflight
+    # answers 409 "install the model", which would be a misleading reply to a
+    # request naming a dataset that doesn't exist (the service used to validate
+    # first, since it ran the preflight itself).
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'ok': False, 'error': 'dataset not found'}), 400
+    # Runs BEFORE any dispatch, and covers the MODEL FILES as well as the nodes:
+    # generate_variations checks the assets itself, but by then the API batches of
+    # a mixed run would already be in flight — the user would be told the batch
+    # failed while paying for half of it. Both gaps answer the same actionable
+    # 409 (with the downloads started), so they are checked together, up front.
+    if any(g == 'klein' for g, _ in batches):
+        from ..services import klein_edit_helper as keh
+        missing_nodes = keh.klein_missing_nodes()
+        missing_assets = keh.klein_missing_assets()
+        if missing_nodes or any(a in missing_assets for a in keh.KLEIN_REQUIRED):
+            return _klein_missing_response(missing_assets, missing_nodes)
+    # Same rule for the second LOCAL engine: weights AND the custom-node pack are
+    # checked once, up front, so a mixed run can't bill an API batch and only
+    # then discover Krea can't render its share.
+    if any(g == 'krea' for g, _ in batches):
+        from ..services import krea_edit_helper as keh2
+        try:
+            keh2.preflight()
+        except keh2.KreaModelsMissing as e:
+            return _krea_missing_response(e)
+    # Qwen Edit (Wave 4): general-purpose peer of Klein, same up-front-preflight
+    # rule. NSFW shots run a COMPLETELY DIFFERENT graph (Rapid-AIO checkpoint,
+    # see qwen_edit_helper.py) — preflight it too when any batch queues one.
+    if any(g == 'qwen_edit' for g, _ in batches):
+        from ..services import qwen_edit_helper as qeh
+        has_nsfw = any(v.get('nsfw') or is_nsfw_label(v.get('label'))
+                       for g, variations in batches if g == 'qwen_edit' for v in variations)
+        missing_nodes = qeh.qwen_edit_missing_nodes()
+        if has_nsfw:
+            missing_nodes = missing_nodes + qeh.qwen_edit_nsfw_missing_nodes()
+        if missing_nodes:
+            missing_assets = qeh.qwen_edit_missing_assets()
             if has_nsfw:
-                missing_nodes = missing_nodes + qeh.qwen_edit_nsfw_missing_nodes()
-            if missing_nodes:
-                missing_assets = qeh.qwen_edit_missing_assets()
-                if has_nsfw:
-                    missing_assets = missing_assets + qeh.qwen_edit_nsfw_missing_assets()
-                return _qwen_edit_missing_response(missing_assets, missing_nodes)
-            ids = svc.generate_variations(LOCAL_USER, dataset_id,
-                                          data.get('variations') or [], data.get('multiplier', 1),
-                                          data.get('klein_model'),
-                                          lora_strength=data.get('lora_strength'),
-                                          engine='qwen_edit')
-        else:
-            # Klein node preflight (once per request — /object_info is large, so
-            # never per-tile): if the workflow needs a custom node this ComfyUI
-            # lacks, answer one actionable 409 instead of a grid of tiles each
-            # failing ComfyUI validation. Fail-open when /object_info is
-            # unreachable. Combined with the model scan so a fresh install gets
-            # ONE 409 covering both (and the model downloads start in parallel
-            # with the user's node-pack install).
-            from ..services import klein_edit_helper as keh
-            missing_nodes = keh.klein_missing_nodes()
-            if missing_nodes:
-                return _klein_missing_response(keh.klein_missing_assets(), missing_nodes)
-            ids = svc.generate_variations(LOCAL_USER, dataset_id,
-                                          data.get('variations') or [], data.get('multiplier', 1),
-                                          data.get('klein_model'),
-                                          lora_strength=data.get('lora_strength'),
-                                          # Optional generation-LoRA preset
-                                          # (Idea by @waltm): a NAME resolved
-                                          # from config — absent/'' = none.
-                                          generation_lora_preset=data.get('generation_lora_preset'),
-                                          engine='klein')
-            _autostart_optional_klein()  # bg-fetch the consistency LoRA if it's absent
+                missing_assets = missing_assets + qeh.qwen_edit_nsfw_missing_assets()
+            return _qwen_edit_missing_response(missing_assets, missing_nodes)
+    created, per_engine = 0, {}
+    try:
+        # The per-engine calls each enforce MAX_FANOUT on their own share, which
+        # would let a 3-engine run create rows for two engines before the third
+        # is refused. Check the AGGREGATE first: all-or-nothing.
+        svc.check_fanout_budget(
+            dataset_id, sum(len(v) for _, v in batches) * max(1, int(multiplier or 1)))
+        for generator, variations in batches:
+            if generator in svc.API_ENGINES:
+                # API path (Gemini Nano Banana Pro or OpenAI ChatGPT gpt-image-2):
+                # no GPU, rows filled by a background thread — the existing polling
+                # UI tracks them.
+                from flask import current_app
+                ids = svc.generate_variations_nanobanana(
+                    current_app._get_current_object(), LOCAL_USER, dataset_id,
+                    variations, multiplier, engine=generator)
+            elif generator == 'krea':
+                # Second LOCAL path (Krea 2 Identity Edit): GPU-bound like Klein,
+                # free, NSFW-capable. Its one dial (grounding_px) is a setting,
+                # not a per-run argument — see krea_edit_helper.grounding_px.
+                ids = svc.generate_variations_krea(LOCAL_USER, dataset_id,
+                                                   variations, multiplier)
+            elif generator == 'qwen_edit':
+                # Third LOCAL path (Qwen-Image-Edit-2511, Wave 4) — a peer of
+                # Klein, no fixed rotation vocabulary (unlike Qwen Multi-angle).
+                ids = svc.generate_variations(LOCAL_USER, dataset_id,
+                                              variations, multiplier,
+                                              data.get('klein_model'),
+                                              lora_strength=data.get('lora_strength'),
+                                              engine='qwen_edit')
+            else:
+                ids = svc.generate_variations(LOCAL_USER, dataset_id,
+                                              variations, multiplier,
+                                              data.get('klein_model'),
+                                              lora_strength=data.get('lora_strength'),
+                                              # Optional generation-LoRA preset
+                                              # (Idea by @waltm): a NAME resolved
+                                              # from config — absent/'' = none.
+                                              generation_lora_preset=data.get('generation_lora_preset'))
+                _autostart_optional_klein()  # bg-fetch the consistency LoRA if it's absent
+            created += len(ids)
+            per_engine[generator] = per_engine.get(generator, 0) + len(ids)
     except Exception as e:
         from ..services.klein_edit_helper import KleinModelsMissing
+        from ..services.krea_edit_helper import KreaModelsMissing
         from ..services.qwen_edit_helper import QwenEditModelsMissing
         if isinstance(e, KleinModelsMissing):  # a required Klein model isn't installed
             return _klein_missing_response(e.missing)
+        if isinstance(e, KreaModelsMissing):   # asset or node pack absent — no auto-fetch
+            return _krea_missing_response(e)
         if isinstance(e, QwenEditModelsMissing):  # a required Qwen Edit model isn't installed
             return _qwen_edit_missing_response(e.missing)
         return _map_error(e)
-    return jsonify({'ok': True, 'created': len(ids)})
+    return jsonify({'ok': True, 'created': created, 'per_engine': per_engine})
 
 
 @bp.post('/dataset/<int:dataset_id>/import')
@@ -972,6 +1296,51 @@ def dataset_image_improve(image_id):
     return jsonify({'ok': True, **result})
 
 
+@bp.post('/dataset/image/<int:image_id>/reimprove')
+def dataset_image_reimprove(image_id):
+    """Re-run the ✨ Upscale & improve pass on an improved tile, from its PARENT
+    and with today's settings — replacing the result in place.
+
+    The generic /regenerate route stays closed to these rows on purpose (it would
+    restart from the dataset reference and make an unrelated variation)."""
+    try:
+        result = svc.reimprove_image(LOCAL_USER, image_id)
+    except Exception as e:
+        from ..services.klein_edit_helper import KleinModelsMissing
+        if isinstance(e, svc.KleinNodesMissing):
+            return _klein_missing_response(e.missing, e.missing_nodes)
+        if isinstance(e, KleinModelsMissing):
+            return _klein_missing_response(e.missing)
+        return _map_error(e)
+    if result is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'ok': True, **result})
+
+
+@bp.post('/dataset/<int:dataset_id>/improve/batch')
+def dataset_improve_batch(dataset_id):
+    """Start the SERVER-side ✨ Klein upscale & improve batch over a selection.
+
+    Returns immediately with {queued, skipped}; progress rides on the dataset's
+    `activity` (kind 'improve'), so it survives a reload, and ⏹ Stop generation
+    stops it. The browser no longer loops one request per image."""
+    data = request.get_json(silent=True) or {}
+    ids = data.get('image_ids')
+    if not isinstance(ids, list):
+        return jsonify({'error': 'image_ids must be a list'}), 400
+    try:
+        result = svc.start_bulk_improve(
+            current_app._get_current_object(), LOCAL_USER, dataset_id, ids)
+    except Exception as e:
+        from ..services.klein_edit_helper import KleinModelsMissing
+        if isinstance(e, svc.KleinNodesMissing):
+            return _klein_missing_response(e.missing, e.missing_nodes)
+        if isinstance(e, KleinModelsMissing):
+            return _klein_missing_response(e.missing)
+        return _map_error(e)
+    return jsonify({'ok': True, **result})
+
+
 @bp.post('/dataset/image/<int:image_id>/regenerate')
 def dataset_image_regenerate(image_id):
     data = request.get_json(silent=True) or {}
@@ -994,6 +1363,15 @@ def dataset_image_regenerate(image_id):
             missing_nodes = qeh.qwen_edit_missing_nodes()
             if missing_nodes:
                 return _qwen_edit_missing_response(qeh.qwen_edit_missing_assets(), missing_nodes)
+        elif engine == 'krea':
+            # Krea's own preflight (weights + node pack). Explicit engine only:
+            # when none is given the service picks the row's origin, and its
+            # KreaModelsMissing is mapped below.
+            from ..services import krea_edit_helper as krh
+            try:
+                krh.preflight()
+            except krh.KreaModelsMissing as e:
+                return _krea_missing_response(e)
         elif engine not in svc.API_ENGINES:
             from ..services import klein_edit_helper as keh
             missing_nodes = keh.klein_missing_nodes()
@@ -1008,10 +1386,13 @@ def dataset_image_regenerate(image_id):
     except Exception as e:
         from ..services.klein_edit_helper import KleinModelsMissing
         from ..services.qwen_edit_helper import QwenEditModelsMissing
+        from ..services.krea_edit_helper import KreaModelsMissing
         if isinstance(e, KleinModelsMissing):
             return _klein_missing_response(e.missing)  # auto-download, tell them to retry
         if isinstance(e, QwenEditModelsMissing):
             return _qwen_edit_missing_response(e.missing)
+        if isinstance(e, KreaModelsMissing):
+            return _krea_missing_response(e)
         return _map_error(e)
     if job_id is None:
         return jsonify({'error': 'not found'}), 404
@@ -1150,6 +1531,25 @@ def dataset_image_mirror(image_id):
     """Permanently flip one owned dataset image horizontally in place."""
     try:
         result = svc.mirror_image(LOCAL_USER, image_id)
+    except Exception as e:
+        return _map_error(e)
+    if result is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'ok': True, **result})
+
+
+@bp.post('/dataset/image/<int:image_id>/rotate')
+def dataset_image_rotate(image_id):
+    """Permanently turn one owned dataset image by {degrees} CLOCKWISE (90/180/270).
+
+    Idea by 1Tomber (GitHub #17). Deliberately its own route rather than an
+    option of /crop: the crop lane RESAMPLES (it rescales the box to a fixed
+    long side), which costs detail however the result is then encoded, while a
+    quarter turn resamples nothing — it permutes existing pixels. This route
+    keeps the file's real format and its exact pixels."""
+    data = request.get_json(silent=True) or {}
+    try:
+        result = svc.rotate_image(LOCAL_USER, image_id, data.get('degrees'))
     except Exception as e:
         return _map_error(e)
     if result is None:
@@ -1296,6 +1696,7 @@ def lora_test_run(dataset_id):
                              enhancer=d.get('enhancer'), enhancer_strength=d.get('enhancer_strength'),
                              detail_amount=d.get('detail_amount'),
                              resolution_tier=d.get('resolution_tier'),
+                             resolution_multiplier=d.get('resolution_multiplier'),
                              init_image=d.get('init_image'), denoise=d.get('denoise'))
     except Exception as e:
         from ..services.lora_test_studio import StudioArchMismatch, StudioAssetsMissing

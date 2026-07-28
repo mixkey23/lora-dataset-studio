@@ -1,0 +1,181 @@
+"""The FILESYSTEM half of the ComfyUI contract — and what to say when it breaks.
+
+The app talks to ComfyUI over TWO channels, and only one of them is the network:
+
+1. the HTTP API (`comfyui.api_url`) — what the Setup wizard tests;
+2. the FILESYSTEM — every local engine copies its source image into ComfyUI's
+   `input/` folder and reads the render back from `output/` (the read side already
+   degrades to `GET /view`; the write side has no fallback).
+
+A ComfyUI that answers on its URL therefore proves nothing about channel 2. When
+ComfyUI runs in another container, in WSL, or on another machine, `input/` is not
+shared by default: the copy lands somewhere ComfyUI cannot see, or fails outright
+with an OSError that no route maps — a bare 500 with no detail (reported on
+Discord by nofaceman).
+
+This module makes that failure SPEAK. Every staged write goes through
+`stage_input_copy` / `stage_input_write`, which name the operation, the folder and
+the plausible cause, and raise `ComfyFolderUnavailable` (a RuntimeError, so the
+existing route mapping answers 409 + message instead of 500 + nothing).
+
+Every message is PASTE-SAFE: paths run through `redact_user_paths`, because these
+strings are written to be dropped into a public help thread.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import uuid
+
+from .redact import redact_user_paths
+
+# Which of the four ComfyUI folders the APP writes into (the rest it only reads).
+# Drives both the staging guards and the Settings/Setup writability probe.
+WRITTEN_KINDS = ('input', 'loras')
+
+_KIND_LABELS = {'input': "ComfyUI's input folder", 'output': "ComfyUI's output folder",
+                'models': "ComfyUI's models folder", 'loras': "ComfyUI's LoRA folder"}
+
+# The one sentence that turns "it failed" into "here is what to do". Said the same
+# way everywhere (staging error, Settings warning, Setup note) so it is recognisable.
+SHARED_FOLDER_HINT = (
+    'If ComfyUI runs in another container, in WSL or on another machine, this folder '
+    'must be a shared volume visible to LoRA Dataset Studio at that exact path — '
+    'pointing the app at ComfyUI\'s URL is not enough.'
+)
+
+_SETTINGS_HINT = ('Settings > Local tools > ComfyUI > Advanced: ComfyUI folder '
+                  'overrides lets you point the app at the right folder.')
+
+
+class ComfyFolderUnavailable(RuntimeError):
+    """A ComfyUI working folder cannot be used from this process.
+
+    RuntimeError on purpose: the routes' `_map_error` already turns a RuntimeError
+    into a 409 carrying the message, which is exactly the contract here — an
+    actionable refusal, never an opaque 500."""
+
+
+def safe_path(path) -> str:
+    """A path as it may be SHOWN to the user / pasted in public: home-dir prefix
+    stripped. Everything in this module goes through it."""
+    return redact_user_paths(str(path or ''))
+
+
+def folder_label(kind: str) -> str:
+    return _KIND_LABELS.get(kind, f"ComfyUI's {kind} folder")
+
+
+def folder_problem(kind: str, path) -> str:
+    """Why `path` cannot serve as the `kind` folder, or '' when it looks usable.
+
+    Checks only what is CHEAP and certain — configured, exists, is a directory,
+    and (for the folders the app writes into) actually writable by this process,
+    verified by writing and deleting a probe file rather than trusting a
+    permission bit (a bind-mounted read-only volume lies to `os.access`).
+    Never raises."""
+    if not path:
+        return (f'{folder_label(kind)} is not configured. Set the ComfyUI install '
+                'directory (or an explicit folder override) in Settings.')
+    shown = safe_path(path)
+    try:
+        if not os.path.exists(path):
+            return (f'{folder_label(kind)} does not exist here: {shown}. '
+                    + SHARED_FOLDER_HINT)
+        if not os.path.isdir(path):
+            return f'{folder_label(kind)} is not a directory: {shown}.'
+    except OSError as exc:
+        return f'{folder_label(kind)} could not be checked: {shown} ({_cause(exc)}).'
+    if kind in WRITTEN_KINDS:
+        err = _write_probe(path)
+        if err:
+            return (f'{folder_label(kind)} is not writable from LoRA Dataset Studio: '
+                    f'{shown} ({err}). ' + SHARED_FOLDER_HINT)
+    else:
+        if not os.access(path, os.R_OK):
+            return (f'{folder_label(kind)} is not readable from LoRA Dataset Studio: '
+                    f'{shown}. ' + SHARED_FOLDER_HINT)
+    return ''
+
+
+def _write_probe(path) -> str:
+    """'' when a file can be created AND removed in `path`, else the cause.
+    A real write: read-only bind mounts, full disks and ACL surprises all pass
+    `os.access(W_OK)` on at least one platform."""
+    probe = os.path.join(str(path), f'.lds-write-test-{uuid.uuid4().hex[:8]}')
+    try:
+        with open(probe, 'wb') as fh:
+            fh.write(b'lds')
+    except OSError as exc:
+        # `strerror` only ("Permission denied"), not the full repr: that one appends
+        # the probe file's path, which the sentence around it already gives — the
+        # message is read on a 400px-wide screen, every repeated path costs a line.
+        return f'{exc.__class__.__name__}: {exc.strerror}' if exc.strerror else _cause(exc)
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+    return ''
+
+
+def probe_folder(kind: str, path) -> dict:
+    """{'ok', 'problem'} for one folder — the Settings preview and the Setup wizard
+    both render this, so a broken mount is a WARNING at configuration time instead
+    of a failed generation an hour later. Never raises, never blocks."""
+    problem = folder_problem(kind, path)
+    return {'ok': not problem, 'problem': problem}
+
+
+def _cause(exc: BaseException) -> str:
+    """Exception rendered short and paste-safe: class + message, no traceback, no
+    home path. Empty messages still say WHICH error it was."""
+    msg = safe_path(str(exc)).strip()
+    return f'{exc.__class__.__name__}: {msg}' if msg else exc.__class__.__name__
+
+
+def _staging_error(action: str, kind: str, path, cause: str) -> ComfyFolderUnavailable:
+    return ComfyFolderUnavailable(
+        f'{action} failed. {folder_label(kind)}: {safe_path(path)} '
+        f'({cause}). {SHARED_FOLDER_HINT} {_SETTINGS_HINT}')
+
+
+def ensure_input_usable(path) -> str:
+    """Check ComfyUI's input folder BEFORE a job is built, and raise a named,
+    paste-safe ComfyFolderUnavailable (-> 409 + message) when it can't be used.
+
+    Takes the path rather than resolving it, so each service keeps its own
+    `_comfy_input_dir()` seam: that one stays a PURE resolver (the folder-override
+    tests point it at paths that don't exist), and the checking lives here, at the
+    one moment where a broken mount actually matters."""
+    problem = folder_problem('input', path)
+    if problem:
+        raise ComfyFolderUnavailable(f'{problem} {_SETTINGS_HINT}')
+    return str(path)
+
+
+def stage_input_copy(src_path, dest_name, input_dir) -> str:
+    """Copy `src_path` into ComfyUI's input folder as `dest_name`; return the full
+    destination path. Any filesystem failure becomes a named, paste-safe 409."""
+    base = str(input_dir)
+    dest = os.path.join(base, dest_name)
+    try:
+        shutil.copy2(src_path, dest)
+    except OSError as exc:
+        raise _staging_error('Copying the source image into ComfyUI', 'input',
+                             base, _cause(exc)) from exc
+    return dest
+
+
+def stage_input_write(dest_name, writer, input_dir) -> str:
+    """Same guarantee for callers that GENERATE the file (a PIL crop, say) instead
+    of copying one: `writer(path)` does the write, everything it can raise on the
+    way out is turned into the same named failure."""
+    base = str(input_dir)
+    dest = os.path.join(base, dest_name)
+    try:
+        writer(dest)
+    except OSError as exc:
+        raise _staging_error('Writing the source image into ComfyUI', 'input',
+                             base, _cause(exc)) from exc
+    return dest

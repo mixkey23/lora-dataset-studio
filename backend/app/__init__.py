@@ -1,5 +1,6 @@
 import os
 import logging
+import mimetypes
 import sqlite3
 import json
 from pathlib import Path
@@ -11,6 +12,68 @@ from . import config as cfg
 
 FRONTEND_DIST = cfg.REPO_ROOT / 'frontend' / 'dist'
 logger = logging.getLogger(__name__)
+
+# --- Content types for our own static files ---------------------------------
+# Flask/Werkzeug label every file they send with `mimetypes.guess_type()`. On
+# Windows that module seeds itself from the registry
+# (HKEY_CLASSES_ROOT\<ext>\Content Type), which ANY installed program is free to
+# overwrite — so the type a browser is told depends on what else happens to be on
+# the machine. When `.js` has been rewritten to `text/plain`, the browser refuses
+# to execute the bundle and the app opens on a blank page with nothing at all in
+# the server log. Reported, diagnosed AND fixed by gessyoo (GitHub #12); the same
+# lottery has been observed hitting `.mjs` on a different machine, so this is not
+# one broken PC.
+#
+# The cure is to never ask the registry what our own files are. Every value below
+# is the standard one — the very value Python's built-in table carries when no
+# registry is involved — so on a healthy machine (and on Linux/macOS) this pins
+# what was already being served and changes nothing observable. It only ever
+# repairs a downgrade; it never invents a type for an extension we don't ship.
+_STATIC_MIME_TYPES = {
+    '.html': 'text/html',
+    '.js': 'text/javascript',      # RFC 9239; browsers execute this and
+    '.mjs': 'text/javascript',     # application/javascript identically
+    '.css': 'text/css',
+    '.json': 'application/json',
+    '.map': 'application/json',     # source maps: devtools-only, never executed
+    '.svg': 'image/svg+xml',
+    '.webp': 'image/webp',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.avif': 'image/avif',
+    '.ico': 'image/vnd.microsoft.icon',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+    '.otf': 'font/otf',
+    '.wasm': 'application/wasm',
+    '.txt': 'text/plain',
+}
+
+
+def pin_static_mime_types():
+    """Force the standard content type for every extension the frontend ships.
+
+    `mimetypes.add_type(..., strict=True)` writes into the same table
+    `guess_type()` reads, and it is applied AFTER the registry has been loaded
+    (`add_type` initialises the database first, then overwrites the entry), so
+    the pinned value wins over whatever the registry said. Verified rather than
+    assumed — see backend/tests/test_static_mime_types.py.
+
+    Idempotent and called twice on purpose: at import time (so ANY entry point —
+    backend/run.py, the packaged launcher, a WSGI server, a test importing
+    create_app — is covered without having to remember) and again from
+    create_app(), because a `mimetypes.init()` executed later by any other
+    library rebuilds that table from the registry and would silently drop the
+    pins.
+    """
+    for ext, ctype in _STATIC_MIME_TYPES.items():
+        mimetypes.add_type(ctype, ext, strict=True)
+
+
+pin_static_mime_types()
 
 _DEFAULT_DATASET_ARCHIVE_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 _DEFAULT_DATASET_ARCHIVE_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
@@ -60,6 +123,7 @@ event.listen(Engine, 'connect', _configure_sqlite_connection)
 # hardcoded constants (no user input) → safe to interpolate into the ALTER.
 _SCHEMA_ADDITIONS = (
     ('face_dataset', 'kind', 'VARCHAR(16)'),
+    ('face_dataset', 'subject_type', 'VARCHAR(16)'),
     ('face_dataset', 'concept_desc', 'TEXT'),
     ('face_dataset', 'concept_terms', 'TEXT'),
     ('face_dataset', 'ref_original_filename', 'VARCHAR(255)'),
@@ -80,7 +144,19 @@ _SCHEMA_ADDITIONS = (
     ('face_dataset_image', 'watermark_bbox', 'TEXT'),
     ('face_dataset_image', 'watermark_regions', 'TEXT'),
     ('face_dataset_image', 'source_metadata', 'TEXT'),
+    # Back-link to the bank_image a promotion copied here. Existing rows keep
+    # NULL: a bank that was promoted before this column existed still relies on
+    # its own promoted_dataset_id pointer (see _promotable_query).
+    ('face_dataset_image', 'bank_image_id', 'INTEGER'),
+    # Cached image content hash (run snapshots). Existing rows stay NULL and are
+    # hashed on the next launch that includes them — nothing to backfill, and a
+    # database that never gains these columns simply keeps the old behaviour.
+    ('face_dataset_image', 'content_sig', 'VARCHAR(24)'),
+    ('face_dataset_image', 'content_sig_stat', 'VARCHAR(40)'),
     ('training_run_record', 'settings', 'TEXT'),
+    # Full launch freeze: caption text, per-image content hashes, environment.
+    # NULL on every run recorded before it existed — the compare panel says so.
+    ('training_run_record', 'snapshot', 'TEXT'),
     ('training_run_record', 'parent_record_id', 'INTEGER'),
     ('training_run_record', 'resumed_from', 'INTEGER'),
     ('training_run_record', 'lineage_origin', 'VARCHAR(16)'),
@@ -88,6 +164,12 @@ _SCHEMA_ADDITIONS = (
     ('training_preset', 'dataset_kind', 'VARCHAR(16)'),
     ('training_preset', 'variants', 'TEXT'),
     ('lora_test_image', 'error', 'TEXT'),
+    ('lora_test_image', 'resolution_multiplier', 'REAL'),
+    # WHICH checkpoint produced this image, written at generation time instead of
+    # re-parsed from the filename on every render. Existing rows stay NULL until
+    # services.checkpoint_link_backfill attributes the ones it can prove.
+    ('lora_test_image', 'record_id', 'INTEGER'),
+    ('lora_test_image', 'step', 'INTEGER'),
     # Bank V2 scoring pass — the image_bank/bank_image tables shipped in the Beta,
     # so these columns need the additive path (db.create_all never ALTERs an
     # existing table).
@@ -98,11 +180,52 @@ _SCHEMA_ADDITIONS = (
     ('bank_image', 'caption', 'TEXT'),
     ('bank_image', 'semantic_dup_group', 'INTEGER'),
     ('bank_image', 'framing', 'VARCHAR(8)'),
+    # Bank watermark CLEANING (two manual levels) — the detected bbox is now kept
+    # (the scan used to parse it and throw it away) and the cleaned blob's method
+    # is recorded. Additive: existing banks keep their rows, they just carry NULLs.
+    ('bank_image', 'watermark_bbox', 'TEXT'),
+    ('bank_image', 'watermark_clean_method', 'VARCHAR(16)'),
+    # Bank provenance pass — effective resolution, letterbox, JPEG quality and the
+    # ai/camera/unknown origin. Same additive path: existing banks keep every row
+    # and simply carry NULLs until the next quality scan fills them in.
+    ('bank_image', 'detail_ratio', 'REAL'),
+    ('bank_image', 'bars_ratio', 'REAL'),
+    ('bank_image', 'jpeg_quality', 'REAL'),
+    ('bank_image', 'origin', 'VARCHAR(8)'),
+    ('bank_image', 'origin_evidence', 'VARCHAR(24)'),
+    # ⬆ Promote's second destination: the bank a selection was copied into.
+    # Additive and independent of promoted_dataset_id — a database that never
+    # gains it simply never shows the "promoted to a bank" badge.
+    ('bank_image', 'promoted_bank_id', 'INTEGER'),
+    # Manual quarter-turn of a bank image (degrees clockwise, NULL = untouched).
+    # Additive: a database that never gains it simply has no rotated images.
+    ('bank_image', 'rotation', 'INTEGER'),
     ('image_bank', 'pipeline_report', 'TEXT'),
     ('face_dataset', 'train_engine', 'VARCHAR(16)'),
     ('face_dataset', 'render_style', 'VARCHAR(16)'),
     ('face_dataset_image', 'generation_engine', 'VARCHAR(16)'),
+    # Cloud stop that cannot lie: the moment the user asked for a stop, kept in
+    # the database so the supervisor can terminate a pod whose monitor thread
+    # never honoured it. Additive — existing runs simply carry NULL.
+    ('cloud_training_run', 'stop_requested_at', 'DATETIME'),
 )
+
+# Indexes that only a FRESH database ever got. `index=True` on a model column is
+# honoured by db.create_all() when it creates the table; on a database that
+# already existed, the additive path above adds the COLUMN and nothing else — so
+# every install that predates one of these columns has been scanning without its
+# index ever since. These are exactly the _SCHEMA_ADDITIONS columns declared
+# index=True in models.py, under SQLAlchemy's own default name (ix_<table>_<col>),
+# so a fresh database finds them already there and does nothing.
+_INDEX_ADDITIONS = (
+    ('face_dataset_image', 'bank_image_id'),
+    ('bank_image', 'semantic_dup_group'),
+    ('bank_image', 'style_cluster'),
+    ('bank_image', 'framing'),
+    ('bank_image', 'origin'),
+    ('lora_test_image', 'record_id'),
+)
+
 
 def _apply_additive_migrations():
     from sqlalchemy import text
@@ -114,6 +237,15 @@ def _apply_additive_migrations():
                 db.session.commit()
         except Exception:
             db.session.rollback()  # a failed ALTER must never block boot
+    # Same loop, same discipline: idempotent (IF NOT EXISTS), additive only, and
+    # fail-open — a database that cannot take an index still boots, just slower.
+    for table, col in _INDEX_ADDITIONS:
+        try:
+            db.session.execute(text(
+                f'CREATE INDEX IF NOT EXISTS ix_{table}_{col} ON {table} ({col})'))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
 
 def _cleanup_orphaned_lora_test_images():
@@ -171,6 +303,9 @@ def _cleanup_orphaned_lora_test_images():
                        cancelled_jobs)
 
 def create_app(config_object=None):
+    # Re-assert the static content types: cheap, idempotent, and it survives a
+    # `mimetypes.init()` run by any library imported since this module loaded.
+    pin_static_mime_types()
     app = Flask(__name__, static_folder=None)
     data_dir = Path(os.environ.get('LDS_DATA_DIR', str(cfg.REPO_ROOT / 'data')))
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -250,6 +385,25 @@ def create_app(config_object=None):
         # — once, best-effort, never blocks boot (see services.lineage_backfill).
         from .services.lineage_backfill import run_if_needed as _lineage_backfill
         _lineage_backfill()
+        # Give back their framing to the images promoted from a bank before the
+        # promotion carried it, so they count in Composition instead of sitting
+        # invisible — once, best-effort (see services.framing_backfill).
+        from .services.framing_backfill import run_if_needed as _framing_backfill
+        _framing_backfill()
+        # Let a checkpoint KEEP every preview it is given instead of one (the
+        # canvas shows a gallery under each node). Recreating the table is the
+        # only step of that feature that can lose rows silently, so it is guarded
+        # by a before/after row count and leaves the original in place on any
+        # doubt (see services.checkpoint_preview_migration).
+        from .services.checkpoint_preview_migration import (
+            run_if_needed as _lift_preview_constraint)
+        _lift_preview_constraint()
+        # Attach the test images already on disk to the checkpoint that produced
+        # them, from the evidence only — the rest stays honestly unlinked
+        # (see services.checkpoint_link_backfill).
+        from .services.checkpoint_link_backfill import (
+            run_if_needed as _checkpoint_link_backfill)
+        _checkpoint_link_backfill()
         # Vision requests are process-local, while their mutual-exclusion flag is
         # persisted in SQLite. A killed captioning request therefore cannot still
         # be running after boot; clear its stale flag immediately instead of
@@ -330,3 +484,7 @@ def _start_workers(app):
     from .services import cloud_training
     threading.Thread(target=cloud_training.boot_recover, args=(app,),
                      daemon=True, name='cloud-boot-recover').start()
+    # Started separately from boot_recover on purpose: the watchdog that
+    # enforces the runtime cap, the stop deadline and the freeze detection must
+    # not share a fate with the recovery it supervises.
+    cloud_training.start_supervisor(app)

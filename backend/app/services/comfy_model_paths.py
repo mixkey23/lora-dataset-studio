@@ -36,12 +36,17 @@ Reference semantics (verbatim from comfyanonymous/ComfyUI, read 2026-07):
         constant.
 
 Extensions: ComfyUI's ``supported_pt_extensions`` = {.ckpt,.pt,.pt2,.bin,.pth,
-.safetensors,.pkl,.sft}. We list ``{.safetensors, .sft, .gguf}``: the app's
-pipelines only load these, and the app ALREADY lists ``.gguf`` across
-klein_edit_helper + utils/comfyui (ComfyUI-GGUF quantised diffusion models are
-common in this community). Dropping ``.gguf`` to match core ComfyUI would HIDE
-models existing users already see, so we keep it and stay narrow on the rest so
-``picker == probe == resolver``.
+.safetensors,.pkl,.sft}. We list ``{.safetensors, .sft, .gguf}`` and stay narrow
+on the rest so ``picker == probe == resolver``.
+
+``.gguf`` is the exception that is listed but NOT loadable: core ComfyUI has no
+``.gguf`` in ``supported_pt_extensions``, so it never scans such a file in ANY
+model root, and the shipped graphs emit core ``UNETLoader``, which cannot read one
+even when the ComfyUI-GGUF pack is installed (that pack adds a separate
+``UnetLoaderGGUF`` node, which nothing here emits). Dropping it would hide a file
+users can see on disk and turn a nameable problem into a silent absence; keeping
+it is only honest because ``utils.comfyui.unavailable_model_files`` states the
+extension as the cause before a job is queued (naniii2352, Discord).
 
 Degradation is total and silent-safe: no base_dir / no yaml / malformed yaml /
 PyYAML not importable all resolve to "no extra roots" (logged once), never an
@@ -77,6 +82,28 @@ YAML_FILENAME = 'extra_model_paths.yaml'
 # folder_paths.supported_pt_extensions narrowed to what this app's loaders can
 # actually consume, plus .gguf (see module docstring). endswith() takes a tuple.
 _MODEL_EXTENSIONS = ('.safetensors', '.sft', '.gguf')
+
+# What a loader can actually OPEN — the same tuple minus .gguf. Listing and
+# loading are two different questions and conflating them shipped a real bug:
+# a base resolver picks a file by NAME (the first one containing 'turbo'), and
+# `krea2_turbo-Q4_K_M.gguf` contains 'turbo'. So dropping that file into a krea
+# folder was enough for the app to start choosing, on its own, a model ComfyUI
+# cannot read — mid-batch, with no setting touched. Reported by naniii2352
+# (Discord) as "it generated half the images and then started throwing a gguf
+# error"; the batch straddled the moment he copied the file in.
+# Any code that CHOOSES a file must filter on this; code that merely LISTS may
+# use _MODEL_EXTENSIONS so the user still sees what is on disk.
+LOADABLE_MODEL_EXTENSIONS = ('.safetensors', '.sft')
+
+
+def is_loadable_model(name: str) -> bool:
+    """True when a loader node could actually open this file.
+
+    Deliberately a function and not an inline endswith(): every resolver that
+    picks a base model must go through the same predicate, or the next format
+    we list-but-cannot-load repeats this bug somewhere else.
+    """
+    return str(name or '').lower().endswith(LOADABLE_MODEL_EXTENSIONS)
 
 # folder_paths.map_legacy — the canonical alias source (unet↔diffusion_models,
 # clip↔text_encoders). Query and yaml keys are both normalised through it.

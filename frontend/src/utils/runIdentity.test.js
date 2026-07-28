@@ -5,7 +5,34 @@ import {
   localRunIdentity,
   runIdentityOf,
   runRowDomId,
+  runNumber,
+  cloudNumber,
+  runIdentityLabel,
 } from './runIdentity.js';
+
+/* ── One run number across the lineage surfaces ───────────────────────────────
+   The graph card printed the CLOUD id and the inspector the RECORD id, so
+   "#103" opened "Run #107" and nothing said they were the same run. */
+
+test('runNumber is always the record id — a local run has no cloud id at all', () => {
+  assert.equal(runNumber({ record_id: 107, source: 'cloud', run_id: 103 }), '#107');
+  assert.equal(runNumber({ record_id: 12, source: 'local' }), '#12');
+  assert.equal(runNumber(null), '#?');
+  assert.equal(runNumber({}), '#?');
+});
+
+test('cloudNumber only answers for a cloud run that has one', () => {
+  assert.equal(cloudNumber({ record_id: 107, source: 'cloud', run_id: 103 }), 103);
+  assert.equal(cloudNumber({ record_id: 12, source: 'local', run_id: 103 }), null);
+  assert.equal(cloudNumber({ record_id: 9, source: 'cloud' }), null);
+  assert.equal(cloudNumber(null), null);
+});
+
+test('runIdentityLabel names the run once and the cloud run explicitly', () => {
+  assert.equal(runIdentityLabel({ record_id: 107, source: 'cloud', run_id: 103 }),
+    'Run #107 · cloud #103');
+  assert.equal(runIdentityLabel({ record_id: 12, source: 'local' }), 'Run #12');
+});
 
 test('runRowDomId keys cloud vs local rows distinctly, null when unaddressable', () => {
   assert.equal(runRowDomId('cloud', 49), 'run-cloud-49');

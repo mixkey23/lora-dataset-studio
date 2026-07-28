@@ -1,18 +1,24 @@
 import { Link } from 'react-router-dom'
-import { deriveCapabilitySummary } from '../../hooks/useSetupSteps'
-
-const FIX_LINKS = [
-  { to: '/settings/engines', label: 'Image engines', hint: 'API keys, ChatGPT subscription, default engine' },
-  { to: '/settings/local-tools', label: 'Local tools', hint: 'ComfyUI, Ollama, ai-toolkit' },
-  { to: '/settings/training', label: 'Training', hint: 'Default family, cloud GPU' },
-  { to: '/setup', label: 'Setup wizard', hint: 'Guided scan + install of everything above' },
-]
+import { deriveCapabilitySummary, capabilityDestination } from '../../hooks/useSetupSteps'
 
 /* The health map in full: the sidebar LEDs summarized as tiles, plus where to
-   go to fix what's off. Status is glyph + text, never color alone. */
+   go to fix what's off. Status is glyph + text, never color alone.
+
+   Each tile is a DOOR, not a verdict. A row that reads "✗ Person masks" used to
+   be a dead end — the user learned something was missing and then had to guess
+   which of eight Settings sections (or which wizard screen) turned it on. Every
+   row is now a real <Link> to the exact control, focus id included, resolved
+   from the help registry by capabilityDestination so it cannot drift.
+
+   Deliberately NOT eleven buttons: this is read at a glance, so the glyph and
+   the label stay the loudest thing on the row and the affordance is a quiet
+   chevron. Same reason the old four-entry "Where to fix it" card is gone — the
+   rows above are strictly more precise; only the whole-rig guided path (the
+   Setup wizard), which belongs to no single capability, is worth one line. */
 export default function OverviewSection({ caps }) {
   const summary = deriveCapabilitySummary(caps)
   const ready = summary.filter((s) => s.ok).length
+  const waiting = summary.filter((s) => s.pending).length
   return (
     <div className="space-y-6">
       {!caps.configured && (
@@ -27,35 +33,44 @@ export default function OverviewSection({ caps }) {
       )}
 
       <section className="rounded-xl border border-border bg-surface p-5">
-        <div className="flex items-baseline justify-between gap-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
           <h2 className="text-base font-semibold text-content">Capabilities</h2>
-          <span className="font-mono text-xs text-content-subtle">{ready}/{summary.length} ready</span>
+          <span className="font-mono text-xs text-content-subtle">
+            {ready}/{summary.length} ready{waiting ? ` · ${waiting} waiting` : ''}
+          </span>
         </div>
-        <div className="mt-4 grid gap-2 sm:grid-cols-2">
-          {summary.map((s) => (
-            <div key={s.label}
-              className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-sm">
-              <span aria-hidden className={s.ok ? 'text-emerald-400' : 'text-content-subtle'}>{s.ok ? '✓' : '✗'}</span>
-              <span className={s.ok ? 'text-content' : 'text-content-muted'}>{s.label}</span>
-              <span className="sr-only">{s.ok ? '(ready)' : '(not available)'}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="rounded-xl border border-border bg-surface p-5">
-        <h2 className="text-base font-semibold text-content">Where to fix it</h2>
-        <ul className="mt-3 divide-y divide-border">
-          {FIX_LINKS.map((l) => (
-            <li key={l.to}>
-              <Link to={l.to}
-                className="group flex items-baseline justify-between gap-3 py-2.5 no-underline">
-                <span className="text-sm font-medium text-content group-hover:underline">{l.label}</span>
-                <span className="text-right text-xs text-content-subtle">{l.hint}</span>
+        <p className="mt-1 text-xs text-content-subtle">Pick any row to jump to the setting that turns it on.</p>
+        <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+          {summary.map((s) => {
+            const dest = capabilityDestination(s)
+            // Pending = installed, just not running. Amber ◐ like the wizard's
+            // "Almost there", never the discouraging ✗ of something missing.
+            const glyph = s.pending ? '◐' : (s.ok ? '✓' : '✗')
+            const glyphCls = s.pending ? 'text-amber-400' : (s.ok ? 'text-emerald-400' : 'text-content-subtle')
+            return (
+              <Link key={s.label} to={dest.href} aria-label={dest.announce}
+                className="group flex min-w-0 items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2
+                  text-sm no-underline transition-colors hover:border-border-strong hover:bg-surface-raised
+                  focus:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                <span aria-hidden className={glyphCls}>{glyph}</span>
+                <span className="min-w-0 flex-1">
+                  <span className={`block truncate ${s.ok || s.pending ? 'text-content' : 'text-content-muted'}`}>
+                    {s.label}
+                  </span>
+                  {s.note && <span className="block truncate text-[11px] text-amber-300/80">{s.note}</span>}
+                </span>
+                <span aria-hidden
+                  className="shrink-0 text-content-subtle opacity-0 transition-opacity group-hover:opacity-100
+                    group-focus-visible:opacity-100">›</span>
               </Link>
-            </li>
-          ))}
-        </ul>
+            )
+          })}
+        </div>
+        <p className="mt-4 border-t border-border pt-3 text-xs text-content-muted">
+          Not sure where to start?{' '}
+          <Link to="/setup" className="font-medium text-sky-300 underline hover:text-sky-200">Run the Setup wizard</Link>
+          {' '}— it scans your machine and installs what it can.
+        </p>
       </section>
     </div>
   )

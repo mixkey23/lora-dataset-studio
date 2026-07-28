@@ -29,7 +29,7 @@ test('both hubs open the shared ContinueDialog', () => {
 
 test('local continue still routes through the guarded, accumulating request helper', () => {
   assert.match(panel, /runConfirmableTrainingRequest/);
-  assert.match(panel, /\(continueOpts\) => ds\.continueTraining/);
+  assert.match(panel, /\(continueOpts\) => \(inCloud \? ds\.continueTrainingInCloud : ds\.continueTraining\)\(/);
   assert.match(panel, /fromStep:\s*payload\.fromStep,\s*overrides:\s*payload\.overrides/);
   assert.match(panel, /confirmableRetryFlag\(error, 'Continue anyway \(force\)'\)/);
 });
@@ -67,16 +67,69 @@ test('both hubs feed the dialog the run optimizer + current LR for the hint', ()
 });
 
 test('the dialog can open on a specific checkpoint (◉ Graph "continue from here")', () => {
-  // opt-in prop, defaulting to the newest when the step is not a real save
+  // opt-in prop, resolved by the unit-tested rule (lineageContinue.test.js):
+  // the requested step when it is a real save, else the newest.
   assert.match(dialog, /initialFromStep\s*=\s*null/);
-  assert.match(dialog, /initialFromStep\s*!=\s*null\s*&&\s*steps\.includes\(initialFromStep\)/);
+  assert.match(dialog, /initialResumeStep\(initialFromStep, steps\)/);
+  assert.match(dialog, /import \{ initialResumeStep, resolveInitialLane, submitBlockedReason \} from '\.\/lineageContinue\.js'/);
+});
+
+test('the dialog can offer the LANE (local vs cloud), opt-in and reasoned', () => {
+  // opt-in prop: absent → no picker at all (the Runs hub keeps today's dialog)
+  assert.match(dialog, /lanes = null/);
+  assert.match(dialog, /\{lanes && \(/);
+  assert.match(dialog, /resolveInitialLane\(where, lanes\)/);
+  // both lanes rendered as radios, a closed one disabled WITH its reason shown
+  assert.match(dialog, /aria-label="Where to run the continuation"/);
+  assert.match(dialog, /💻 Local/);
+  assert.match(dialog, /☁ Cloud/);
+  assert.match(dialog, /disabled=\{off\}/);
+  assert.match(dialog, /laneState\(lane\)\.reason/);
+  // the chosen lane rides the payload, and a blocked lane can't be submitted
+  assert.match(dialog, /lane,\s*\}\)/);
+  assert.match(dialog, /disabled=\{busy \|\| latest === 0 \|\| laneBlocked\}/);
+});
+
+test('the Runs hub offers the picker too, with its own lane rule', () => {
+  // It used to pass no `lanes` (a deliberate scope choice) and silently
+  // relaunched a pod — Continue opened from the Runs page gave no choice at all.
+  assert.match(cloud, /lanes=\{continueLanes\}/);
+  // the hub's guards differ from the panel's (many datasets, machine-wide local
+  // single-flight), so they live in their own unit-tested rule
+  assert.match(cloud, /runsHubContinueLanes\(continueRunTarget/);
+});
+
+test('the dataset panel routes the chosen lane to the matching call', () => {
+  // ONE dialog, two hooks — no third resume path, same guarded request helper
+  // (the lane is normalised through preflightLane.js now — same rule, one place,
+  // because the preflight gate needs it too)
+  assert.match(panel, /const lane = laneOfPayload\(payload\);\s*\n\s*const inCloud = lane === 'cloud';/);
+  assert.match(panel, /\(inCloud \? ds\.continueTrainingInCloud : ds\.continueTraining\)\(/);
+  assert.match(panel, /lanes=\{continueLanes\}/);
+  assert.match(panel, /where=\{laneOfStep\(continueInitialStep\)\}/);
+  // each lane carries its own honest reason, cloud reusing the app's single source
+  assert.match(panel, /Cloud training needs a vast\.ai API key/);
+  assert.match(panel, /Local training needs ai-toolkit/);
+  assert.match(panel, /cloudDisabledReason\s*\?\s*\{ available: false, reason: cloudDisabledReason \}/);
+});
+
+test('the cloud lane posts the local checkpoint to the continue-local endpoint', () => {
+  assert.match(hook, /train\/cloud\/continue-local/);
+  // it reuses the local payload shape (selection + safe overrides + from_step)
+  assert.match(hook, /const continueTrainingInCloud = useCallback/);
+  assert.match(hook, /opts\.fromStep != null \? \{ from_step: opts\.fromStep \} : \{\}/);
+  assert.match(hook, /continueTraining, continueTrainingInCloud,/);
 });
 
 test('a ◉ Graph checkpoint pill opens the cloud Continue dialog pre-filled', () => {
   const graph = fs.readFileSync(new URL('./RunLineageGraph.jsx', import.meta.url), 'utf8');
   const tree = fs.readFileSync(new URL('./RunLineageTree.jsx', import.meta.url), 'utf8');
-  // the graph surfaces a "continue from here" action, threaded through the tree
-  assert.match(graph, /onContinueCheckpoint\(openCk\.node,\s*openCk\.pill\)/);
+  // the graph surfaces a "continue from here" action, threaded through the tree.
+  // The action itself lives in the SHARED popover now (one popover for the graph
+  // and the canvas); the graph's job is to hand it the mount's handler.
+  const popover = fs.readFileSync(new URL('./CheckpointActionsPopover.jsx', import.meta.url), 'utf8');
+  assert.match(graph, /onContinue=\{typeof onContinueCheckpoint === 'function' \? onContinueCheckpoint : undefined\}/);
+  assert.match(popover, /onClick=\{\(\) => \{ onContinue\(node, pill\); onClose\?\.\(\); \}\}/);
   assert.match(tree, /onContinueCheckpoint=\{onContinueCheckpoint\}/);
   // the Runs page maps a pill to the run and opens the dialog on that step
   assert.match(cloud, /continueFromCheckpoint/);

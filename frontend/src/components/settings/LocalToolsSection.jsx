@@ -1,6 +1,12 @@
-import { useState } from 'react'
-import { Card, TextField, TestResult, TestButton, SecretField } from './primitives'
-import { postJson } from '../../api/fetchClient'
+import { useEffect, useState } from 'react'
+import { INPUT_CLASS, Card, TextField, TestResult, TestButton, SecretField } from './primitives'
+import { postJson, apiFetch } from '../../api/fetchClient'
+import {
+  COMFY_FOLDER_FIELDS, comfyFolderField, folderPlaceholder, folderEffective,
+  folderWarning, detectedSuggestion, foldersQuery, hasAnyOverride,
+} from './comfyFolders'
+import ResetToDefault from './ResetToDefault'
+import { defaultValueAt } from './settingDefaults.js'
 
 /* HF token is for gated TRAINING bases (Krea 2 / FLUX.1 / FLUX.2 Klein) and reading
    your private custom-base repos — it lives with the ComfyUI card because that's
@@ -77,8 +83,116 @@ function OllamaStatus({ caps, refreshCaps, toast }) {
   )
 }
 
+/* The four ComfyUI folder overrides. They have always been honoured by the backend but
+   had no field anywhere, so a ComfyUI started with --input-directory/--output-directory
+   looked like it was being ignored (reported on Discord by vykas22).
+
+   Two things make them safe to use rather than a leap of faith: an empty field shows
+   the DERIVED path it actually falls back to, and a path that isn't on disk says so —
+   both resolved by the backend with the same function the app itself uses, so the
+   preview cannot drift from the real behaviour. Debounced so typing a path doesn't
+   fire a request per keystroke. */
+function ComfyFolderOverrides({ config, setField }) {
+  const comfy = config.comfyui
+  const [state, setState] = useState({ folders: {}, detected: {} })
+  const query = foldersQuery(comfy)
+
+  useEffect(() => {
+    let alive = true
+    const t = setTimeout(async () => {
+      try {
+        const r = await apiFetch(`/api/setup/comfyui-folders?${query}`)
+        if (alive) setState((prev) => ({ folders: r.folders || {}, detected: prev.detected }))
+      } catch { /* preview only — never block the form on it */ }
+    }, 350)
+    return () => { alive = false; clearTimeout(t) }
+  }, [query])
+
+  // Ask the running ComfyUI what it was launched with, once per mount. It answers from
+  // its own command line (/system_stats), so a hit is a fact, not a layout guess; no
+  // answer simply means nothing is offered and the manual fields stand alone.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const r = await apiFetch(`/api/setup/comfyui-folders?${foldersQuery(comfy, { detect: true })}`)
+        if (alive) setState((prev) => ({ ...prev, detected: r.detected || {} }))
+      } catch { /* ComfyUI down: no suggestions, nothing broken */ }
+    })()
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const anyDetected = COMFY_FOLDER_FIELDS.some((f) => detectedSuggestion(f, state.detected, comfy[f.key]))
+  // The four ids below are written out literally, not mapped: the help-registry
+  // contract test discovers Settings ids by scanning this file for id="…", and a
+  // computed id would silently escape the "every setting has a help topic" check.
+  const rowProps = { comfy, setField, state }
+
+  return (
+    <details className="rounded-lg border border-border p-3" open={hasAnyOverride(comfy) || anyDetected}>
+      <summary className="cursor-pointer text-sm font-medium text-content-muted">
+        Advanced: ComfyUI folder overrides
+      </summary>
+      <div className="mt-3 space-y-4">
+        <p className="text-xs text-content-muted">
+          Leave these empty unless ComfyUI was started with its own folders (
+          <code>--output-directory</code>, <code>--input-directory</code>,{' '}
+          <code>--models-directory</code>). Each field shows the folder the app uses
+          while it is empty.
+        </p>
+        <ComfyFolderRow {...rowProps} fieldKey="output_dir" id="comfyui-output-dir" />
+        <ComfyFolderRow {...rowProps} fieldKey="input_dir" id="comfyui-input-dir" />
+        <ComfyFolderRow {...rowProps} fieldKey="models_dir" id="comfyui-models-dir" />
+        <ComfyFolderRow {...rowProps} fieldKey="loras_dir" id="comfyui-loras-dir" />
+      </div>
+    </details>
+  )
+}
+
+function ComfyFolderRow({ comfy, setField, state, fieldKey, id }) {
+  const field = comfyFolderField(fieldKey)
+  const info = state.folders[fieldKey]
+  const suggestion = detectedSuggestion(field, state.detected, comfy[fieldKey])
+  return (
+    <TextField
+      id={id}
+      label={field.label}
+      value={comfy[fieldKey]}
+      onChange={(v) => setField('comfyui', fieldKey, v)}
+      placeholder={folderPlaceholder(field)}
+      help={field.help}
+      warn={folderWarning(info)}
+    >
+      {folderEffective(info) && (
+        <p className="mt-1 break-all text-xs text-content-muted">
+          Currently using <code className="text-content">{folderEffective(info)}</code>
+        </p>
+      )}
+      {suggestion && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          <span className="min-w-0 break-all text-xs text-content-muted">
+            ComfyUI is running with <code className="text-sky-300">{suggestion}</code>
+          </span>
+          <button
+            type="button"
+            onClick={() => setField('comfyui', fieldKey, suggestion)}
+            className="shrink-0 rounded-md border border-sky-400/40 px-2 py-1 text-xs font-medium text-sky-300 hover:bg-sky-400/10"
+          >
+            Use this
+          </button>
+        </div>
+      )}
+    </TextField>
+  )
+}
+
 export default function LocalToolsSection(props) {
-  const { config, setField, testResults, recordTestResult, saveConfigSection, caps, refreshCaps, toast } = props
+  const { config, setField, testResults, recordTestResult, saveConfigSection, caps, refreshCaps, toast,
+          configDefaults } = props
+  // Shipped values come from the server payload, never retyped here.
+  const ollamaDefault = (key) => defaultValueAt(configDefaults, 'ollama', key)
+  const comfyDefault = (key) => defaultValueAt(configDefaults, 'comfyui', key)
   return (
     <div className="space-y-6">
       <Card
@@ -105,8 +219,37 @@ export default function LocalToolsSection(props) {
           value={config.comfyui.base_dir}
           onChange={(v) => setField('comfyui', 'base_dir', v)}
           placeholder="C:\ComfyUI"
-          help="Used to derive the output/input/models/loras folders unless overridden."
+          help="Used to derive the output/input/models/loras folders unless overridden below."
         />
+        <ComfyFolderOverrides config={config} setField={setField} />
+        <div>
+          <label htmlFor="comfyui-object-info-timeout" className="block text-sm font-medium text-content">
+            ComfyUI response timeout
+          </label>
+          <select
+            id="comfyui-object-info-timeout"
+            value={String(config.comfyui.object_info_timeout_s ?? comfyDefault('object_info_timeout_s'))}
+            onChange={(e) => setField('comfyui', 'object_info_timeout_s', Number(e.target.value))}
+            className={INPUT_CLASS}
+          >
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="45">45 seconds — recommended</option>
+            <option value="90">90 seconds</option>
+            <option value="180">3 minutes — very large install</option>
+          </select>
+          <p className="mt-1 text-xs text-content-muted">
+            How long ComfyUI may take to list its nodes and model files. That list
+            grows with every custom-node pack and every weight you install, so a
+            heavily-loaded ComfyUI can need 15 seconds or more — and when the app gave
+            up too early it wrongly reported ComfyUI as not running. Raise this if you
+            see “ComfyUI is answering too slowly”. A ComfyUI that is genuinely stopped
+            is detected in a couple of seconds either way, so a high value here costs
+            you nothing. Reported and measured by j_o_e_l. (Discord).
+          </p>
+          <ResetToDefault label="ComfyUI response timeout" section="comfyui" field="object_info_timeout_s"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </div>
         <SecretField field={HF_SECRET} {...props} />
       </Card>
 
@@ -135,6 +278,60 @@ export default function LocalToolsSection(props) {
           </div>
           <TestButton target="ollama" beforeTest={() => saveConfigSection('ollama')}
             onResult={(r) => recordTestResult('ollama', r)} />
+        </div>
+        <div>
+          <label htmlFor="ollama-vision-concurrency" className="block text-sm font-medium text-content">
+            Images analysed at once
+          </label>
+          <select
+            id="ollama-vision-concurrency"
+            value={String(config.ollama.vision_concurrency ?? ollamaDefault('vision_concurrency'))}
+            onChange={(e) => setField('ollama', 'vision_concurrency', Number(e.target.value))}
+            className={INPUT_CLASS}
+          >
+            <option value="1">1 — one at a time (slowest, gentlest)</option>
+            <option value="2">2</option>
+            <option value="4">4 — recommended (about twice as fast)</option>
+            <option value="6">6</option>
+            <option value="8">8 — only if Ollama is set up for it</option>
+          </select>
+          <p className="mt-1 text-xs text-content-muted">
+            Bank passes that read every image — watermark scan, framing, captions — send
+            this many requests to Ollama at the same time. Most of each request is
+            waiting, not computing, so overlapping them roughly halves a long pass.
+            Raising it past 4 gains little unless your Ollama is configured for more
+            parallel requests, and it makes Stop take a few seconds longer.
+          </p>
+          <ResetToDefault label="Images analysed at once" section="ollama" field="vision_concurrency"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </div>
+        <div>
+          <label htmlFor="ollama-vision-keep-warm" className="block text-sm font-medium text-content">
+            Keep the vision model warm
+          </label>
+          <select
+            id="ollama-vision-keep-warm"
+            value={String(config.ollama.vision_keep_warm_seconds ?? ollamaDefault('vision_keep_warm_seconds'))}
+            onChange={(e) => setField('ollama', 'vision_keep_warm_seconds', Number(e.target.value))}
+            className={INPUT_CLASS}
+          >
+            <option value="0">Off — unload after every single image</option>
+            <option value="60">1 minute</option>
+            <option value="120">2 minutes — recommended</option>
+            <option value="300">5 minutes</option>
+            <option value="600">10 minutes</option>
+          </select>
+          <p className="mt-1 text-xs text-content-muted">
+            Loading the vision model takes about 13 seconds; describing an image once
+            it's loaded takes half a second. One-off jobs — the automatic head crop on a
+            reference photo, Describe in Test Studio — used to unload it straight away,
+            so doing several in a row paid that load every time. The app now keeps it
+            loaded for this long, but only while nothing else needs the graphics card,
+            and hands the memory straight back the moment a generation or a training run
+            starts. Set it to Off if your card is tight on memory.
+          </p>
+          <ResetToDefault label="Keep the vision model warm" section="ollama" field="vision_keep_warm_seconds"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
       </Card>
 

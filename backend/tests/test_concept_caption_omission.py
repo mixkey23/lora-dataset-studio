@@ -269,10 +269,10 @@ def test_caption_concept_joycaption_backend_scrubs_without_ollama(app, monkeypat
         assert 'red hair' in cap and 'park' in cap
 
 
-# --- NSFW vocabulary preset on a CONCEPT dataset (Jeremy 2026-07-19) ----------
+# --- NSFW vocabulary preset on a CONCEPT dataset (reported 2026-07-19) ----------
 def test_caption_concept_explicit_vocabulary_reaches_the_refine(app, monkeypatch):
     """The 'explicit' preset must reach the Qwen REFINE prompt — the path that actually
-    PRODUCES the caption when JoyCaption is available (Jeremy's case). It was appended only
+    PRODUCES the caption when JoyCaption is available (the reported case). It was appended only
     to cap_prompt (Joy + direct), so the refine ran WITHOUT it and the abliterated refiner
     rewrote the crude Joy draft into neutral prose: the preset looked like it did nothing."""
     from app.services import vision_ollama

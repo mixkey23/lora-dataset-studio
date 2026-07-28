@@ -424,7 +424,7 @@ def test_resync_recovers_trained_from_on_disk_lora(app, tmp_path):
 
         for ds in list(svc.list_datasets(LOCAL_USER)):
             svc.delete_dataset(LOCAL_USER, ds.id)
-        # delete_dataset purges deployed LoRAs; Jeremy's same-machine case is the
+        # delete_dataset purges deployed LoRAs; the same-machine case is the
         # file STILL on disk at restore time (he re-imported without deleting), so
         # put it back to reproduce faithfully.
         _deploy_fake_lora(str(loras_root), 'sdxl', 'alice')

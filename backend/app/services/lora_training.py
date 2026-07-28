@@ -35,7 +35,7 @@ from PIL import Image
 from .. import config as cfg
 from ..models import FaceDataset, FaceDatasetImage
 from ..job_queue import queue_manager
-from . import face_dataset_service as fds, trash
+from . import face_dataset_service as fds, face_mask, trash
 from . import musubi_tuner
 from .person_mask import generate_person_masks
 
@@ -107,6 +107,87 @@ def _jobs_dir():
     return d
 
 
+def _machine_hf_token_files() -> list:
+    """Every place `hf auth login` may have written a token on THIS machine, best
+    first. Mirrors `huggingface_hub.constants` (read from 0.36): `$HF_HOME/token`,
+    `$XDG_CACHE_HOME/huggingface/token`, `~/.cache/huggingface/token`.
+
+    All three are listed rather than only the first: the app's own process may
+    already run with `HF_HOME` pointed at the ai-toolkit cache, while the shell
+    where the user typed `hf auth login` had none — the CLI token is then in the
+    plain default home and only the last candidate finds it.
+
+    Pure string math; huggingface_hub is NOT imported (it lives in the ai-toolkit
+    venv, not necessarily in ours), and no home path is assumed — Linux, macOS
+    and Windows all fall out of `expanduser`."""
+    def _norm(p):
+        return os.path.expanduser(os.path.expandvars(p))
+
+    homes = []
+    env_home = (os.environ.get('HF_HOME') or '').strip()
+    if env_home:
+        homes.append(_norm(env_home))
+    xdg = (os.environ.get('XDG_CACHE_HOME') or '').strip()
+    if xdg:
+        homes.append(os.path.join(_norm(xdg), 'huggingface'))
+    homes.append(os.path.join(_norm('~'), '.cache', 'huggingface'))
+
+    out = []
+    for h in homes:
+        cand = os.path.join(h, 'token')
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def training_subprocess_env(hf_home=None) -> dict:
+    """The environment the LOCAL ai-toolkit process is launched with.
+
+    `HF_HOME` routes base/adapter weights onto the configured disk and
+    `PYTHONIOENCODING` keeps unicode logs from dying on cp1252.
+
+    Hugging Face authentication, in the order huggingface_hub itself resolves it:
+
+    1. the token saved in Settings ▸ API keys is injected EXPLICITLY, exactly
+       like the cloud lane does (`cloud_training`) — the local lane used to rely
+       on it happening to sit in this process's `os.environ`, which is an
+       implementation detail of `cfg.secret`, not a contract;
+    2. failing that, whatever the machine already carries is preserved: an
+       `HF_TOKEN` in the environment (ai-toolkit's own `.env`, loaded by its
+       `run.py`, is how this worked for the people it worked for) …
+    3. … and, crucially, the token file `hf auth login` wrote. huggingface_hub
+       reads it at `$HF_HOME/token`, so overriding `HF_HOME` for the cache HID
+       a perfectly valid login and produced a 401 on gated bases (Krea 2,
+       FLUX.1-dev, FLUX.2 Klein) — reported by SurpassHR on GitHub. `HF_TOKEN_PATH`
+       is a separate variable that wins over `HF_HOME`, so we pin it at the real
+       file. Relocating a CACHE must never log the user out.
+
+    Never logs, and never copies a token anywhere but into this env dict.
+    """
+    env = dict(os.environ, HF_HOME=str(hf_home if hf_home is not None else _hf_home()),
+               PYTHONIOENCODING='utf-8')
+    token = (cfg.secret('HF_TOKEN') or '').strip()
+    if token:
+        env['HF_TOKEN'] = token
+        return env
+    if (env.get('HF_TOKEN') or '').strip():
+        return env                                   # already authenticated by env
+    if (env.get('HF_TOKEN_PATH') or '').strip():
+        return env                                   # user pinned it: respect it
+    try:
+        ours = os.path.join(env['HF_HOME'], 'token')
+        # A login made WITH our HF_HOME already resolves — never redirect it away.
+        if os.path.isfile(ours):
+            return env
+        for cand in _machine_hf_token_files():
+            if cand != ours and os.path.isfile(cand):
+                env['HF_TOKEN_PATH'] = cand
+                break
+    except OSError:
+        pass                                         # unreadable home: change nothing
+    return env
+
+
 # ComfyUI-side destinations (deploy target for a trained LoRA, and the SDXL base
 # checkpoint pool). Distinct error message from the aitoolkit accessors above:
 # a dataset can be trainable (aitoolkit OK) while ComfyUI itself is unconfigured,
@@ -153,6 +234,13 @@ def _lora_dest_dir_qwen_image():
     return d / 'qwen_image'
 
 
+def _lora_dest_dir_anima():
+    d = cfg.comfyui_dir('loras')
+    if not d:
+        raise RuntimeError('ComfyUI is not configured')
+    return d / 'anima'
+
+
 def _sdxl_checkpoints_dir():
     d = cfg.comfyui_dir('models')
     if not d:
@@ -164,6 +252,33 @@ def is_installed() -> bool:
     """ai-toolkit est-il installé (venv python présent) ?"""
     p = cfg.aitoolkit_path('venv_python')
     return bool(p) and p.is_file()
+
+
+def assert_interpreter_ready() -> None:
+    """Refuse a launch whose interpreter provably cannot `import torch`, NAMING
+    the path — the only fact that makes the failure obvious in one second.
+
+    `is_installed()` above only asks whether a file is there. A path that exists,
+    runs, and carries none of ai-toolkit's dependencies passes it, the run starts,
+    and ai-toolkit dies on `ModuleNotFoundError: No module named 'torch'` while the
+    panel suggests a missing base model or a Hugging Face token (GitHub #19,
+    strouder — an `aitoolkit.python` pointing at the Windows Store python stub
+    while a working venv sat next to run.py).
+
+    Refuses ONLY on a proven False. An unknown probe (cold-import timeout) lets
+    the launch through: blocking a real training run on an answer we do not have
+    would be a worse bug than the one this fixes. RuntimeError -> 409 (a backend
+    availability problem, not a bad request)."""
+    from .. import capabilities
+    from .training_diagnostics import interpreter_verdict
+    try:
+        report = capabilities.aitoolkit_interpreter_report()
+    except Exception:
+        return                                   # a broken probe never blocks a run
+    verdict = interpreter_verdict(report['python'], report['torch'],
+                                  alternative=report['alternative'])
+    if verdict:
+        raise RuntimeError(verdict['message'])
 
 
 def _aitoolkit_supports_krea() -> bool:
@@ -307,6 +422,39 @@ def _aitoolkit_supports_qwen_image_edit() -> bool:
     return False
 
 
+def _aitoolkit_supports_anima() -> bool:
+    """L'ai-toolkit installé connaît-il Anima ? Même enjeu CRITIQUE que
+    _aitoolkit_supports_krea (lire son commentaire) : l'arch 'anima' est une
+    EXTENSION (extensions_built_in/diffusion_models/anima, PR ostris/ai-toolkit
+    #860 mergée le 2026-07-15), pas une arch cœur — un ai-toolkit antérieur ne la
+    connaît pas et get_model_class retomberait SILENCIEUSEMENT sur le loader SD
+    legacy → LoRA corrompu. On exige l'arch EXACTE `arch = "anima"` (la chaîne
+    émise par _build_job_config_anima). Lecture fraîche : un `git pull` du
+    mainteneur passe la détection à True sans restart. ⚠️ Cette garde vérifie la
+    PRÉSENCE de l'arch dans les sources, PAS la version de diffusers : Anima exige
+    aussi un diffusers récent (AnimaModularPipeline/CosmosTransformer3DModel) —
+    un checkout à jour mais un venv ancien lèvera un ImportError au chargement
+    (même angle mort que krea2/flux2_klein)."""
+    root = cfg.aitoolkit_path('dir')
+    if not root:
+        return False
+    ext_root = root / 'extensions_built_in'
+    if not ext_root.is_dir():
+        return False
+    pat = re.compile(r'arch\s*=\s*[\'"]anima[\'"]')
+    for dp, _dn, files in os.walk(str(ext_root)):
+        for fn in files:
+            if not fn.endswith('.py'):
+                continue
+            try:
+                with open(os.path.join(dp, fn), encoding='utf-8', errors='ignore') as fh:
+                    if pat.search(fh.read()):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
 def _safe_trigger(ds) -> str:
     t = (ds.trigger_word or f'dataset{ds.id}').strip()
     return ''.join(c if (c.isalnum() or c in '_-') else '_' for c in t) or f'dataset{ds.id}'
@@ -372,6 +520,8 @@ def _lora_dest_dir(ds, family=None) -> str:
         return str(_lora_dest_dir_flux2klein())
     if fam == 'qwen_image':
         return str(_lora_dest_dir_qwen_image())
+    if fam == 'anima':
+        return str(_lora_dest_dir_anima())
     return str(_lora_dest_dir_zimage())
 
 
@@ -546,18 +696,20 @@ _LORA_ARCH_LABEL = {'zimage': 'Z-Image', 'sdxl': 'SDXL', 'krea': 'Krea 2',
 # (its own DiT layout, base + Edit-2511 variant) is its own group.
 _LORA_ARCH_NAMESPACE = {'zimage': 'zimage', 'sdxl': 'sdxl', 'krea': 'krea',
                         'flux': 'flux', 'flux2klein': 'flux',
-                        'qwen_image': 'qwen_image'}
+                        'qwen_image': 'qwen_image', 'anima': 'anima'}
 
 
 def _family_from_base_model_version(value) -> str | None:
     """Map ai-toolkit's ss_base_model_version metadata to a FAMILY key. Real
     values observed on deployed LoRAs (C:\\ai-toolkit: toolkit/metadata.py stamps
     'sdxl_1.0'/'sd_1.5'/'sd_2.1'; each newer arch's get_base_model_version returns
-    'zimage' / 'krea2' / 'flux' / 'flux2_klein_4b' / 'flux2_klein_9b'). SD1.5/2.1
-    and any foreign value → None (not one of our trainable families)."""
+    'zimage' / 'krea2' / 'flux' / 'flux2_klein_4b' / 'flux2_klein_9b' / 'anima').
+    SD1.5/2.1 and any foreign value → None (not one of our trainable families)."""
     v = str(value or '').strip().lower()
     if not v:
         return None
+    if 'anima' in v:                     # AnimaModel.get_base_model_version() → 'anima'
+        return 'anima'
     if v.startswith(('flux2_klein', 'flux2klein')):
         return 'flux2klein'
     if v.startswith('flux'):
@@ -582,6 +734,13 @@ def _lora_arch_from_keys(keys) -> str | None:
       - Krea2 SingleStreamDiT: 'txtfusion' is unique to it (present even
         in a header-only stub); or diffusion_model.blocks.*.attn.{wk,wq,gate} → krea
       - Z-Image NextDiT: 'diffusion_model.layers.*' (adaLN / attention.to_*) → zimage
+      - Anima (Cosmos Predict2 DiT): the ComfyUI-converted keys use
+        'diffusion_model.llm_adapter.*' (text conditioner) and, inside
+        'diffusion_model.blocks.*', the Cosmos-specific 'self_attn.q_proj' /
+        'cross_attn.*' / 'adaln_modulation_self_attn' names (PR #860's
+        _convert_diffusers_lora_key_to_comfy) → anima. These are DISJOINT from
+        Krea's 'diffusion_model.blocks.*.attn.wk/wq/gate' + 'txtfusion', so the
+        two never cross-detect (regression guard test pins both directions).
     A name-only sniff can't separate FLUX.1 from FLUX.2 Klein → 'flux' for both."""
     def has(sub):
         return any(sub in k for k in keys)
@@ -594,6 +753,12 @@ def _lora_arch_from_keys(keys) -> str | None:
                             and (has('.attn.wk') or has('.attn.wq')
                                  or has('.attn.gate'))):
         return 'krea'
+    # Anima BEFORE the generic zimage 'layers.' check. Its signature keys off the
+    # Cosmos-specific tensor names so it can never match a Krea block (which uses
+    # .attn.wk/wq/gate and has no llm_adapter / self_attn.q_proj / adaln_modulation).
+    if has('diffusion_model.llm_adapter.') or has('adaln_modulation_self_attn') \
+            or (has('diffusion_model.blocks.') and has('self_attn.q_proj')):
+        return 'anima'
     if has('diffusion_model.layers.'):
         return 'zimage'
     return None
@@ -648,12 +813,13 @@ def lora_arch_conflicts(detected, family) -> bool:
 
 _FAMILY_EXPECTED_ARCH = {'sdxl': 'sdxl', 'krea': 'krea2',
                          'flux': 'flux', 'flux2klein': 'flux',
-                         'qwen_image': 'qwen_image'}
+                         'qwen_image': 'qwen_image', 'anima': 'anima'}
 _ARCH_LABEL = {'sdxl': 'an SDXL', 'sd15': 'a Stable Diffusion 1.5',
-               'flux': 'a FLUX', 'krea2': 'a Krea 2', 'qwen_image': 'a Qwen-Image'}
+               'flux': 'a FLUX', 'krea2': 'a Krea 2', 'qwen_image': 'a Qwen-Image',
+               'anima': 'an Anima'}
 _FAMILY_LABEL = {'sdxl': 'SDXL', 'krea': 'Krea 2',
                  'flux': 'FLUX.1', 'flux2klein': 'FLUX.2 Klein',
-                 'qwen_image': 'Qwen-Image'}
+                 'qwen_image': 'Qwen-Image', 'anima': 'Anima'}
 # Confirmable-refusal marker (mirrors UNCAPTIONED:/MISMATCH_CAPTION:): the UI
 # strips it, asks window.confirm, and retries with allow_unverified_weights.
 _UNVERIFIED_MARKER = 'CUSTOM_WEIGHTS_UNVERIFIED: '
@@ -736,6 +902,41 @@ def _base_tag(ds) -> str:
     return _base_tag_for(getattr(ds, 'train_base_model', None))
 
 
+def official_base_repo(ds, family=None, variant=_PERSISTED):
+    """The Hugging Face repo a CLOUD pod will download for the OFFICIAL base of this
+    recipe, or None when the run uses custom local weights (nothing to fetch) or a
+    family whose base is not an HF repo.
+
+    Exists for one reason: a gated repo the account has not been granted access to
+    fails with a 403 **on the pod**, i.e. after a GPU has been rented and paid for.
+    Three runs were burned that way on krea/Krea-2-Raw. Resolving the repo here lets
+    the launch check the gate BEFORE reserving anything.
+
+    Mirrors the recipe decisions (`_krea_is_raw`, `_flux2klein_is_9b`, the Z-Image
+    variant matrix) rather than restating them, so a recipe change cannot silently
+    leave this behind."""
+    fam = _train_type(ds, family)
+    weights = getattr(ds, 'train_base_model', None)
+    if _is_custom_weights(weights) or (weights and os.path.isfile(str(weights))):
+        return None                       # local file: the pod never asks HF for it
+    if fam == 'krea':
+        return 'krea/Krea-2-Raw' if _krea_is_raw(ds, variant) else 'krea/Krea-2-Turbo'
+    if fam == 'flux':
+        return 'black-forest-labs/FLUX.1-dev'
+    if fam == 'flux2klein':
+        return ('black-forest-labs/FLUX.2-klein-base-9B' if _flux2klein_is_9b(ds, variant)
+                else 'black-forest-labs/FLUX.2-klein-base-4B')
+    if fam == 'zimage':
+        var = str((getattr(ds, 'train_variant', None) if variant is _PERSISTED else variant)
+                  or 'turbo').lower()
+        if var == 'deturbo':
+            return ZIMAGE_DETURBO_BASE
+        return ZIMAGE_BASE if var == 'base' else ZIMAGE_TURBO_BASE
+    if fam == 'anima':
+        return ANIMA_BASE           # public, non-gated → the pre-rent HEAD returns 200
+    return None
+
+
 KREA_BASE_LABEL = 'Krea-2-Turbo'   # mirrors name_or_path 'krea/Krea-2-Turbo'
 # Flux a une seule base officielle (FLUX.1-dev). Sans point dans le label (sinon
 # _base_tag_for le prendrait pour une extension et tronquerait à « FLUX ») → tag
@@ -753,6 +954,19 @@ FLUX2KLEIN_BASE_LABELS = {'4b': 'FLUX2-Klein-4B', '9b': 'FLUX2-Klein-9B'}
 # FLUX2KLEIN_BASE_LABELS: distinct tags so the two never share a run folder or
 # a deployed LoRA name for the same trigger.
 QWEN_IMAGE_BASE_LABELS = {'image': 'Qwen-Image', 'edit': 'Qwen-Image-Edit-2511'}
+# Anima (circlestone-labs, Cosmos Predict2 DiT, 2B) has a single OFFICIAL base and
+# it is PUBLIC/non-gated (unlike Krea/FLUX/Klein) — the pre-rent HEAD in
+# cloud_training returns 200, never a 403. Base tag has no dot (same extension
+# trap as FLUX_BASE_LABEL: _base_tag_for truncates after a '.') so official Anima
+# runs stay isolated from Z-Image runs of the same trigger (both would otherwise
+# carry an empty tag → shared run folder → ai-toolkit cross-resume).
+ANIMA_BASE = 'circlestone-labs/Anima-Base-v1.0-Diffusers'
+ANIMA_BASE_LABEL = 'Anima-Base'
+# Default preview negative for Anima, verbatim from ai-toolkit options.ts (PR #860,
+# entry 'anima'). The score_1..3 / "artist name" tags are the anime-model convention
+# the upstream UI ships — kept as the default so previews match ai-toolkit's own.
+ANIMA_SAMPLE_NEG = ('worst quality, low quality, score_1, score_2, score_3, blurry, '
+                    'jpeg artifacts, sepia, signature, artist name')
 
 # Z-Image recipes are intentionally centralized here.  Before this guardrail,
 # ``train_variant='base'`` / ``'deturbo'`` only removed the Turbo training
@@ -953,7 +1167,7 @@ def _valid_variants_for(family) -> tuple:
 #     (cf. Research vault 2026-07-10). Toute valeur hors des listes autorisées
 #     retombe sur le défaut : on ne pousse JAMAIS une config invalide à ai-toolkit. ---
 _DEFAULT_RANK = {'zimage': 16, 'krea': 32, 'sdxl': 32, 'flux': 16, 'flux2klein': 16,
-                 'qwen_image': 32}   # Z-Image reste 16 (choix user) ; Krea/SDXL 32 ; Flux/FLUX.2 Klein 16 (défaut des exemples officiels) ; Qwen-Image 32 — EXTRAPOLÉ (DiT 20B, pas de recherche dédiée encore), à réviser si sous/sur-entraînement observé
+                 'qwen_image': 32, 'anima': 32}   # Z-Image reste 16 (choix user) ; Krea/SDXL 32 ; Flux/FLUX.2 Klein 16 (défaut des exemples officiels) ; Qwen-Image 32 — EXTRAPOLÉ (DiT 20B, pas de recherche dédiée encore) ; Anima 32 (defaultLinearRank ai-toolkit options.ts, PR #860)
 # FLUX.2 Klein STYLE only : linear 128 (+ Conv2d 64) — la recette dominante du sweep
 # Calvin Herbst (64 runs, fév. 2026) ET l'exemple de training officiel BFL, tous deux
 # sur les dims 128/64/64/32 (ratio 4:2:2:1). Les AUTRES kinds Klein gardent 16.
@@ -969,7 +1183,7 @@ _DROPOUT_CHOICES = (0.05, 0.1, 0.15, 0.2, 0.3)          # LoRA network dropout ;
 _ALPHA_CHOICES = (1, 2, 4, 8, 16, 24, 32, 48, 64)       # alpha découplé du rank ; absent = dérivé
 _TIMESTEP_TYPE_CHOICES = ('sigmoid', 'linear', 'weighted', 'shift')  # pondération flowmatch ; SDXL le désactive
 _DEFAULT_TIMESTEP = {'zimage': 'sigmoid', 'krea': 'linear', 'flux': 'sigmoid',
-                     'flux2klein': 'weighted', 'qwen_image': 'sigmoid'}   # ce que « Auto » résout (sdxl : aucun) ; flux subject → sigmoid (reco ai-toolkit) ; flux2klein → weighted (défaut canonique options.ts, PAS sigmoid) ; qwen_image → sigmoid, EXTRAPOLÉ par analogie flux/zimage (pas de recette Qwen-Image dédiée encore)
+                     'flux2klein': 'weighted', 'qwen_image': 'sigmoid', 'anima': 'weighted'}   # ce que « Auto » résout (sdxl : aucun) ; flux subject → sigmoid (reco ai-toolkit) ; flux2klein → weighted (défaut canonique options.ts, PAS sigmoid) ; qwen_image → sigmoid, EXTRAPOLÉ par analogie flux/zimage (pas de recette Qwen-Image dédiée encore) ; anima → weighted (défaut options.ts PR #860)
 # Batch 2 — optimiseur / planning du LR / batch effectif (valeurs VÉRIFIÉES dans
 # ai-toolkit : get_optimizer + toolkit/scheduler.py). CAME n'est PAS supporté.
 _OPTIMIZER_CHOICES = ('adamw8bit', 'adafactor', 'automagic', 'prodigy')
@@ -989,6 +1203,124 @@ _GRAD_ACCUM_CHOICES = (1, 2, 4)
 # Recette communautaire (Krea-2) : LoKr + rank bas + EMA 0.99 → ressemblance ~step 500.
 _NETWORK_TYPE_CHOICES = ('lora', 'lokr')
 _EMA_CHOICES = (0.99, 0.999)
+
+# --- Memory-saving levers (quantisation + low-VRAM streaming) --------------------
+# Community request (GitHub issue #14, bobba84): the recipes hard-coded quantize /
+# quantize_te / low_vram, calibrated so a 12B DiT fits in 24 GB. On a card with MORE
+# than the target, that calibration is a tax nobody asked for — quantisation costs
+# precision and low_vram costs a lot of speed (it streams blocks CPU↔GPU).
+#
+# VÉRIFIÉ dans l'ai-toolkit installé : `quantize`, `quantize_te`, `qtype` et
+# `low_vram` sont des champs de ModelConfig (toolkit/config_modules.py L658-662),
+# arch-agnostiques, tous à False/'qfloat8' par défaut. Donc AUCUNE whitelist par
+# famille : le levier existe partout, et sa valeur par défaut reste celle que la
+# recette de CHAQUE famille a calibrée (table ci-dessous). Un utilisateur qui n'y
+# touche pas obtient un job-config byte-for-byte identique à avant.
+#
+# `qtype` n'est PAS exposé : il ne s'applique que quand la quantisation est ON, et
+# 'qfloat8' est déjà l'option la plus fidèle qu'ai-toolkit offre là (int8/uint8
+# échangent de la qualité contre de la place). Un knob qui ne peut que dégrader
+# n'est pas un choix, c'est un piège.
+_MEMORY_SETTING_KEYS = ('quantize', 'quantize_te', 'low_vram')
+
+# Ce que chaque famille émet quand l'utilisateur ne choisit rien. NE PAS TOUCHER :
+# la majorité du parc est à 24 Go ou moins et c'est ce qui fait tenir l'entraînement.
+_DEFAULT_MEMORY_SAVING = {
+    'zimage':     {'quantize': True,  'quantize_te': True,  'low_vram': True},
+    'krea':       {'quantize': True,  'quantize_te': True,  'low_vram': True},
+    'flux':       {'quantize': True,  'quantize_te': True,  'low_vram': True},
+    'flux2klein': {'quantize': True,  'quantize_te': True,  'low_vram': True},
+    # 2B DiT — les defaults options.ts d'ai-toolkit sont déjà « pas de quantisation ».
+    # Le levier reste offert dans l'AUTRE sens : une petite carte peut l'activer.
+    'anima':      {'quantize': False, 'quantize_te': False, 'low_vram': False},
+    'sdxl':       {'quantize': False, 'quantize_te': False, 'low_vram': False},
+}
+
+# VRAM (Gio) qu'il faut RAISONNABLEMENT pour entraîner cette famille sans
+# quantisation ni streaming basse-VRAM. ESTIMÉ, pas mesuré carte par carte :
+# poids du DiT en bf16 (2 octets × paramètres) + ~6 Gio d'activations/optimiseur
+# LoRA/marge. Sert UNIQUEMENT à formuler un conseil ; ne bloque jamais rien.
+#   zimage 6B → ~12 + 6      krea/flux 12B → ~24 + 6
+#   flux2klein 9B → ~18 + 6  flux2klein 4B → ~8 + 6
+_UNQUANTISED_VRAM_GB = {'zimage': 18, 'krea': 30, 'flux': 30,
+                        'flux2klein': 24, 'flux2klein_4b': 14,
+                        'anima': 10, 'sdxl': 10}
+
+
+def _memory_saving_defaults(ds, family) -> dict:
+    """Les trois défauts calibrés de la famille (copie — l'appelant les mute)."""
+    return dict(_DEFAULT_MEMORY_SAVING.get(family or '',
+                                           _DEFAULT_MEMORY_SAVING['zimage']))
+
+
+def _memory_flag_eff(ds, key: str, default: bool) -> bool:
+    """Valeur EFFECTIVE d'un levier mémoire : le booléen stocké s'il y en a un,
+    sinon le défaut de la famille. Tri-état volontaire — `False` STOCKÉ doit
+    survivre (c'est précisément la demande « disable »), donc on teste le type et
+    jamais la véracité, contrairement à `dual_captions` où falsy = clé retirée."""
+    v = _train_settings(ds).get(key)
+    return v if isinstance(v, bool) else default
+
+
+def _model_memory_block(ds, family) -> dict:
+    """Fragment `model` à fusionner dans la recette de chaque famille.
+
+    Forme d'émission choisie pour que le défaut reste BYTE-IDENTIQUE à l'existant :
+      * `quantize` / `quantize_te` : toujours émis (les 6 recettes les émettaient
+        déjà, dans les deux sens) ;
+      * `low_vram` : émis SEULEMENT quand True — le défaut ModelConfig est False,
+        donc omettre == False, et anima/sdxl (qui ne l'émettaient pas) ne gagnent
+        pas une clé ;
+      * `qtype` : émis seulement si au moins une quantisation est active — sans
+        quantisation la clé ne veut rien dire.
+    """
+    d = _memory_saving_defaults(ds, family)
+    q = _memory_flag_eff(ds, 'quantize', d['quantize'])
+    qte = _memory_flag_eff(ds, 'quantize_te', d['quantize_te'])
+    lv = _memory_flag_eff(ds, 'low_vram', d['low_vram'])
+    out = {'quantize': q, 'quantize_te': qte}
+    if lv:
+        out['low_vram'] = True
+    if q or qte:
+        out['qtype'] = 'qfloat8'
+    return out
+
+
+def _unquantised_vram_need(ds, family) -> int:
+    """Estimation Gio pour tourner sans quantisation. FLUX.2 Klein a deux tailles
+    de base (9B/4B) : le 4B tient beaucoup plus bas, le dire serait faux sinon."""
+    if family == 'flux2klein' and not _flux2klein_is_9b(ds):
+        return _UNQUANTISED_VRAM_GB['flux2klein_4b']
+    return _UNQUANTISED_VRAM_GB.get(family or '', 24)
+
+
+def _memory_saving_advice(ds, family) -> dict:
+    """Conseil INDEXÉ SUR LA CARTE RÉELLE pour les leviers mémoire.
+
+    `verdict` :
+      * 'unknown'  — pas de nvidia-smi, GPU non-NVIDIA, machine sans carte, ou
+                     famille non quantisée par défaut : texte générique côté UI ;
+      * 'can_disable' — la VRAM détectée couvre le besoin estimé sans quantisation ;
+      * 'keep_on'  — elle ne le couvre pas.
+
+    Conseiller n'est PAS décider : rien ici n'écrit dans train_settings, rien ne
+    bloque un lancement, et un échec de sonde (fail-open, mémoïsé 10 min côté
+    run_environment) retombe simplement sur 'unknown'."""
+    try:
+        from . import run_environment
+        vram = run_environment.local_vram_gb()
+        gpu = (run_environment.gpu_info() or {}).get('name')
+    except Exception:                                   # sonde absolument jamais fatale
+        vram, gpu = None, None
+    need = _unquantised_vram_need(ds, family)
+    if not vram:
+        verdict = 'unknown'
+    elif vram + 0.5 >= need:        # 0.5 Gio : nvidia-smi rapporte 23.99 pour « 24 Go »
+        verdict = 'can_disable'
+    else:
+        verdict = 'keep_on'
+    return {'verdict': verdict, 'vram_gb': vram, 'gpu': gpu,
+            'unquantised_vram_gb': need}
 
 
 def _train_settings(ds) -> dict:
@@ -1354,7 +1686,7 @@ def _effective_resolution(ds) -> list:
 
     Slider mode defaults to 768 only: the concept_slider loss runs several
     prediction passes per step, so its VRAM peak sits far above a normal run —
-    multi-scale 768+1024 really OOMs on 24 GB (Jeremy's first slider run died
+    multi-scale 768+1024 really OOMs on 24 GB (the first reported slider run died
     with 'bad allocation' at step 21 when Discord grabbed some VRAM). This is a
     DEFAULT, not a clamp: an explicit user resolution is always obeyed."""
     if slider_mode_enabled(ds) and not _resolution_is_explicit(ds):
@@ -1574,18 +1906,42 @@ def launch_settings_snapshot(ds, family=None) -> dict:
         if getattr(ds, 'train_te_path', None):
             snap['te_name_or_path'] = ds.train_te_path
     s = _train_settings(ds)
-    for k in ('dropout', 'lr_scheduler', 'warmup', 'grad_accum', 'sample_every'):
+    for k in ('dropout', 'sample_every'):
         if s.get(k):
             snap[k] = s[k]
-    # Recipe levers surfaced only when they deviate from the default (LoRA / EMA off),
-    # so the provenance line and ⎘ Share config stay compact — and the cloud run, which
-    # stamps this same snapshot, carries them too.
-    nt = _network_type_eff(ds)
-    if nt != 'lora':
-        snap['network_type'] = nt
+    # Recipe levers, ALWAYS stamped with their effective value — including the
+    # default. They used to be omitted when they matched the default, which reads
+    # as "compact" until you compare two runs: an absent `ema` was then
+    # indistinguishable from a run recorded before the key existed, so the panel
+    # could not say which of two runs had EMA on — the exact question the EMA
+    # experiment exists to answer. An explicit 'off' costs one line and cannot be
+    # misread. The cloud run stamps this same snapshot.
+    snap['network_type'] = _network_type_eff(ds)
     em = _ema_eff(ds)
-    if em is not None:
-        snap['ema'] = em
+    snap['ema'] = em if em is not None else 'off'
+    snap['lr_scheduler'] = s.get('lr_scheduler') if s.get('lr_scheduler') in _LR_SCHEDULER_CHOICES else 'constant'
+    snap['warmup'] = s.get('warmup') if s.get('warmup') in _WARMUP_CHOICES else 0
+    snap['grad_accum'] = s.get('grad_accum') if s.get('grad_accum') in _GRAD_ACCUM_CHOICES else 1
+    # Fixed at 1 by every family's recipe today. Recorded anyway: the day it stops
+    # being 1, the runs on either side of the change have to be comparable.
+    snap['batch_size'] = 1
+    # Stamped EFFECTIVE, like `ema` and the memory keys: krea/anima cannot train a second
+    # caption (they cache their text embeddings — see _dual_captions_unsupported_reason),
+    # so recording the preference there would make the run comparison claim two runs
+    # differ by dual captions when the trainer saw exactly the same captions.
+    snap['dual_captions'] = (bool(s.get('dual_captions'))
+                             and fam not in DUAL_CAPTION_UNSUPPORTED_FAMILIES)
+    # Face masking is a per-run FACT, not a preference: two concept runs that
+    # differ only by it are not the same experiment, so it is stamped effective
+    # (concept-only, hence the kind check) exactly like `ema` and the memory keys.
+    snap['mask_faces'] = bool(s.get('mask_faces')) and fds.is_concept(ds)
+    # Memory strategy — stamped with its EFFECTIVE value for the same reason as
+    # `ema` above: two runs of the same dataset can differ only by these, and a
+    # quantised run and a full-precision one are NOT the same experiment. Absent
+    # would be indistinguishable from "recorded before the keys existed".
+    _memdef = _memory_saving_defaults(ds, fam)
+    for _k in _MEMORY_SETTING_KEYS:
+        snap[_k] = _memory_flag_eff(ds, _k, _memdef[_k])
     return snap
 
 
@@ -1648,6 +2004,25 @@ def effective_train_settings(ds, family=None) -> dict:
             # default OFF. Local training only for now (the cloud pod's dataset upload
             # skips the JSON caption file), so the recipe strips it on the cloud path.
             'dual_captions': bool(s.get('dual_captions')),
+            # Concept face masking (issue #15). `mask_faces` = the stored opt-in;
+            # `mask_faces_supported` = whether this dataset can use it at all
+            # (concept only), so the panel states the reason instead of hiding it.
+            'mask_faces': bool(s.get('mask_faces')) and fds.is_concept(ds),
+            'mask_faces_supported': fds.is_concept(ds),
+            'mask_faces_concept_conflict': fds.concept_face_conflict(ds),
+            # --- Memory strategy (issue #14) -----------------------------------
+            # `memory_saving` = le choix STOCKÉ par clé (None = « Auto », le panel
+            # recoche le défaut de la famille) ; `memory_saving_default` = ce que
+            # la recette calibrée émet ; `memory_saving_effective` = ce qui partira
+            # vraiment. `memory_advice` porte le conseil indexé sur la carte réelle
+            # (verdict/vram_gb/gpu) — purement consultatif, jamais appliqué seul.
+            'memory_saving': {k: (s.get(k) if isinstance(s.get(k), bool) else None)
+                              for k in _MEMORY_SETTING_KEYS},
+            'memory_saving_default': _memory_saving_defaults(ds, fam),
+            'memory_saving_effective': {
+                k: _memory_flag_eff(ds, k, _memory_saving_defaults(ds, fam)[k])
+                for k in _MEMORY_SETTING_KEYS},
+            'memory_advice': _memory_saving_advice(ds, fam),
             'resolution': res if res in _RES_CHOICES else '768,1024',
             # `resolution` above is the STORED choice (default label when unset);
             # these two report what the run will actually train at — slider mode
@@ -1810,6 +2185,29 @@ def update_train_settings(user_id, dataset_id, patch: dict) -> dict:
             cur['dual_captions'] = True
         else:
             cur.pop('dual_captions', None)
+    if 'mask_faces' in patch:
+        # Concept face masking (issue #15, shivdbz2010). Same plain-boolean contract
+        # as dual_captions: falsy drops the key, so OFF is byte-identical to a
+        # dataset that never heard of the option. The CONCEPT-only restriction is
+        # enforced where it matters (face_masking_enabled + the export guard), not
+        # here — a preset carrying the key must stay applicable to any dataset.
+        if patch['mask_faces']:
+            cur['mask_faces'] = True
+        else:
+            cur.pop('mask_faces', None)
+    for _mk in _MEMORY_SETTING_KEYS:
+        if _mk not in patch:
+            continue
+        v = patch[_mk]
+        # Tri-state: an explicit False is a VALUE (the whole point of issue #14),
+        # so it must be stored, not dropped like a falsy `dual_captions`. Only
+        # None/'auto'/'' clear the key back to the family's calibrated default.
+        if isinstance(v, bool):
+            cur[_mk] = v
+        elif v in (None, 'auto', ''):
+            cur.pop(_mk, None)
+        else:
+            raise ValueError(f'{_mk} must be true, false or auto')
     if 'learning_rate' in patch:
         # Not a general Advanced-options control: the family-fixed 1e-4 (or the
         # Prodigy lr=1 convention) is the default, and only the ▶ Continue dialog's
@@ -1833,7 +2231,7 @@ TRAIN_SETTING_KEYS = ('rank', 'resolution', 'save_every', 'max_step_saves',
                       'sample_every', 'sample_prompts', 'dropout', 'alpha',
                       'timestep_type', 'optimizer', 'lr_scheduler', 'warmup',
                       'grad_accum', 'network_type', 'ema', 'dual_captions',
-                      'learning_rate', 'musubi_profile')
+                      'mask_faces', 'learning_rate', 'musubi_profile', *_MEMORY_SETTING_KEYS)
 
 # The ONLY settings a resume/continue may change. ai-toolkit rebuilds the job
 # config from scratch on every launch, so a re-read setting is honored on resume —
@@ -1852,6 +2250,18 @@ TRAIN_SETTING_KEYS = ('rank', 'resolution', 'save_every', 'max_step_saves',
 # only (½ polish / ⅒ gentle finish — the LR pendant of the low-noise timestep
 # recipe), touches no weight shape, and resolves to an explicit `learning_rate`
 # via resolve_resume_lr (refused on a Prodigy run, whose LR is self-adaptive).
+#
+# The memory-saving levers (quantize / quantize_te / low_vram) are deliberately
+# NOT in this list, and that is a decision, not an oversight. They ARE harmless to
+# a resume — VÉRIFIÉ: quantisation is applied to the BASE modules, which are frozen
+# (`param.requires_grad = False` + `freeze(orig_module)` in ai-toolkit's
+# util/quantize.py), while the resumed checkpoint holds only the LoRA weights,
+# whose shape is fixed by `network` (rank/alpha/type) and untouched here. But this
+# tuple is the whitelist of what the ▶ Continue DIALOG may send, and the dialog has
+# no control for them; the persisted Advanced-options value is already re-read on
+# every resume (ai-toolkit rebuilds the job config from scratch), so a user who
+# turns quantisation off and hits ▶ Continue already gets it. Listing them would
+# add untested surface with no caller.
 RESUME_SAFE_SETTING_KEYS = ('save_every', 'sample_every', 'sample_prompts',
                             'timestep_type', 'lr_factor')
 
@@ -2104,6 +2514,22 @@ BUILTIN_TRAIN_PRESETS = [
                        'timesteps, probing every 250 steps.',
         'settings': _character_preset_settings(32, 32, timestep_type='sigmoid'),
     },
+    # No Anima-specific study exists yet (model shipped mid-2026): extrapolated
+    # from ai-toolkit's own defaults (options.ts entry 'anima', PR #860) — rank 32
+    # (defaultLinearRank) with weighted timesteps (the entry's canonical default,
+    # NOT subject-tuned sigmoid). Drop rank to 16 manually for small clean sets.
+    {
+        'id': 'builtin-character-anima',
+        'name': 'Anima · Character',
+        'train_type': 'anima',
+        'dataset_kind': 'character',
+        'variants': [],
+        'builtin': True,
+        'description': "ai-toolkit's Anima defaults: rank 32/32 with weighted "
+                       'timesteps — no Anima-specific study yet, extrapolated '
+                       'from options.ts; probe every 250 steps.',
+        'settings': _character_preset_settings(32, 32, timestep_type='weighted'),
+    },
     # --- Concept / composition (one per family) --------------------------
     # Historical ID kept stable. rank 16 / alpha 8: concept research (vault
     # 2026-06-22) — object/concept rank 16-32 with alpha dim/2. weighted
@@ -2207,6 +2633,22 @@ BUILTIN_TRAIN_PRESETS = [
                        'caption each shot with its angle — front view / '
                        'three-quarter / side profile / from above / from below.',
         'settings': _concept_preset_settings(32, 16, timestep_type='sigmoid'),
+    },
+    # No Anima concept source exists: extrapolate the family canon (rank 32, the
+    # options.ts defaultLinearRank) with the generic concept alpha dim/2 rule and
+    # Anima's canonical weighted timesteps — same reasoning as the Krea/Klein
+    # concept presets, flagged as extrapolated.
+    {
+        'id': 'builtin-concept-anima',
+        'name': 'Anima · Concept',
+        'train_type': 'anima',
+        'dataset_kind': 'concept',
+        'variants': [],
+        'builtin': True,
+        'description': 'No Anima-specific concept research yet — extrapolated '
+                       "from ai-toolkit's rank-32 default with half alpha 16 "
+                       'and weighted timesteps, 500-step probes.',
+        'settings': _concept_preset_settings(32, 16, timestep_type='weighted'),
     },
     # Legacy generic Style alias. The API hides it from GET and resolves its ID
     # to a family-specific built-in at apply time. Keep the raw entry only for
@@ -2319,6 +2761,11 @@ def _dest_base_tag(ds, base_model=_PERSISTED, family=None,
         tag = _base_tag_for(
             QWEN_IMAGE_BASE_LABELS[
                 'edit' if _qwen_image_is_edit(ds, variant) else 'image'])
+    # Anima : même garde que Flux — sa base officielle unique donne un tag vide qui
+    # télescoperait un run Z-Image officiel du même trigger. Le tag `_Anima-Base`
+    # isole le run et le LoRA déployé.
+    if not tag and fam == 'anima':
+        tag = _base_tag_for(ANIMA_BASE_LABEL)
     return tag + _custom_combo_hash(ds, base_model, family)
 
 
@@ -2430,18 +2877,54 @@ def _masks_dir(dataset_folder: str) -> str:
     return f'{dataset_folder}_masks'
 
 
+# Historical person-mask weight (méthode jandordoe). A CONSTANT, not the new
+# configurable knob: `face_mask.min_weight` governs face masking, and letting it
+# silently re-weight every character run's background would be a behaviour change
+# nobody asked for.
+_PERSON_MASK_MIN_VALUE = 0.1
+
+# Written beside the masks by the exporter so `_mask_fields` can tell WHICH mask it
+# is looking at. The two polarities share one folder (ai-toolkit takes a single PNG
+# per image), so the folder alone cannot say whether 'black' means background or
+# face — and they do not want the same weight. ai-toolkit resolves masks by exact
+# `<image basename><ext>` lookup, so this extra file is never mistaken for one.
+_MASK_META_FILENAME = '_mask_meta.json'
+
+
+def _write_mask_meta(masks_dir: str, kind: str, min_value: float) -> None:
+    try:
+        with open(os.path.join(masks_dir, _MASK_META_FILENAME), 'w', encoding='utf-8') as fh:
+            json.dump({'kind': kind, 'mask_min_value': float(min_value)}, fh)
+    except OSError:
+        pass  # best-effort: a missing sidecar degrades to the historical weight
+
+
 def _mask_fields(dataset_folder: str) -> dict:
     """Champs `mask_path`/`mask_min_value` à fusionner dans l'entrée datasets de la
-    job-config SI des masques ont été exportés (masked training, méthode jandordoe :
-    fond pondéré à 10 % de la loss → l'identité se lie au sujet, pas au décor).
+    job-config SI des masques ont été exportés.
+
+    Deux polarités possibles, même dossier :
+      - `person` (méthode jandordoe) : sujet blanc, fond noir pondéré à 10 %.
+      - `face` (issue #15) : visage noir, reste blanc — l'acte s'apprend, pas l'identité.
+    Le poids appliqué vient du sidecar écrit à la génération ; sans sidecar (export
+    d'une version antérieure) on retombe sur le 10 % historique, jamais sur le
+    réglage du masque visage.
     Dossier absent/vide → {} (l'entraînement reste strictement l'historique)."""
     md = _masks_dir(dataset_folder)
     try:
-        if os.path.isdir(md) and any(f.lower().endswith('.png') for f in os.listdir(md)):
-            return {'mask_path': md, 'mask_min_value': 0.1}
+        if not (os.path.isdir(md) and any(f.lower().endswith('.png') for f in os.listdir(md))):
+            return {}
     except OSError:
+        return {}
+    min_value = _PERSON_MASK_MIN_VALUE
+    try:
+        with open(os.path.join(md, _MASK_META_FILENAME), encoding='utf-8') as fh:
+            meta = json.load(fh)
+        if isinstance(meta, dict) and isinstance(meta.get('mask_min_value'), (int, float)):
+            min_value = float(meta['mask_min_value'])
+    except (OSError, ValueError, TypeError):
         pass
-    return {}
+    return {'mask_path': md, 'mask_min_value': min_value}
 
 
 # --- Qwen-Image-Edit control images (musubi `control_directory` / ai-toolkit
@@ -2540,7 +3023,8 @@ def _dual_caption_json_path(dataset_folder) -> str:
     return (str(dataset_folder).rstrip('/\\') + '/' + _DUAL_CAPTION_FILENAME)
 
 
-def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_dir=None) -> str:
+def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_dir=None,
+                                masked_faces: bool = True) -> str:
     """Écrit les images `keep` en paires .png/.txt dans
     DATASETS_DIR/<trigger>. Character/concept = trigger + caption éditée ; Style
     always-on = caption de contenu seule (le trigger interne n'est jamais exporté).
@@ -2557,6 +3041,14 @@ def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_d
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
+    # TWO masks exist, of OPPOSITE polarity, and the guard below must not confuse
+    # them (issue #15, shivdbz2010):
+    #   person mask -> subject white, background black. Learn the subject, not the room.
+    #   face mask   -> face black, everything else white. Learn the scene, not the identity.
+    # The historical guard was written when only the first existed, so it read
+    # "concept => no masks at all". A FACE mask does not have the defect it guards
+    # against: it removes the identity and keeps the act. Hence a per-polarity guard.
+    face_masked = bool(masked_faces) and fds.face_masking_enabled(ds)
     if masked and fds.is_conceptual(ds):
         # A person-mask would erase the very thing we want the LoRA to learn (the
         # recurring act for a concept; the whole-image rendering for a style - which
@@ -2564,6 +3056,25 @@ def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_d
         # concept AND style datasets even if the caller/UI asked for it -- server guard.
         logger.info('dataset %s %s -> masked training forced OFF (server guard)',
                     dataset_id, ds.kind)
+        masked = False
+    if face_masked and not fds.is_concept(ds):
+        # Character wants its identity learned; a Style must learn how it renders a
+        # face. Only a concept benefits. face_masking_enabled already refuses both,
+        # this is the belt to its braces (a caller may pass masked_faces=True).
+        logger.info('dataset %s %s -> face masking forced OFF (server guard)',
+                    dataset_id, ds.kind)
+        face_masked = False
+    if face_masked and slider_mode_enabled(ds):
+        # Same reason the person mask is refused in slider mode: the guided slider
+        # loss never reads batch.mask_tensor, so the masks would only burn export time.
+        logger.info('dataset %s -> slider mode: face masking forced OFF (server guard)',
+                    dataset_id)
+        face_masked = False
+    if face_masked and masked:
+        # Belt and braces: one mask PNG per image, so the two polarities cannot
+        # share a folder. Unreachable today (a concept never keeps `masked`), but
+        # the day someone lifts the concept guard this must not silently pick one.
+        logger.info('dataset %s -> face masking wins over person masking', dataset_id)
         masked = False
     if masked and slider_mode_enabled(ds):
         # Slider mode: the guided slider loss never reads the masked-loss path
@@ -2629,18 +3140,45 @@ def export_dataset_to_aitoolkit(user_id, dataset_id, masked: bool = True, dest_d
         wrote = int(res.get('written') or 0) if isinstance(res, dict) else 0
         if wrote:
             masked_ok = True
+            _write_mask_meta(masks_out, 'person', _PERSON_MASK_MIN_VALUE)
             logger.info(f'export dataset {dataset_id}: {wrote}/{n} masque(s) personne -> {masks_out}')
         else:
             logger.warning(f'export dataset {dataset_id}: masques indisponibles - training SANS masked loss')
             if os.path.isdir(masks_out):
                 # Failed/incomplete derived mask cache; safe to destroy directly.
                 shutil.rmtree(masks_out, ignore_errors=True)
+    face_masked_ok = False
+    face_coverage = None
+    if face_masked:
+        # Same contract as the person masks: a dict (possibly {}), read the count —
+        # never `if res:`, which a non-empty failure dict would satisfy.
+        res = face_mask.generate_face_masks(exported, masks_out)
+        wrote = int(res.get('written') or 0) if isinstance(res, dict) else 0
+        if wrote:
+            face_masked_ok = True
+            face_coverage = face_mask.coverage_summary(res.get('results') or {})
+            _write_mask_meta(masks_out, 'face', face_mask.min_weight())
+            logger.info('export dataset %s: %s/%s masque(s) visage -> %s (%s)',
+                        dataset_id, wrote, n, masks_out, face_coverage)
+        else:
+            logger.warning('export dataset %s: masques visage indisponibles '
+                           '(insightface absent ?) - training SANS masked loss', dataset_id)
+            if os.path.isdir(masks_out):
+                shutil.rmtree(masks_out, ignore_errors=True)
     # A REQUESTED masked run that produced no masks (rembg missing, or generation
     # crashed at runtime) silently trains UNMASKED. Record it per-run so the live
     # progress view can warn — instead of the fallback being invisible. `masked` is
     # the FINAL intent: concept/style were already forced OFF above (by design), so
     # they never set this flag.
-    queue_manager._set_system_state('training_masks_skipped', bool(masked and not masked_ok),
+    queue_manager._set_system_state('training_masks_skipped',
+                                    bool((masked and not masked_ok)
+                                         or (face_masked and not face_masked_ok)),
+                                    ttl_seconds=_TRAIN_STATE_TTL)
+    # Face-mask COVERAGE is a safety figure, not a statistic: a partially masked set
+    # is the worst case, because the faces that stayed unmasked are then the only
+    # ones carrying loss weight and end up over-represented. Publish it per run so
+    # the progress view can say "masked on 32 of 40" instead of staying silent.
+    queue_manager._set_system_state('training_face_mask_coverage', face_coverage,
                                     ttl_seconds=_TRAIN_STATE_TTL)
     # Qwen-Image-Edit-2511 control images (see the guide comment above
     # `_qwen_edit_control_dir`) — every other family/variant never creates this
@@ -2695,6 +3233,45 @@ def _apply_style_overrides(ds, process: dict, family: str | None = None) -> dict
     return process
 
 
+# Families whose recipe caches the text embeddings and unloads the text encoder to fit
+# their 12B/2B DiT — and which therefore CANNOT honour dual captions (see
+# _dual_captions_unsupported_reason). Kept as data so the preflight can warn before the
+# launch without building a job config; test_dual_captions asserts it stays in sync with
+# what the recipes actually emit, so a new caching family cannot slip in unnoticed.
+DUAL_CAPTION_UNSUPPORTED_FAMILIES = ('krea', 'anima')
+
+
+def _dual_captions_unsupported_reason(process: dict) -> str | None:
+    """Why this ai-toolkit process cannot train dual captions. None = it can.
+
+    ai-toolkit caches ONE embedding per image: TextEmbeddingCachingMixin.cache_text_embeddings
+    encodes `file_item.caption` (the LONG one) and nothing else, and once the encoder is
+    unloaded SDTrainer takes the `if unload_text_encoder or is_caching_text_embeddings`
+    branch, which feeds the model `batch.prompt_embeds` and never looks at the prompt
+    strings again. The short caption has, literally, nowhere to go.
+
+    It does not merely go unused — it crashes the run. The caching pass reaches
+    load_caption() through get_text_embedding_info_dict() WITHOUT the JSON caption dict,
+    so each item is filled from its .txt sidecar (long only) and `raw_caption_short` stays
+    None; load_caption() then short-circuits on the real per-batch call ("we already
+    loaded it"), `caption_short` is never computed, and the doubled prompt list handed to
+    inject_trigger_into_prompt contains None → AttributeError at the first step, after the
+    weights download and the whole caching pass. Reported on krea as GitHub issue #22 by
+    1Tomber; anima emits the identical pair.
+
+    So the combination is refused at config time rather than patched with a placeholder
+    short caption: a placeholder would buy a green run that trains exactly like a
+    long-caption run while claiming otherwise."""
+    train = process.get('train') or {}
+    if any(d.get('cache_text_embeddings') for d in process.get('datasets', ())):
+        return ('this family pre-caches its text embeddings (one embedding per image) '
+                'to free the VRAM its text encoder would hold')
+    if train.get('unload_text_encoder'):
+        return ('this family unloads its text encoder after caching, so no second '
+                'caption can be encoded')
+    return None
+
+
 def _apply_dual_captions(ds, process: dict, dataset_folder) -> dict:
     """Wire ai-toolkit dual long+short captioning onto one process. No-op unless the
     dataset opted in. When on, the FIRST dataset block points at the JSON caption file
@@ -2703,8 +3280,14 @@ def _apply_dual_captions(ds, process: dict, dataset_folder) -> dict:
     BOTH captions. caption_ext is left as-is; it is ignored once folder_path is a JSON file.
 
     Local-only for now: the cloud pod's dataset upload skips the JSON, so the cloud path
-    (_cloudify_job_config) reverts this back to the historical folder + .txt sidecars."""
+    (_cloudify_job_config) reverts this back to the historical folder + .txt sidecars.
+
+    No-op as well on a family that caches its text embeddings — emitting the pair is what
+    crashed issue #22. The run then trains on the long caption alone (the .txt sidecars,
+    trigger included), and the preflight says so before the launch."""
     if not fds.dual_captions_enabled(ds):
+        return process
+    if _dual_captions_unsupported_reason(process):
         return process
     datasets = process.get('datasets') or []
     if not datasets:
@@ -2793,14 +3376,17 @@ def build_job_config(ds, dataset_folder: str, steps: int = 3000, training_folder
     l'UI ai-toolkit (ui/src/app/jobs/new/options.ts) + structure LoRA 24 Go de
     référence - vérifiées au runtime contre la version installée (cf. spec §3).
     Points non négociables : arch='zimage', base/adapter résolus uniquement par
-    ``zimage_training_recipe``, quantize qfloat8 + low_vram pour tenir sur 24 Go.
+    ``zimage_training_recipe``, quantize qfloat8 + low_vram pour tenir sur 24 Go
+    — ces trois-là sont désormais les DÉFAUTS (inchangés) d'un tri-état surchargeable
+    par dataset (_model_memory_block), pas des constantes : cf. issue #14.
 
     SDXL (train_type='sdxl') part dans une branche dédiée (_build_job_config_sdxl) -
     le chemin zimage ci-dessous reste strictement inchangé.
 
     `training_folder` (cloud seam) : utilisé TEL QUEL comme process.training_folder
     dans les 3 familles - aucun appel à _output_dir() (pas d'ai-toolkit local requis).
-    Défaut (None) = comportement historique inchangé (_output_dir() / _run_name(ds))."""
+    Défaut (None) = comportement historique inchangé (`_run_root(ds)`) - c'est aussi
+    le dossier où atterrit training.log, l'invariant que « 📂 Run folder » ouvre."""
     if _train_type(ds) == 'sdxl':
         cfg_ = _build_job_config_sdxl(ds, dataset_folder, steps, training_folder=training_folder)
         _apply_style_overrides(ds, cfg_['config']['process'][0], 'sdxl')
@@ -2831,13 +3417,18 @@ def build_job_config(ds, dataset_folder: str, steps: int = 3000, training_folder
         _apply_slider_overrides(ds, cfg_['config']['process'][0], 'qwen_image')
         _apply_dual_captions(ds, cfg_['config']['process'][0], dataset_folder)
         return cfg_
+    if _train_type(ds) == 'anima':
+        cfg_ = _build_job_config_anima(ds, dataset_folder, steps, training_folder=training_folder)
+        _apply_style_overrides(ds, cfg_['config']['process'][0], 'anima')
+        _apply_slider_overrides(ds, cfg_['config']['process'][0], 'anima')
+        _apply_dual_captions(ds, cfg_['config']['process'][0], dataset_folder)
+        return cfg_
     trigger = _safe_trigger(ds)
     base_model = getattr(ds, 'train_base_model', None)
     recipe = zimage_training_recipe(getattr(ds, 'train_variant', None), base_model)
 
     # Base : officielle (repo HF diffusers) OU merge ComfyUI converti en diffusers.
-    model = {'arch': 'zimage', 'quantize': True, 'quantize_te': True,
-             'low_vram': True, 'qtype': 'qfloat8'}
+    model = {'arch': 'zimage', **_model_memory_block(ds, 'zimage')}
     if recipe['custom_base']:
         from .zimage_convert import converted_dir
         model['name_or_path'] = converted_dir(base_model)       # dossier diffusers converti
@@ -2856,7 +3447,7 @@ def build_job_config(ds, dataset_folder: str, steps: int = 3000, training_folder
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _zrank, 'zimage'),
@@ -2920,7 +3511,8 @@ def _build_job_config_krea(ds, dataset_folder: str, steps: int, training_folder=
     - TURBO (opt-in, VRAM-friendly) : name_or_path='krea/Krea-2-Turbo' + l'adapter de
       training Ostris (retiré à l'inférence, comme Z-Image), previews CFG 1 / 8 steps.
 
-    Commun : quantize qfloat8 + low_vram pour tenir sur 24 Go. ⚠️ Requiert ai-toolkit
+    Commun : quantize qfloat8 + low_vram pour tenir sur 24 Go (défauts surchargeables,
+    cf. _model_memory_block — 12B non quantisé = ~30 Gio). ⚠️ Requiert ai-toolkit
     À JOUR (commit « Add support for Krea2 », arch 'krea2') sinon l'arch est inconnue
     (garde _aitoolkit_supports_krea). Réseau = 'lora' : VÉRIFIÉ canonique 2026-06-26.
     Résolution KREA_TRAIN_RESOLUTION (1024, TE déchargé) car 768 seul tenait sinon."""
@@ -2934,7 +3526,7 @@ def _build_job_config_krea(ds, dataset_folder: str, steps: int, training_folder=
         'arch': 'krea2',
         'name_or_path': (_kbase if _is_custom_weights(_kbase)
                          else ('krea/Krea-2-Raw' if is_raw else 'krea/Krea-2-Turbo')),
-        'quantize': True, 'quantize_te': True, 'low_vram': True, 'qtype': 'qfloat8',
+        **_model_memory_block(ds, 'krea'),
     }
     # Adapter de dé-distillation : Turbo UNIQUEMENT (le Raw est déjà non distillé →
     # rien à retirer ; le charger dessus dégraderait le training).
@@ -2948,7 +3540,7 @@ def _build_job_config_krea(ds, dataset_folder: str, steps: int, training_folder=
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _krank, 'krea'),
@@ -3021,7 +3613,7 @@ def _build_job_config_flux(ds, dataset_folder: str, steps: int, training_folder=
         'arch': 'flux',
         'name_or_path': (_fbase if _is_custom_weights(_fbase)
                          else 'black-forest-labs/FLUX.1-dev'),
-        'quantize': True, 'quantize_te': True, 'low_vram': True, 'qtype': 'qfloat8',
+        **_model_memory_block(ds, 'flux'),
     }
     return {
         'job': 'extension',
@@ -3030,7 +3622,7 @@ def _build_job_config_flux(ds, dataset_folder: str, steps: int, training_folder=
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _frank, 'flux'),
@@ -3110,7 +3702,7 @@ def _build_job_config_flux2klein(ds, dataset_folder: str, steps: int, training_f
         'name_or_path': (_fkbase if _is_custom_weights(_fkbase)
                          else ('black-forest-labs/FLUX.2-klein-base-9B' if is_9b
                                else 'black-forest-labs/FLUX.2-klein-base-4B')),
-        'quantize': True, 'quantize_te': True, 'low_vram': True, 'qtype': 'qfloat8',
+        **_model_memory_block(ds, 'flux2klein'),
         'model_kwargs': {'match_target_res': False},
     }
     return {
@@ -3120,7 +3712,7 @@ def _build_job_config_flux2klein(ds, dataset_folder: str, steps: int, training_f
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _fkrank, 'flux2klein'),
@@ -3207,7 +3799,7 @@ def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_f
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _qirank, 'qwen_image'),
@@ -3257,6 +3849,100 @@ def _build_job_config_qwen_image(ds, dataset_folder: str, steps: int, training_f
     }
 
 
+
+
+def _build_job_config_anima(ds, dataset_folder: str, steps: int, training_folder=None) -> dict:
+    """Job-config ai-toolkit pour Anima (arch='anima'). Modèle circlestone-labs
+    Anima (Cosmos Predict2 DiT 2B + text encoder Qwen3 + conditionneur T5 + VAE
+    Qwen-Image). Valeurs VÉRIFIÉES contre la PR ostris/ai-toolkit #860 (mergée le
+    2026-07-15), entrée `anima` de `ui/.../options.ts` :
+    - name_or_path 'circlestone-labs/Anima-Base-v1.0-Diffusers' (PUBLIC, non gated) ;
+    - quantize / quantize_te False (defaults options.ts — le DiT ne fait que 2B,
+      contrairement aux 12B krea/flux qui forcent qfloat8) ;
+    - noise_scheduler / sampler 'flowmatch', timestep_type 'weighted' (défaut
+      canonique de l'entrée, PAS 'sigmoid') ;
+    - negative de preview = ANIMA_SAMPLE_NEG (tags anime score_1..3, défaut UI).
+
+    ⚠️ arch 'anima' = EXTENSION (extensions_built_in/diffusion_models/anima), PAS
+    une arch cœur → garde de version obligatoire (_aitoolkit_supports_anima) sinon
+    get_model_class retombe en silence sur le loader SD legacy (LoRA corrompu).
+    Anima exige aussi un diffusers récent (AnimaModularPipeline) — angle mort de la
+    garde, documenté dans _aitoolkit_supports_anima.
+
+    VRAM : 2B → modeste. On garde quand même cache_latents_to_disk +
+    cache_text_embeddings + unload_text_encoder (générique ai-toolkit, valide car
+    train_text_encoder=False → sorties du Qwen3 figées, cachables sans perte), ce
+    qui décharge le TE après caching et laisse de la marge sur les petites cartes.
+    guidance 4 / 25 steps pour les previews : base NON distillée (vrai CFG), même
+    duo que Krea Raw — extrapolé faute de chiffre publié spécifique à Anima."""
+    trigger = _safe_trigger(ds)
+    _arank = _lora_rank(ds, 'anima')   # défaut 32 (defaultLinearRank options.ts) ; éditable via train_settings
+    # Custom weights (local-only, same anima arch) override name_or_path; the TE
+    # (Qwen3) / conditioner (T5) / VAE stay official (ai-toolkit's anima loader
+    # resolves them from the official pipeline).
+    _abase = getattr(ds, 'train_base_model', None)
+    model = {
+        'arch': 'anima',
+        'name_or_path': (_abase if _is_custom_weights(_abase) else ANIMA_BASE),
+        **_model_memory_block(ds, 'anima'),
+    }
+    return {
+        'job': 'extension',
+        'config': {
+            'name': f'lora_{trigger}',
+            'process': [{
+                'type': 'sd_trainer',
+                'training_folder': (training_folder if training_folder
+                                    else str(_run_root(ds))),
+                'device': 'cuda:0',
+                'trigger_word': trigger,
+                'network': _network_block(ds, _arank, 'anima'),
+                'save': {'dtype': 'float16', 'save_every': _save_every(ds),
+                         'max_step_saves_to_keep': _max_step_saves(ds)},
+                'datasets': [{
+                    'folder_path': dataset_folder,
+                    'caption_ext': 'txt',
+                    'caption_dropout_rate': 0.05,
+                    'cache_latents_to_disk': True,
+                    # Pré-cache les embeddings du Qwen3 pour pouvoir le DÉCHARGER pendant
+                    # le training (unload_text_encoder) → libère de la VRAM. Valide car
+                    # train_text_encoder=False (sorties figées → cachables sans perte).
+                    'cache_text_embeddings': True,
+                    'resolution': _train_res(ds),
+                    **_mask_fields(dataset_folder),
+                }],
+                'train': {
+                    'batch_size': 1,
+                    'steps': steps,
+                    'gradient_accumulation': _grad_accum(ds),
+                    'train_unet': True,
+                    'train_text_encoder': False,
+                    'unload_text_encoder': True,
+                    'gradient_checkpointing': True,
+                    'noise_scheduler': 'flowmatch',
+                    'timestep_type': _timestep_type_eff(ds, 'weighted'),  # défaut canonique anima (options.ts)
+                    'optimizer': _optimizer_eff(ds),
+                    'lr': _lr_eff(ds),
+                    'dtype': 'bf16',
+                    **_lr_sched_fields(ds),
+                    **_ema_fields(ds),
+                },
+                'model': model,
+                'sample': {
+                    'sampler': 'flowmatch',
+                    'neg': ANIMA_SAMPLE_NEG,
+                    'sample_every': _sample_every(ds),
+                    'guidance_scale': 4,
+                    'sample_steps': 25,
+                    'prompts': _sample_prompts(ds, trigger),
+                },
+            }],
+        },
+    }
+
+
+
+
 def _build_job_config_sdxl(ds, dataset_folder: str, steps: int, training_folder=None) -> dict:
     """Job-config ai-toolkit arch='sdxl' - valeurs VÉRIFIÉES dans ai-toolkit
     ui/.../options.ts (entrée 'sdxl', 2026-06-14) : quantize/quantize_te False,
@@ -3271,7 +3957,7 @@ def _build_job_config_sdxl(ds, dataset_folder: str, steps: int, training_folder=
     # preflight, so it bypasses the basename whitelist deliberately).
     name_or_path = base_model if _is_custom_weights(base_model) else _sdxl_base_path(base_model)
     model = {'arch': 'sdxl', 'name_or_path': name_or_path,
-             'quantize': False, 'quantize_te': False}
+             **_model_memory_block(ds, 'sdxl')}
     # SDXL is the only family where ai-toolkit honours these top-level overrides
     # (stable_diffusion_model.py). Emitted only when set; TE may be a local path
     # or a HF repo id (AutoModel.from_pretrained accepts both).
@@ -3289,7 +3975,7 @@ def _build_job_config_sdxl(ds, dataset_folder: str, steps: int, training_folder=
             'process': [{
                 'type': 'sd_trainer',
                 'training_folder': (training_folder if training_folder
-                                    else str(_output_dir() / _run_name(ds))),
+                                    else str(_run_root(ds))),
                 'device': 'cuda:0',
                 'trigger_word': trigger,
                 'network': _network_block(ds, _srank, 'sdxl'),
@@ -3342,6 +4028,24 @@ def _build_job_config_sdxl(ds, dataset_folder: str, steps: int, training_folder=
 _CK_RE = re.compile(r'[_-](\d{4,})\.safetensors$')
 
 
+def _run_root(ds, base_model=_PERSISTED, family=None, variant=_PERSISTED):
+    """ai-toolkit's `training_folder` for this run — the run's TOP folder.
+
+    It holds `training.log` (we open it before spawning, so it exists from the
+    first second of a run) and, once ai-toolkit reaches its first save, the
+    `lora_<trigger>` save_root below. Two distinct folders were both being
+    called "the run folder" at nine call sites; this is the top one, `_run_dir`
+    is the save_root, and no caller should rebuild either by hand again."""
+    return _output_dir() / _run_name(ds, base_model, family, variant)
+
+
+def _run_log_path(ds, base_model=_PERSISTED, family=None, variant=_PERSISTED) -> str:
+    """Where the local run's `training.log` is written and read. Single source
+    of truth: the writer, the progress reader and « 📂 Run folder » must never
+    disagree on it (they did — a crashed run's log looked missing)."""
+    return str(_run_root(ds, base_model, family, variant) / 'training.log')
+
+
 def _run_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
              variant=_PERSISTED) -> str:
     ds = fds.get_dataset(user_id, dataset_id)
@@ -3375,7 +4079,14 @@ def _resolve_folder_target(ds, dataset_id, target, base_model=_PERSISTED,
     folder_file_path) — same targets, same security model (fixed server-side
     paths, the client only ever names WHICH of the 3, never a path)."""
     if target == 'run':
-        return _run_dir(ds.user_id, dataset_id, base_model, family, variant)
+        # The run's TOP folder, not the `lora_<trigger>` save_root below it.
+        # That save_root is created by ai-toolkit at its first save, so a run
+        # that died at boot has none — opening it used to CREATE an empty
+        # folder and reveal that, while `training.log` sat one level up, in
+        # the very folder the failure message sends people to (reported by
+        # wannadecryptor on Discord). The top folder shows the log AND leads
+        # to the checkpoints.
+        return str(_run_root(ds, base_model, family, variant))
     if target == 'loras':
         return _lora_dest_dir(ds, family)
     if target == 'dataset':
@@ -3388,7 +4099,8 @@ def open_training_folder(user_id, dataset_id, target='loras', family=None,
     """Ouvre dans l'explorateur de fichiers du POSTE (app locale mono-utilisateur,
     le navigateur tourne sur la même machine) le dossier demandé :
     'loras' → dossier d'import ComfyUI de la famille (loras/krea, loras/sdxl,
-    loras/z image) ; 'run' → dossier de checkpoints du run courant (base+famille) ;
+    loras/z image) ; 'run' → dossier HAUT du run courant (base+famille) : il porte
+    training.log, et les checkpoints sont dans son sous-dossier lora_<trigger> ;
     'dataset' → dossier des images du dataset (data/datasets/<id>/ — où « 💾 Write
     .txt files » dépose les captions sidecar ; aucune dépendance ai-toolkit).
     Cibles FIXES résolues côté serveur — le client n'envoie jamais de chemin.
@@ -3559,6 +4271,11 @@ def list_checkpoints(user_id, dataset_id, base_model=_PERSISTED, family=None,
         if rec is not None:
             c['version'] = rec.version
             c['source'] = rec.source
+            # The record that PRODUCED this file. A continuation resolves its
+            # lineage parent (and the LoRA geometry it must keep) from HERE —
+            # `run_id` below is a cloud id for a cloud record, which is not a
+            # record key and cannot be used for either.
+            c['record_id'] = rec.id
             c['trained_at'] = rec.created_at.isoformat() if rec.created_at else None
             # Run identity for the ☁/💻 #N chip + deep-link on the local group
             # header — the same run the deployed file will be tagged with.
@@ -3566,7 +4283,51 @@ def list_checkpoints(user_id, dataset_id, base_model=_PERSISTED, family=None,
                 c['run_id'], c['run_source'] = rec.cloud_run_id, 'cloud'
             else:
                 c['run_id'], c['run_source'] = rec.id, 'local'
+            # The FINAL save has no step in its name, so it was filed under the
+            # last NUMBERED one (2750 for a 3000-step run) — where the dedup of
+            # the ▶ Continue list swallowed it, making the run's real end
+            # unresumable from here. The ◉ Graph reads a cloud run's staging and
+            # numbers the same file at the run's target (3000): two views, two
+            # truths, and a pill the panel then refused. Number it like the graph
+            # does — its own run's target — whenever the record knows better.
+            if c.get('final') and (rec.steps or 0) > c['step']:
+                c['step'] = rec.steps
+    out.sort(key=lambda c: (c['step'], bool(c.get('final'))))
     return out
+
+
+def resume_source_checkpoint(checkpoints, step):
+    """The save a resume at `step` actually loads, out of a list_checkpoints()
+    list — so a continuation can read ITS provenance (`record_id`) and ITS
+    geometry instead of guessing from the lane. Ties (a numbered save and the
+    bare final at the same step) prefer the numbered file, the same rule every
+    ▶ Continue path already uses. None when nothing sits at that step."""
+    matches = [c for c in (checkpoints or []) if c.get('step') == step]
+    if not matches:
+        return None
+    return min(matches, key=lambda c: bool(c.get('final')))
+
+
+def describe_geometry_conflict(parent_geometry, rank, alpha):
+    """Message for "you cannot continue THESE weights at THAT rank", or None when
+    the shapes agree (or the parent's geometry was never recorded).
+
+    A LoRA's rank and alpha size its matrices: rank-32 weights simply do not load
+    into a rank-64 network. So on a resume the geometry is a property of the
+    checkpoint, never a setting to re-pick — and when the two disagree the launch
+    must say so BEFORE renting anything, not train a fresh LoRA the user believes
+    is a continuation."""
+    geo = parent_geometry or {}
+    want_r, want_a = geo.get('rank'), geo.get('alpha')
+    bad = ((want_r is not None and rank is not None and int(want_r) != int(rank))
+           or (want_a is not None and alpha is not None and int(want_a) != int(alpha)))
+    if not bad:
+        return None
+    return (f'this checkpoint was trained at rank {want_r} / alpha {want_a}, and '
+            f'this run would use rank {rank} / alpha {alpha}. A LoRA\'s rank is '
+            'fixed by its weights — continuing it at another rank cannot load '
+            'them. Set rank and alpha back in Training settings, or start a '
+            'fresh run instead of continuing.')
 
 
 def checkpoint_file_path(user_id, dataset_id, filename, base_model=_PERSISTED,
@@ -4001,10 +4762,11 @@ def purge_training_artifacts(user_id, trigger_safe) -> list[str]:
     removed: list[str] = []
     run_prefix = f'u{user_id}_{trigger_safe}'    # ex. u1_Lola69382
     lora_prefix = f'lora_{trigger_safe}'         # ex. lora_Lola69382
-    # 1) LoRA déployés dans ComfyUI (z image + sdxl + krea + flux + flux2klein + qwen_image séparés)
+    # 1) LoRA déployés dans ComfyUI (z image + sdxl + krea + flux + flux2klein + qwen_image + anima séparés)
     lora_roots = []
     for accessor in (_lora_dest_dir_zimage, _lora_dest_dir_sdxl, _lora_dest_dir_krea,
-                     _lora_dest_dir_flux, _lora_dest_dir_flux2klein, _lora_dest_dir_qwen_image):
+                     _lora_dest_dir_flux, _lora_dest_dir_flux2klein, _lora_dest_dir_qwen_image,
+                     _lora_dest_dir_anima):
         try:
             lora_roots.append(str(accessor()))
         except RuntimeError:
@@ -4060,6 +4822,141 @@ def purge_training_artifacts(user_id, trigger_safe) -> list[str]:
     logger.info('purge_training_artifacts u%s/%s : %d artefact(s) retiré(s)',
                 user_id, trigger_safe, len(removed))
     return removed
+
+
+def _rename_plan(root, old_prefix, new_prefix, *, want_dir=False, suffix=None) -> list:
+    """Entries of `root` on the EXACT boundary of old_prefix, paired with their
+    renamed path. `suffix` restricts to one extension and is stripped before the
+    boundary test (a job config's boundary lives in its stem, not in '.json')."""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for name in os.listdir(root):
+        if suffix and not name.endswith(suffix):
+            continue
+        src = os.path.join(root, name)
+        if os.path.isdir(src) != want_dir:
+            continue
+        stem = name[:-len(suffix)] if suffix else name
+        if not _trigger_boundary(stem, old_prefix):
+            continue
+        out.append((src, os.path.join(root, new_prefix + name[len(old_prefix):])))
+    return out
+
+
+def _rename_inside_run(run_dir, old_trigger_safe, new_trigger_safe) -> list:
+    """Rename the `lora_<trigger>` subfolder and every `lora_<trigger>*` weights file
+    INSIDE a run folder that was just renamed.
+
+    ai-toolkit stamps the trigger at three levels, not one:
+        ulocal_<trigger>_<base>/ lora_<trigger>/ lora_<trigger>_000000250.safetensors
+    Moving only the outer folder therefore fixed nothing the user could see: importing
+    a checkpoint deploys it under the SOURCE FILE's stem (`import_checkpoint`), so the
+    LoRA still landed in ComfyUI under the old trigger. Reported after renaming a
+    style dataset — the label changed, the deployed name did not.
+
+    Best-effort per entry: a locked file is skipped, not fatal. Depth 1 is deliberate
+    — that is the exact shape ai-toolkit writes, and walking deeper would risk
+    renaming unrelated payloads (samples, optimizer state) that merely share a prefix."""
+    moved = []
+    try:
+        entries = sorted(os.listdir(run_dir))
+    except OSError:
+        return moved
+    for name in entries:
+        if not _trigger_boundary(os.path.splitext(name)[0], f'lora_{old_trigger_safe}'):
+            continue
+        src = os.path.join(run_dir, name)
+        dest = os.path.join(run_dir, f'lora_{new_trigger_safe}'
+                            + name[len(f'lora_{old_trigger_safe}'):])
+        if os.path.exists(dest):
+            logger.warning('rename: %s already exists — left in place', dest)
+            continue
+        try:
+            os.rename(src, dest)
+            moved.append((src, dest))
+            if os.path.isdir(dest):        # the lora_<trigger>/ folder: its files too
+                moved += _rename_inside_run(dest, old_trigger_safe, new_trigger_safe)
+        except OSError as e:
+            logger.warning('rename: %s -> %s échoué : %s', src, dest, e)
+    return moved
+
+
+def rename_training_artifacts(user_id, old_trigger_safe, new_trigger_safe) -> dict:
+    """Rename every training artefact of a (user, trigger) onto a NEW trigger —
+    the mirror of purge_training_artifacts, for an edit instead of a delete.
+
+    Without this, changing a dataset's trigger word orphaned everything it had
+    already produced: the deployed LoRA, the ai-toolkit run folder, the export and
+    the job config all keep the OLD trigger in their name, so they no longer match
+    the dataset that made them (and a later run under the new trigger starts from
+    an empty folder while the old one lingers as dead weight).
+
+    Covers the same four backends as the purge: deployed LoRAs (all five family
+    dirs), run output/, export datasets/, and config/generated/. Same safety
+    rules too — exact trigger-boundary matching (never a sibling: Lola vs Lola2),
+    bare os.listdir names (no path traversal), empty trigger is a no-op.
+
+    PLANNED IN FULL, THEN EXECUTED: a half-renamed set is worse than none at all
+    (artefacts split across two triggers with no record of the split), so any
+    destination that already exists aborts the whole rename and nothing is moved.
+    Returns {'renamed': [(src, dest)], 'conflicts': [dest], 'ok': bool}; ok is
+    False only when a conflict blocked it. Idempotent: a second call finds
+    nothing left under the old trigger and is a successful no-op.
+
+    Each backend is probed independently — an unconfigured one (no ComfyUI dir
+    yet) simply yields no roots to sweep instead of aborting the rename."""
+    old_trigger_safe = (old_trigger_safe or '').strip()
+    new_trigger_safe = (new_trigger_safe or '').strip()
+    if (not old_trigger_safe or not new_trigger_safe
+            or old_trigger_safe == new_trigger_safe or user_id in (None, '')):
+        return {'renamed': [], 'conflicts': [], 'ok': True}
+
+    old_run, new_run = f'u{user_id}_{old_trigger_safe}', f'u{user_id}_{new_trigger_safe}'
+    old_lora, new_lora = f'lora_{old_trigger_safe}', f'lora_{new_trigger_safe}'
+
+    def _roots(accessors):
+        roots = []
+        for accessor in accessors:
+            try:
+                roots.append(str(accessor()))
+            except RuntimeError:
+                pass                      # backend not configured yet -> nothing to sweep
+        return roots
+
+    plan = []
+    # 1) deployed LoRAs in ComfyUI (zimage + sdxl + krea + flux + flux2klein + anima)
+    for root in _roots((_lora_dest_dir_zimage, _lora_dest_dir_sdxl, _lora_dest_dir_krea,
+                        _lora_dest_dir_flux, _lora_dest_dir_flux2klein, _lora_dest_dir_anima)):
+        plan += _rename_plan(root, old_lora, new_lora, suffix='.safetensors')
+    # 2) run output + 3) export datasets (whole folders)
+    for root in _roots((_output_dir, _datasets_dir)):
+        plan += _rename_plan(root, old_run, new_run, want_dir=True)
+    # 4) job configs, keyed by run name (one trigger can have several families)
+    for root in _roots((_jobs_dir,)):
+        plan += _rename_plan(root, old_run, new_run, suffix='.json')
+
+    conflicts = [dest for _, dest in plan if os.path.exists(dest)]
+    if conflicts:
+        logger.warning('rename_training_artifacts u%s %s->%s : abandon, %d collision(s)',
+                       user_id, old_trigger_safe, new_trigger_safe, len(conflicts))
+        return {'renamed': [], 'conflicts': conflicts, 'ok': False}
+
+    renamed = []
+    for src, dest in plan:
+        try:
+            os.rename(src, dest)
+            renamed.append((src, dest))
+            if os.path.isdir(dest):
+                renamed += _rename_inside_run(dest, old_trigger_safe, new_trigger_safe)
+        except OSError as e:
+            # Best-effort like the purge: a locked file (an open LoRA, a folder held
+            # by a viewer) is logged and skipped rather than aborting mid-way, which
+            # would leave the set split with no way to tell which half moved.
+            logger.warning('rename: %s -> %s échoué : %s', src, dest, e)
+    logger.info('rename_training_artifacts u%s %s->%s : %d artefact(s) renommé(s)',
+                user_id, old_trigger_safe, new_trigger_safe, len(renamed))
+    return {'renamed': renamed, 'conflicts': [], 'ok': True}
 
 
 def write_job_config(ds, dataset_folder: str, steps: int = 3000) -> str:
@@ -4238,7 +5135,7 @@ def style_caption_quality(dataset_id) -> dict:
 TRAIN_MIN_IMAGES = {'zimage': (12, 20), 'sdxl': (20, 30), 'krea': (15, 20), 'flux': (15, 20),
                     'flux2klein': (15, 20), 'qwen_image': (15, 20)}
 _FAMILY_LABEL = {'zimage': 'Z-Image', 'sdxl': 'SDXL', 'krea': 'Krea 2', 'flux': 'FLUX.1',
-                 'flux2klein': 'FLUX.2 Klein', 'qwen_image': 'Qwen-Image'}
+                 'flux2klein': 'FLUX.2 Klein', 'qwen_image': 'Qwen-Image', 'anima': 'Anima'}
 # VRAM mesurée : Krea 2 (12B) sature un 24 GB à 1024 (cf. KREA_TRAIN_RESOLUTION). Flux
 # est un DiT de même classe (12B) → même seuil recommandé.
 _KREA_MIN_VRAM_GB = 24
@@ -4251,7 +5148,8 @@ _KREA_MIN_VRAM_GB = 24
 _VRAM24_FAMILIES = ('krea', 'flux', 'qwen_image')   # familles 12B+ qui recommandent ~24 GB à 1024
 
 
-def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> dict:
+def training_preflight(user_id, dataset_id, train_type=None, variant=None,
+                       lane=None) -> dict:
     """Pre-launch sanity report: {'blockers': [...], 'warnings': [...]}. Blockers
     stop the launch (too few images for the family); warnings ask for one explicit
     confirm in the UI. Pure reads — never mutates, never raises on probe failures
@@ -4264,7 +5162,16 @@ def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> di
     workspace (gf-generate/gf-images) où corriger — None quand rien à cibler.
     NB : le check 'captioned' (images gardées sans caption) est un fail dans
     `checks` (assert_trainable refusera le launch) mais volontairement PAS un
-    blocker ici — le flux modal existant (launch → erreur explicite) est conservé."""
+    blocker ici — le flux modal existant (launch → erreur explicite) est conservé.
+
+    ``lane`` ('local' default, or 'cloud') says WHERE the run will execute. Every
+    row carries a ``scope``: 'dataset' (a property of the images/captions, true
+    wherever the job runs) or 'machine' (a read of THIS box — its GPU, its
+    ai-toolkit venv). A cloud lane drops the 'machine' rows and their warning
+    lines: that hardware will not run the job, and on a machine with no local
+    training environment at all they would fire on every single cloud launch —
+    which is exactly how users learn to click through warnings without reading
+    them. Default 'local' keeps the historical payload byte-for-byte."""
     from .face_variations import caption_has_identity_leak
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
@@ -4273,13 +5180,24 @@ def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> di
     label = _FAMILY_LABEL.get(ttype, ttype)
     blockers, warnings = [], []
     checks = []
+    # `warnings` is a flat list of strings (the modal renders it verbatim), so the
+    # lane filter cannot recognise a machine-scope line by reading it. Record the
+    # indices as they are appended instead — the only reliable pairing.
+    machine_warning_ix = set()
 
-    def _check(cid, clabel, status, detail, target=None, bypassable=None, hint=None):
+    def _machine_warn(msg):
+        machine_warning_ix.add(len(warnings))
+        warnings.append(msg)
+
+    def _check(cid, clabel, status, detail, target=None, bypassable=None, hint=None,
+               scope='dataset'):
         # `bypassable` (fail rows only): True = a QUALITY guard-rail the explicit
         # "Continue anyway" ack can waive; False = a physical impossibility the ack
         # never covers. `hint` = the honest one-line risk shown next to the ack.
+        # `scope`: 'dataset' = a property of the images/captions (true on any lane);
+        # 'machine' = a read of THIS box, meaningless when the job runs elsewhere.
         entry = {'id': cid, 'label': clabel, 'status': status,
-                 'detail': detail, 'target': target}
+                 'detail': detail, 'target': target, 'scope': scope}
         if bypassable is not None:
             entry['bypassable'] = bool(bypassable)
         if hint:
@@ -4402,6 +5320,28 @@ def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> di
         else:
             _check('captioned', 'Every kept image captioned', 'ok', f'{n}/{n} captioned')
 
+    # 3ter) DUAL CAPTIONS vs famille. Krea/Anima pré-cachent les embeddings de texte et
+    # déchargent l'encodeur : la caption courte n'a aucun encodeur pour la lire, et l'émettre
+    # quand même faisait planter le run au 1er step (issue #22, 1Tomber). La combinaison est
+    # refusée à la construction de la config — on le DIT ici, avant le launch, plutôt que de
+    # laisser l'utilisateur croire qu'il entraîne sur deux libellés. scope='dataset' : c'est
+    # une propriété de la recette de famille, vraie sur n'importe quelle voie.
+    # Slider mode is excluded: its guided loss ignores captions entirely, and the
+    # 'captioned' row above already says so — a second row promising two wordings would
+    # contradict it.
+    if fds.dual_captions_enabled(ds) and not slider:
+        if ttype in DUAL_CAPTION_UNSUPPORTED_FAMILIES:
+            warnings.append(
+                f'Dual captions are ON but {label} cannot train them — it pre-caches its '
+                'text embeddings and unloads the text encoder, so only the long caption is '
+                'encoded. The run will train on the long caption alone.')
+            _check('dual_captions', 'Dual captions', 'warn',
+                   f'{label} caches its text embeddings — the short caption is ignored and '
+                   'the run trains on the long one alone', 'gf-training')
+        else:
+            _check('dual_captions', 'Dual captions', 'ok',
+                   f'{label} trains each image on both its long and its short caption')
+
     # 3) captions suspectes (trop courtes / dupliquées) — sans objet en slider mode
     caps = [(r.caption or '').strip() for r in kept if (r.caption or '').strip()]
     if caps and not slider:
@@ -4497,13 +5437,80 @@ def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> di
         from .. import capabilities
         vram = capabilities.gpu_vram_gb()
         if vram is not None and ttype in _VRAM24_FAMILIES and vram < _KREA_MIN_VRAM_GB:
-            warnings.append(f'{label} training needs ~{_KREA_MIN_VRAM_GB} GB of VRAM at 1024 '
-                            f'— this GPU reports {vram} GB; expect OOM or extreme slowness. '
-                            'Drop the resolution to 768 in Advanced options to fit.')
+            _machine_warn(f'{label} training needs ~{_KREA_MIN_VRAM_GB} GB of VRAM at 1024 '
+                          f'— this GPU reports {vram} GB; expect OOM or extreme slowness. '
+                          'Drop the resolution to 768 in Advanced options to fit.')
             _check('vram', 'GPU memory', 'warn',
-                   f'{label} needs ~{_KREA_MIN_VRAM_GB} GB VRAM — this GPU reports {vram} GB')
+                   f'{label} needs ~{_KREA_MIN_VRAM_GB} GB VRAM — this GPU reports {vram} GB',
+                   scope='machine')
     except Exception:
         pass
+
+    # 8) torch build vs GPU architecture — the RTX 50 (Blackwell) trap. Stable
+    # PyTorch wheels stop at sm_90; `torch.cuda.is_available()` stays True, the
+    # run builds its buckets, then dies at the first real computation. Catching
+    # it HERE is the whole point: the alternative is 20 minutes of setup for an
+    # opaque "ai-toolkit exited 1". A warning, not a blocker — the verdict is a
+    # read of the venv, and an unknown probe (None) says nothing at all.
+    try:
+        from .. import capabilities
+        from .training_diagnostics import torch_arch_verdict
+        arch = torch_arch_verdict(capabilities.aitoolkit_torch_info(),
+                                  venv_python=cfg.aitoolkit_path('venv_python'))
+        if arch and not arch['supported']:
+            _machine_warn(arch['message']
+                          + (f' Fix: {arch["command"]}' if arch['command'] else ''))
+            # Keep the row SHORT — it sits in a one-line list next to ten other
+            # checks, on a phone too. The full explanation + fix is the warning.
+            _check('torch_arch', 'PyTorch supports this GPU', 'warn',
+                   f'torch {arch["torch"]} has no {arch["sm"]} kernels — the run '
+                   'dies at the first GPU computation', scope='machine')
+    except Exception:
+        pass   # a probe failure must never block or fake a diagnosis
+
+    # 9) Face masking asked for, but the detector isn't installed.
+    #
+    # InsightFace is an OPTIONAL extra by decision (a few hundred MB nobody should
+    # be made to download), so its absence is a NORMAL state, not an anomaly — this
+    # is a warning, never a blocker. What is NOT acceptable is what happened before:
+    # the export silently dropped the masks and the run trained unmasked, with the
+    # user only finding out from a flag on the progress view, GPU-hours in. So the
+    # decision is posed HERE, once, before the launch: install it, or continue
+    # unmasked on purpose.
+    #
+    # The condition distinguishes "impossible for lack of a tool" from "refused BY
+    # DESIGN": face_masking_enabled() already returns False for a Character or a
+    # Style (their identity/rendering must be learned, masking would amputate it),
+    # and slider mode forces it off because the guided slider loss never reads
+    # batch.mask_tensor. Installing InsightFace would change nothing in those cases,
+    # so they stay silent — warning there would be pure noise.
+    if not slider and fds.face_masking_enabled(ds):
+        try:
+            from . import face_mask
+            face_mask_ok = face_mask.is_available()
+        except Exception:
+            face_mask_ok = None      # probe blew up -> say nothing, never block
+        if face_mask_ok is False:
+            warnings.append(
+                'Mask faces is ON, but face detection (InsightFace) is not installed — '
+                'this run would train UNMASKED, with the faces at full loss weight. '
+                'Install it from the Mask faces option in Advanced training options '
+                '(~400 MB, a few minutes), or continue and train unmasked on purpose.')
+            _check('face_mask', 'Face masking ready', 'warn',
+                   'InsightFace is not installed — this run trains unmasked')
+        elif face_mask_ok:
+            _check('face_mask', 'Face masking ready', 'ok',
+                   'InsightFace found — the faces will be weighted down')
+
+    # Lane filter — BEFORE the verdict, so a cloud launch whose only complaint was
+    # this machine's GPU comes back a clean 🟢 instead of a warning nobody can act
+    # on. Note what stays: face_mask is machine-INSTALLED but dataset-SCOPED, since
+    # the masks are generated locally at export and uploaded with the images
+    # (cloud_training uploads `<staging>_masks`) — InsightFace missing here means
+    # the PAID run trains unmasked. Local origin, cloud consequence: it must show.
+    if (lane or 'local') == 'cloud':
+        checks = [c for c in checks if c.get('scope') != 'machine']
+        warnings = [w for i, w in enumerate(warnings) if i not in machine_warning_ix]
 
     # Verdict agrégé pour la pastille : un fail = 🔴, sinon un warn = 🟡, sinon 🟢.
     statuses = {c['status'] for c in checks}
@@ -4527,6 +5534,9 @@ def training_preflight(user_id, dataset_id, train_type=None, variant=None) -> di
             # can_override : la case « Continue anyway » n'est offerte que quand c'est True
             # (miroir exact du garde serveur assert_trainable/allow_not_ready).
             'can_override': can_override, 'override_hint': override_hint,
+            # Echoed so the modal can say WHERE this run is headed (and, implicitly,
+            # why no GPU-memory row is listed) without re-deriving it client-side.
+            'lane': ('cloud' if (lane or 'local') == 'cloud' else 'local'),
             'kept': n, 'floor': floor, 'recommended': reco}
 
 
@@ -4578,11 +5588,82 @@ def _log_tail(path: str, n: int = 60) -> str:
         return '(log illisible)'
 
 
+# Scanning window for the excerpt: wide enough that a full traceback (frames +
+# exception line) is never cut in half, while `log_tail` keeps its historical
+# 30-line shape for anything still reading that field.
+_ERROR_SCAN_LINES = 200
+
+
+def _crash_payload(log_path, dataset_id, rc, engine: str = 'aitoolkit') -> dict:
+    """The `training_error` state a crashed local run leaves behind: the tail
+    (path-redacted — this text is shown to the user and pasted into public help
+    threads), the excerpt that actually EXPLAINS the failure, and, when the venv
+    says so, the GPU-architecture verdict that turns "exited 1" into something
+    the user can act on. Best-effort throughout: nothing here may raise inside
+    the watcher thread, and an unknown probe adds no key at all. `engine`
+    (ai-toolkit OR musubi-tuner) rides along so the UI never mislabels which
+    engine actually crashed (bug reported 2026-07-26)."""
+    from ..utils.redact import redact_tokens, redact_user_paths
+    from .training_diagnostics import (extract_error_excerpt, gated_repo_verdict,
+                                       hf_transfer_verdict, interpreter_verdict,
+                                       missing_module_in_log, torch_arch_verdict)
+    wide = _log_tail(log_path, _ERROR_SCAN_LINES)
+    payload = {'dataset_id': dataset_id, 'rc': rc, 'engine': engine,
+               'log_tail': redact_tokens(redact_user_paths(_log_tail(log_path)))[-1500:],
+               'excerpt': extract_error_excerpt(wide)}
+    # A gated-base refusal is a PROVEN cause with a precise remedy — and 401 and
+    # 403 have opposite remedies, which the raw HF sentence conflates.
+    try:
+        gated = gated_repo_verdict(wide, token_configured=bool(cfg.secret('HF_TOKEN')))
+        if gated:
+            payload['hf_gated'] = {k: gated[k] for k in ('status', 'repo', 'url',
+                                                         'title', 'message')}
+    except Exception:
+        pass
+    # A dead fast-download accelerator looks exactly like a network fault, and the
+    # app never sets that variable — so saying so is the whole remedy (GitHub #18,
+    # bobba84).
+    try:
+        transfer = hf_transfer_verdict(wide)
+        if transfer:
+            payload['hf_transfer'] = transfer
+    except Exception:
+        pass
+    # A `ModuleNotFoundError` in the log is a PROVEN interpreter problem, and the
+    # one fact the log itself never carries is WHICH Python produced it. The
+    # module is read off the log — no subprocess is spawned from the watcher
+    # thread — and the "which venv works instead" hint costs a probe only here,
+    # on a run that already failed (GitHub #19, strouder).
+    try:
+        module = missing_module_in_log(wide)
+        if module:
+            from .. import capabilities
+            report = capabilities.aitoolkit_interpreter_report()
+            verdict = interpreter_verdict(
+                report['python'] or cfg.aitoolkit_path('venv_python'),
+                False, alternative=report['alternative'], module=module)
+            if verdict:
+                payload['interpreter'] = {k: verdict[k] for k in (
+                    'python', 'module', 'windows_store', 'alternative',
+                    'title', 'message')}
+    except Exception:
+        pass
+    try:
+        from .. import capabilities
+        arch = torch_arch_verdict(capabilities.aitoolkit_torch_info(),
+                                  venv_python=cfg.aitoolkit_path('venv_python'))
+        if arch and not arch['supported']:
+            payload['gpu_arch'] = {'message': arch['message'], 'command': arch['command']}
+    except Exception:
+        pass
+    return payload
+
+
 def _watch_training(app, proc, log_path, dataset_id, engine: str = 'aitoolkit') -> None:
     """Thread daemon : attend la fin du process (ai-toolkit OU musubi-tuner, cf.
     `engine`) puis fait avancer la file (libère ComfyUI / lance le suivant) DÈS
-    la fin, sans dépendre du polling client. Sur un crash (rc≠0), remonte la fin
-    du log ET l'engine réellement utilisé (bug reporté 2026-07-26 : l'UI
+    la fin, sans dépendre du polling client. Sur un crash (rc≠0), remonte la
+    cause probable ET l'engine réellement utilisé (bug reporté 2026-07-26 : l'UI
     affichait toujours « ai-toolkit exited N » même pour un crash musubi-tuner,
     donnant l'impression trompeuse que le sélecteur d'engine avait été ignoré
     alors que musubi tournait bel et bien - seul le LIBELLÉ de l'erreur était
@@ -4597,17 +5678,12 @@ def _watch_training(app, proc, log_path, dataset_id, engine: str = 'aitoolkit') 
     try:
         with app.app_context():
             if rc not in (0, None):
-                tail = _log_tail(log_path)
+                payload = _crash_payload(log_path, dataset_id, rc, engine=engine)
                 logger.error("Entraînement %s dataset %s terminé en ERREUR (rc=%s). "
-                             "Fin du log :\n%s", engine, dataset_id, rc, tail)
+                             "Cause probable :\n%s", engine, dataset_id, rc,
+                             payload['excerpt']['text'] or payload['log_tail'])
                 # Surface l'erreur à l'UI (sinon un crash = juste « terminé » silencieux).
-                # log_tail élargi 1500 -> 4000 chars : la ligne d'argv unique de
-                # musubi (voir _log_tail) peut à elle seule dépasser 1000
-                # caractères, laissant sinon trop peu de place à la vraie erreur.
-                queue_manager._set_system_state(
-                    'training_error',
-                    {'dataset_id': dataset_id, 'rc': rc, 'engine': engine, 'log_tail': tail[-4000:]},
-                    ttl_seconds=3600)
+                queue_manager._set_system_state('training_error', payload, ttl_seconds=3600)
             else:
                 logger.info("Entraînement %s dataset %s terminé (rc=%s).", engine, dataset_id, rc)
             process_training_queue()  # libère le GPU / enchaîne la file immédiatement
@@ -4623,7 +5699,7 @@ def archive_previous_run(ds) -> str | None:
     main) et tombent avec le dataset : le nom garde le préfixe `lora_<trigger>`
     donc purge_training_artifacts les balaie aussi. Les copies déjà importées
     dans ComfyUI (loras/<famille>) ne sont pas touchées. None si aucun run."""
-    run_dir = _output_dir() / _run_name(ds)
+    run_dir = _run_root(ds)
     if not run_dir.is_dir():
         return None
     dest = f'{run_dir}_archived_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
@@ -4682,6 +5758,10 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     availability problem, not a bad request)."""
     if not is_installed():
         raise RuntimeError('ai-toolkit is not configured')
+    # The interpreter EXISTS; can it actually run ai-toolkit? Asked here, before a
+    # whole dataset is exported, so a torch-less Python is named now instead of
+    # surfacing minutes later as an opaque crash (GitHub #19, strouder).
+    assert_interpreter_ready()
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
@@ -4694,6 +5774,10 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     if (queue_manager._get_system_state('training_in_progress', False)
             and _pid_alive(queue_manager._get_system_state('training_pid', None))):
         raise ValueError('a training is already in progress - wait for it to finish or queue this dataset')
+    # Cheap refusal BEFORE the dataset export below: re-exporting a whole dataset
+    # only to reject the launch under the spawn lock would burn minutes of disk
+    # for nothing. The authoritative copy of this check lives in that lock.
+    _assert_no_vision_pass_on_gpu()
     if check_captions:
         assert_trainable(dataset_id, train_type=train_type,
                          allow_caption_mismatch=allow_caption_mismatch,
@@ -4792,6 +5876,13 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
             "ai-toolkit doesn't support Qwen-Image-Edit yet (qwen_image_edit arch missing) - "
             "update it (git pull) before training a Qwen-Image-Edit LoRA, or switch "
             "the variant to base Qwen-Image.")
+    # Anima : même garde (arch d'EXTENSION, PR #860 mergée le 2026-07-15) — un
+    # ai-toolkit antérieur retombe en silence sur le loader SD legacy → LoRA corrompu.
+    # Anima has no engine axis (ai-toolkit only), so this is unconditional.
+    if _train_type(ds) == 'anima' and not _aitoolkit_supports_anima():
+        raise ValueError(
+            "ai-toolkit doesn't support Anima yet (anima arch missing) - "
+            "update it (git pull) before training an Anima LoRA.")
     # Engine axis (Wave 2): musubi-tuner is scoped to qwen_image only. ai-toolkit
     # stays a blanket requirement regardless (checked unconditionally above) —
     # musubi only replaces the actual subprocess-launch step below.
@@ -4858,17 +5949,17 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
     # training is forced off on that engine rather than risk a wrong shape.
     dataset_folder = export_dataset_to_aitoolkit(
         user_id, dataset_id, masked=(masked and launch_engine != 'musubi'))
-    # HF_HOME route les poids base/adapter sur le disque configuré. PYTHONIOENCODING
-    # évite les crashs cp1252 sur les logs unicode. Jamais shell=True ; args en liste.
-    env = dict(os.environ, HF_HOME=str(_hf_home()), PYTHONIOENCODING='utf-8')
-    run_dir = _output_dir() / _run_name(
-        ds, base_model=base_model, family=launch_fam, variant=variant)
+    # Environnement du sous-process d'entraînement (HF_HOME + auth Hugging Face,
+    # cf. training_subprocess_env). Jamais shell=True ; args en liste.
+    env = training_subprocess_env()
+    run_dir = _run_root(ds, base_model=base_model, family=launch_fam, variant=variant)
     run_dir.mkdir(parents=True, exist_ok=True)
     # Every launch gets its OWN log from here — see _archive_existing_log's
     # docstring (a retry after an OOM used to truncate/concatenate the prior
     # attempt's log before this).
     _archive_existing_log(run_dir)
-    log_path = str(run_dir / 'training.log')
+    log_path = _run_log_path(ds, base_model=base_model, family=launch_fam,
+                             variant=variant)
     run_token = secrets.token_hex(16)
     _model_version = musubi_tuner.MODEL_VERSION['edit' if variant == 'edit' else 'image']
     if launch_engine == 'musubi':
@@ -4913,6 +6004,42 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
             width=_musubi_sample_res, height=_musubi_sample_res)
     else:
         config_path = write_job_config(ds, dataset_folder, steps=steps)
+    # Freeze the dataset (manifest + caption text + image content hashes +
+    # environment) BEFORE taking the lock. All of the reading — file hashes,
+    # nvidia-smi, the ai-toolkit revision — happens here so the registration
+    # under `_queue_lock` stays a single short write; the launch path has
+    # already lost cloud runs to `database is locked` once.
+    from . import checkpoint_registry
+    # Re-ask the cheap question BEFORE the freeze. The same check already runs at
+    # the top of this function, but the dataset export in between takes minutes on
+    # a real dataset — long enough for another launch to have won the process slot.
+    # Without this, that loser still paid for a full freeze (hashing every image,
+    # probing nvidia-smi and the ai-toolkit revision) before the authoritative
+    # check under `_queue_lock` refused it. Two reads of an in-memory flag; the
+    # copy inside the lock stays the authority, this one only saves the work.
+    if (queue_manager._get_system_state('training_in_progress', False)
+            and _pid_alive(queue_manager._get_system_state('training_pid', None))):
+        raise ValueError(
+            'a training is already in progress - wait for it to finish or '
+            'queue this dataset')
+    _prepared = checkpoint_registry.prepare_launch(
+        user_id, dataset_id, base_model=base_model)
+    # ai-toolkit is about to claim the card. Give back the vision model's
+    # 7.5 GB if an isolated call leased it warm (no-op without a live lease).
+    #
+    # OUTSIDE `_queue_lock`, and it must stay outside: a live lease makes this an
+    # HTTP POST to Ollama with `timeout=(10, 30)` retried once — up to ~80 s of
+    # blocking. Held under the lock, that froze Stop, enqueue/dequeue and queue
+    # advancement for as long as Ollama took to answer: pressing Stop during a
+    # launch did nothing until the unload returned. Nothing here depends on the
+    # lock (the vision-pass guard already ran above), and the ordering that
+    # matters — VRAM handed back BEFORE Popen — is unchanged.
+    try:
+        from .vision_keepalive import revoke as _revoke_vision
+        _revoke_vision('training starting')
+    except Exception:
+        logger.warning('vision keep-warm revoke failed before training start',
+                       exc_info=True)
     # The authoritative live-run check, identity state and PID publication are
     # one transition under the SAME lock used by Stop and queue advancement.
     # This closes both races: two launches spawning together, and a stale Stop
@@ -4923,9 +6050,12 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
             raise ValueError(
                 'a training is already in progress - wait for it to finish or '
                 'queue this dataset')
+        # Authoritative: a vision pass may have grabbed the window during the
+        # export above. Checked under the SAME lock as the live-run test so the
+        # two GPU owners can never both believe they won the card.
+        _assert_no_vision_pass_on_gpu()
         # Provenance registry: record WHICH dataset version this launch trains on
         # only after this request has won the process slot.
-        from . import checkpoint_registry
         # Honest provenance: a launch waved through despite a readiness blocker
         # records « acknowledged_not_ready » in its settings snapshot (surfaced in
         # the Runs-hub Share config) — discreet, so a thin run is explainable later.
@@ -4935,7 +6065,7 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         checkpoint_registry.register_launch(
             user_id, dataset_id, family=launch_fam, source='local',
             base_model=base_model or '', variant=variant, masked=bool(masked),
-            steps=int(steps), settings=_launch_settings,
+            steps=int(steps), settings=_launch_settings, prepared=_prepared,
             parent_record_id=parent_record_id, resumed_from=resumed_from)
         queue_manager._set_system_state('training_error', None, ttl_seconds=1)
         identity = {
@@ -5036,7 +6166,7 @@ def _seed_continuation_from(user_id, dataset_id, base, family, variant,
     Returns the archived folder path."""
     ds = fds.get_dataset(user_id, dataset_id)
     trigger = _safe_trigger(ds)
-    training_folder = _output_dir() / _run_name(ds, base, family, variant)
+    training_folder = _run_root(ds, base, family, variant)
     if not training_folder.is_dir():
         raise ValueError('run folder missing - cannot seed the earlier checkpoint')
     dest = f'{training_folder}_superseded_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
@@ -5088,6 +6218,9 @@ def continue_training(user_id, dataset_id, extra_steps: int = 1000,
             queue_manager._get_system_state('training_pid', None))
         if not (_allow_dead_predecessor and previous_is_dead):
             raise ValueError('a training is already in progress')
+    # Same interpreter gate as a fresh launch: a resume spawns the very same
+    # ai-toolkit command, so a torch-less Python must be named here too.
+    assert_interpreter_ready()
     # Validate the safe-subset overrides BEFORE any side effect: a forbidden key
     # (rank/alpha/optimizer/…) must fail loudly with nothing archived or persisted.
     override_patch = validate_resume_overrides(overrides)
@@ -5133,6 +6266,33 @@ def continue_training(user_id, dataset_id, extra_steps: int = 1000,
         # Ties (a numbered save and the bare final at the same step): prefer the
         # numbered file — it carries a clean step and is never the run's live final.
         chosen = min(matches, key=lambda c: bool(c.get('final')))
+    # Lineage: the record this continuation resumes FROM is the record that
+    # PRODUCED the file being loaded (list_checkpoints stamps `record_id` on every
+    # save), NOT merely the newest record of the lane. One lane holds several runs,
+    # and their saves coexist in the same run dir: attributing the child to the
+    # newest record drew an edge to a run whose weights were never touched — and,
+    # worse, one whose rank could differ, which is what makes the graph's claim
+    # physically impossible. Falls back to the lane's newest record when the file
+    # carries no stamp (pre-registry saves). Best-effort like all provenance — a
+    # resolution failure leaves the edge NULL and NEVER blocks the continuation.
+    from . import checkpoint_registry
+    _src_ck = resume_source_checkpoint(cks, resume_step)
+    try:
+        _parent = checkpoint_registry.record_by_id((_src_ck or {}).get('record_id'))
+        if _parent is None:
+            _parent = checkpoint_registry.newest_record_for(dataset_id, fam, base or '', var)
+    except Exception:
+        _parent = None
+    # …and the geometry those weights were trained with is not negotiable. The
+    # local lane trains from the dataset's PERSISTED settings, so it cannot quietly
+    # inherit the parent's rank without rewriting the user's own settings behind
+    # their back (the cloud lane can — it carries a per-run snapshot). Refuse
+    # loudly, here: nothing has been archived, persisted or launched yet.
+    _conflict = describe_geometry_conflict(
+        checkpoint_registry.network_geometry(_parent),
+        _lora_rank(ds, fam), _lora_alpha_eff(ds, _lora_rank(ds, fam), fam))
+    if _conflict:
+        raise ValueError(_conflict)
     try:
         extra = max(100, int(extra_steps))
     except (TypeError, ValueError):
@@ -5165,17 +6325,6 @@ def continue_training(user_id, dataset_id, extra_steps: int = 1000,
     # explicit server-side acknowledgement.
     launch_allow_unverified = (allow_unverified_weights
                                or not needs_explicit_z_recipe)
-    # Lineage: the record this continuation resumes FROM is the newest record of
-    # this exact lane (dataset+family+base+variant). Resolved BEFORE launch_training
-    # registers the child, so the child's parent_record_id points at the true
-    # predecessor. Best-effort like all provenance — a resolution failure (no prior
-    # record, or a queue-thread call outside the app context) leaves the edge NULL
-    # and NEVER blocks the continuation.
-    from . import checkpoint_registry
-    try:
-        _parent = checkpoint_registry.newest_record_for(dataset_id, fam, base or '', var)
-    except Exception:
-        _parent = None
     res = launch_training(user_id, dataset_id, steps=resume_step + extra, check_captions=False,
                           base_model=base, variant=var, train_type=fam,
                           masked=masked,
@@ -5361,6 +6510,33 @@ def assert_trainable(dataset_id, train_type=None, allow_caption_mismatch=False,
                 "expects prose. Re-caption in 'Prose' mode, or force the training.")
 
 
+def _assert_no_vision_pass_on_gpu():
+    """Refuse to start a local training while a vision pass owns the GPU.
+
+    The mirror of gpu_exclusive_vision_window's own 'training is running' check.
+    Until now this half only existed on the QUEUE path (_advance_training_queue
+    skips a due item while `vision_in_progress`); a direct launch — the ▶ button,
+    a retry, a continue — walked straight past it.
+
+    It matters because the two do NOT share the card gracefully. Measured on a
+    24 GB card with ~19 GB already resident: the vision model (7.5 GB with its
+    context) no longer fits, Ollama silently spills ~43 % of it to the CPU, the
+    vision pass runs ~13.5x slower and the resident GPU work drops 20-150x.
+    Nothing raises and nothing OOMs — so a training started here would simply
+    crawl for hours with no error to explain it. Refusing is the kinder failure.
+
+    The flag is TTL-bounded and cleared at startup (recover_stale_vision_window),
+    so this can never latch a training out permanently.
+    """
+    if queue_manager._get_system_state('vision_in_progress', False):
+        from ..gpu_window import GpuBusyError
+        raise GpuBusyError(
+            'a vision pass (captioning, watermark or framing) is using the GPU - '
+            'training would fight it for VRAM instead of failing outright, so it '
+            'has to wait. Stop the pass, or queue this dataset and it will start '
+            'by itself when the pass is done.')
+
+
 def is_local_run_active(dataset_id) -> bool:
     """True when the single-flight LOCAL trainer is mid-run on THIS dataset.
     delete_dataset uses it (alongside cloud_training.active_runs_for) to refuse
@@ -5433,14 +6609,20 @@ def last_local_error() -> dict | None:
 
 
 def local_error_message(err) -> str:
-    """One-line, paste-safe summary of a local crash for the Runs page."""
+    """One-line, paste-safe summary of a local crash for the Runs page. Quotes the
+    line that EXPLAINS the crash (last traceback / error line), never the last
+    line of the log — which is very often a harmless FutureWarning. When the log
+    holds no error line at all, the summary stays honest and says just that."""
     if not isinstance(err, dict):
         return 'Training crashed.'
+    from .training_diagnostics import extract_error_excerpt
     rc = err.get('rc')
-    tail = (err.get('log_tail') or '').strip()
-    last = tail.splitlines()[-1].strip() if tail else ''
+    excerpt = err.get('excerpt')
+    if not isinstance(excerpt, dict):     # legacy payload written before excerpts
+        excerpt = extract_error_excerpt(err.get('log_tail') or '')
+    headline = (excerpt.get('headline') or '').strip()[:300]
     base = f'Training crashed (exit code {rc}).' if rc is not None else 'Training crashed.'
-    return f'{base} {last}' if last else base
+    return f'{base} {headline}' if headline else f'{base} No error line in the log.'
 
 
 def _failed_local_record_id() -> int | None:
@@ -5509,6 +6691,23 @@ _PROG_LOG_MAX_BYTES = 4 * 1024 * 1024   # tail cap: 3000 tqdm updates ≈ 0.5 MB
 _PROG_CURVE_MAX_POINTS = 200
 _PROG_SAMPLES_MAX = 24
 
+# The SAME log also carries huggingface_hub's byte-counter bars while the pod
+# pulls the base weights — the phase that costs the most and reported the least:
+#   raw.safetensors:   7%|▋| 1.95G/26.3G [15:30<2:37:06, 2.58MB/s]
+# Two independent reasons to recognise them.
+#  * They are not steps. '0.00/26.3G' matched _PROG_STEP_RE as "0/26", so a run
+#    downloading its base model showed 'step 0 / 26' — a plausible-looking
+#    number that was pure noise (verified on the run-121 log, 2026-07-28).
+#  * They ARE the answer to "is it downloading or is it frozen?", which nothing
+#    surfaced: two users waited hours in front of a fixed sentence.
+# The discriminator is the rate unit: tqdm prints B/s only for byte bars
+# (it/s or s/it for step bars). '?B/s' (no estimate yet) counts too.
+_DOWNLOAD_PROG_RE = re.compile(
+    r'(?P<label>[^\r\n|]{1,80}?):\s*(?P<percent>\d{1,3})%\|[^|]*\|\s*'
+    r'(?P<done>[\d.]+\s*[kKMGTP]?)/(?P<total>[\d.]+\s*[kKMGTP]?)\s*'
+    r'\[(?P<elapsed>[\d:]+)<(?P<eta>[\d:?]+),\s*(?P<speed>[\d.?]+\s*[kKMGTP]?B/s)\s*\]')
+_DOWNLOAD_RATE_RE = re.compile(r'[\d.?]\s*[kKMGTP]?B/s')
+
 
 def _parse_training_log(text: str) -> dict:
     """Extract (step, total, loss, speed, eta, loss_curve) from raw log text.
@@ -5522,6 +6721,10 @@ def _parse_training_log(text: str) -> dict:
         # contains incidental 'X/Y' text (dataset counts, resolutions) that must not
         # be read as progress.
         if '%|' not in seg and not lm:
+            continue
+        # A byte bar is a download, not a training step: '0.00/26.3G' read as
+        # step 0 of 26 is worse than no number at all.
+        if _DOWNLOAD_RATE_RE.search(seg):
             continue
         sm = None
         for sm in _PROG_STEP_RE.finditer(seg):
@@ -5552,6 +6755,40 @@ def _parse_training_log(text: str) -> dict:
         curve = [curve[int(i * stride)] for i in range(_PROG_CURVE_MAX_POINTS - 1)] + [curve[-1]]
     out['loss_curve'] = curve
     return out
+
+
+def parse_download_progress(text: str) -> dict | None:
+    """The LAST byte-counter bar in the log, or None when there is none.
+
+    Pure function. Returns the figures exactly as tqdm printed them — strings,
+    not converted numbers: '1.95G' is what the log says, and inventing
+    1.95 × 1024³ bytes from it would be a number the log never contained (the
+    unit divisor is the producer's choice, not ours). The caller displays them
+    and compares `done` for movement; neither needs a conversion.
+
+    Degrades on purpose: this format belongs to huggingface_hub/tqdm and can
+    change or be absent (some phases print no bar at all). Anything that does
+    not match EVERY field is not guessed at — it yields None, and the caller
+    keeps whatever it was already showing."""
+    last = None
+    for seg in re.split(r'[\r\n]+', text or ''):
+        m = _DOWNLOAD_PROG_RE.search(seg)
+        if m:
+            last = m
+    if last is None:
+        return None
+    label = last.group('label').strip()
+    # tqdm re-prints the bar with a bumped elapsed even while the byte counter
+    # is frozen (measured on the run-121 log: 1.95G at 15:11, then at 15:30).
+    # 'done' is therefore the only field that means "it moved".
+    return {'label': label[-60:] or 'download',
+            'percent': min(100, int(last.group('percent'))),
+            'done': last.group('done').strip(),
+            'total': last.group('total').strip(),
+            'elapsed': last.group('elapsed'),
+            'eta': None if '?' in last.group('eta') else last.group('eta'),
+            'speed': (None if '?' in last.group('speed')
+                      else last.group('speed').strip())}
 
 
 def _samples_dir(user_id, dataset_id, base_model=_PERSISTED, family=None,
@@ -5604,6 +6841,12 @@ def score_checkpoint_samples(user_id, dataset_id, base_model=_PERSISTED, family=
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
+    # Same InsightFace lane as the dataset pass -> same single rule. Ranking epochs
+    # by a similarity the model cannot measure would recommend a checkpoint at
+    # random while looking authoritative; `reason` is already what the UI shows.
+    blocked = fds.face_scoring_block_reason(ds)
+    if blocked:
+        return {'available': False, 'reason': blocked}
     if not ds.ref_filename:
         return {'available': False, 'reason': 'this dataset has no reference photo'}
     ref_path = os.path.join(fds._dataset_dir(ds.id), ds.ref_filename)
@@ -5651,11 +6894,13 @@ def training_progress(user_id, dataset_id, base_model=_PERSISTED, family=None,
     active = (bool(queue_manager._get_system_state('training_in_progress', False))
               and cur_id is not None and int(cur_id) == int(dataset_id)
               and _pid_alive(queue_manager._get_system_state('training_pid', None)))
-    log_path = os.path.join(
-        str(_output_dir() / _run_name(ds, base_model, family, variant)),
-        'training.log')
+    log_path = _run_log_path(ds, base_model, family, variant)
     parsed = {'step': None, 'total': None, 'loss': None, 'speed': None, 'eta': None,
               'loss_curve': []}
+    # A local run downloads its base weights too (the first run of a family
+    # pulls tens of GB from Hugging Face), and showed the same motionless
+    # 'Starting up...' the cloud card showed. Same parser, same degradation.
+    download = None
     log_exists = os.path.isfile(log_path)
     if log_exists:
         try:
@@ -5663,10 +6908,13 @@ def training_progress(user_id, dataset_id, base_model=_PERSISTED, family=None,
             with open(log_path, encoding='utf-8', errors='replace') as fh:
                 if size > _PROG_LOG_MAX_BYTES:
                     fh.seek(size - _PROG_LOG_MAX_BYTES)
-                parsed = _parse_training_log(fh.read())
+                text = fh.read()
+            parsed = _parse_training_log(text)
+            download = parse_download_progress(text)
         except OSError:
             log_exists = False
     return {'active': active, 'log_exists': log_exists, **parsed,
+            'download': download,
             'masks_skipped': bool(active and queue_manager._get_system_state('training_masks_skipped', False)),
             'samples': list_training_samples(
                 user_id, dataset_id, base_model, family, variant=variant)}
@@ -5820,6 +7068,12 @@ def enqueue_training(user_id, dataset_id, extra_steps=None,
             "ai-toolkit doesn't support Qwen-Image-Edit yet (qwen_image_edit arch missing) - "
             "update it (git pull) before queuing a Qwen-Image-Edit LoRA, or switch "
             "the variant to base Qwen-Image.")
+    # Anima : même garde qu'au lancement (arch d'extension, PR #860). Anima has
+    # no engine axis (ai-toolkit only), so this is unconditional.
+    if ttype == 'anima' and not _aitoolkit_supports_anima():
+        raise ValueError(
+            "ai-toolkit doesn't support Anima yet (anima arch missing) - "
+            "update it (git pull) before queuing an Anima LoRA.")
     # Slider mode : même garde qu'au lancement (musubi n'a aucune notion de slider).
     if eng == 'musubi' and slider_mode_enabled(ds):
         raise ValueError(
@@ -6005,8 +7259,7 @@ def _snapshot_final_checkpoint(dataset_id, step, base_model=_PERSISTED,
     if not ds:
         return None
     trigger = _safe_trigger(ds)
-    run = str(_output_dir() / _run_name(
-        ds, base_model, family, variant) / f'lora_{trigger}')
+    run = str(_run_root(ds, base_model, family, variant) / f'lora_{trigger}')
     final = os.path.join(run, f'lora_{trigger}.safetensors')
     numbered = os.path.join(run, f'lora_{trigger}_{step:09d}.safetensors')
     if not os.path.isfile(final) or os.path.exists(numbered):

@@ -25,13 +25,19 @@ def _reset_config_cache():
 
 
 def _patch_overrides(monkeypatch, mapping):
-    """Make cfg.get answer identity_prompts.<kind> from `mapping`, default else."""
+    """Make cfg.get answer identity_prompts.* from a nested `mapping` shaped like
+    the real config node, walked dotted-path style exactly as config.get does."""
     import app.config as cfg
 
     def fake_get(key, default=None):
-        if key.startswith('identity_prompts.'):
-            return mapping.get(key.split('.', 1)[1], default)
-        return default
+        if not key.startswith('identity_prompts.'):
+            return default
+        node = mapping
+        for part in key.split('.')[1:]:
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
 
     monkeypatch.setattr(cfg, 'get', fake_get)
 
@@ -43,15 +49,22 @@ def test_default_registry_matches_constants():
     assert fv.identity_prompt_default('face_multi') == fv.IDENTITY_GUARD_MULTI
     assert fv.identity_prompt_default('klein_identity') == fv.IDENTITY_GUARD_KLEIN
     assert fv.identity_prompt_default('klein_improve') == fv.KLEIN_IMAGE_IMPROVE_PROMPT
-    assert set(fv.IDENTITY_PROMPT_KINDS) == set(fv._IDENTITY_PROMPT_DEFAULTS)
+    # The registry now also holds the five prompt PARTS that used to be
+    # hardcoded; the four identity kinds keep their exact meaning above.
+    assert (set(fv.IDENTITY_PROMPT_KINDS) | set(fv.PROMPT_PART_KINDS)
+            == set(fv._IDENTITY_PROMPT_DEFAULTS))
 
 
 def test_identity_prompt_defaults_returns_all_four_constants():
     d = fv.identity_prompt_defaults()
-    assert d == {'face_single': fv.IDENTITY_GUARD, 'face_multi': fv.IDENTITY_GUARD_MULTI,
-                 'klein_identity': fv.IDENTITY_GUARD_KLEIN,
-                 'klein_improve': fv.KLEIN_IMAGE_IMPROVE_PROMPT,
-                 'qwen_edit_identity': fv.IDENTITY_GUARD_QWEN_EDIT}
+    for kind, const in (('face_single', fv.IDENTITY_GUARD),
+                        ('face_multi', fv.IDENTITY_GUARD_MULTI),
+                        ('klein_identity', fv.IDENTITY_GUARD_KLEIN),
+                        ('klein_improve', fv.KLEIN_IMAGE_IMPROVE_PROMPT),
+                        ('qwen_edit_identity', fv.IDENTITY_GUARD_QWEN_EDIT)):
+        assert d[kind] == const, kind
+    # ...alongside the five parts that became editable in the same mechanism.
+    assert set(d) == set(fv.IDENTITY_PROMPT_KINDS) | set(fv.PROMPT_PART_KINDS)
     # a copy, not the live registry — a mutating caller cannot corrupt defaults
     d['face_single'] = 'x'
     assert fv.identity_prompt_default('face_single') == fv.IDENTITY_GUARD
@@ -109,7 +122,15 @@ def test_config_defaults_are_additive_and_blank():
     ip = DEFAULTS['identity_prompts']
     assert ip == {'face_single': '', 'face_multi': '', 'klein_identity': '',
                   'klein_improve': '', 'klein_improve_enabled': True,
-                  'qwen_edit_identity': ''}
+                  'qwen_edit_identity': '',
+                  'markings_lock': '', 'outfit_vary': '', 'expression_neutral': '',
+                  'outfit_palette': '', 'render_tail_sfw': '', 'render_tail_nsfw': '',
+                  'framing_face': '', 'framing_bust': '', 'framing_body': '',
+                  'framing_back': '',
+                  'by_subject': {}}
+    # EVERY editable prompt part ships blank: blank is what makes the default path
+    # byte-identical, and a shipped copy of the default text would freeze it.
+    assert all(ip[k] == '' for k in fv.PROMPT_PART_KINDS)
 
 
 # --- D: Klein-improve toggle + override (service path) -----------------------

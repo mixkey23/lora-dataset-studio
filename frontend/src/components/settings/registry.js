@@ -7,7 +7,8 @@ export const SETTINGS_SECTIONS = [
     keywords: ['status', 'summary', 'capabilities', 'ready'] },
   { id: 'engines', title: 'Image engines', icon: '🎨', eyebrow: 'generation',
     description: 'API keys and engines used to generate dataset images.',
-    keywords: ['gemini', 'openai', 'api key', 'chatgpt', 'nano banana', 'klein', 'engine', 'subscription', 'gpt-image',
+    keywords: ['gemini', 'openai', 'openrouter', 'api key', 'chatgpt', 'nano banana', 'klein', 'krea', 'krea 2 edit',
+      'grounding', 'engine', 'subscription', 'gpt-image',
       'lora', 'preset', 'texture', 'anatomy', 'nsfw', 'identity', 'prompt', 'guard', 'improve', 'upscale'] },
   { id: 'scraping', title: 'Scraping & sources', icon: '🔎', eyebrow: 'sources',
     description: 'Credentials used when scanning image sources.',
@@ -39,7 +40,7 @@ export function sectionStatus(id, caps) {
   const e = c.engines || {}
   switch (id) {
     case 'engines':
-      return (e.nanobanana || e.chatgpt || e.klein) ? 'ready' : 'off'
+      return (e.nanobanana || e.chatgpt || e.openrouter || e.klein || e.krea) ? 'ready' : 'off'
     case 'local-tools': {
       const parts = [
         !!(c.comfyui && c.comfyui.reachable),

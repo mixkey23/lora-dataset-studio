@@ -12,6 +12,19 @@ test('the launch dialog posts the three config keys the backend expects', () => 
   assert.match(dialog, /resolve_dups:\s*autoRejectOn\s*&&\s*resolveDups/);
 });
 
+test('the overnight dialog offers no non-verdict flag; the attended button prints its caveat', () => {
+  // The unattended funnel must never offer to bulk-reject on a provenance HINT.
+  const list = dialog.match(/const QUALITY_FLAGS = \[([^\]]*)\]/);
+  assert.ok(list, 'found the dialog flag list');
+  assert.doesNotMatch(list[1], /soft_detail/);
+  assert.doesNotMatch(list[1], /bars/);
+  // The standalone 🧹 Auto-reject still offers them — with the caveat SHOWN,
+  // not left in a title= tooltip nobody sees on a phone.
+  assert.match(ws, /QUALITY_REJECT_FLAGS = \['blur', 'noise', 'uniform', 'small', 'soft_detail', 'bars'\]/);
+  assert.match(ws, /\{FLAG_HINT\[f\] && \(/);
+  assert.match(ws, /check before mass-rejecting/);
+});
+
 test('captioning is OFF by default; auto-reject defaults to blur+uniform and keep-best dedup', () => {
   // Default checked set never includes caption.
   const m = dialog.match(/useState\(\(\)\s*=>\s*new Set\(\s*\[([^\]]*)\]/);

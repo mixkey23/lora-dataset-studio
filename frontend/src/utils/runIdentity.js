@@ -31,6 +31,42 @@ export function localRunIdentity(checkpoints) {
   return { source: c.run_source === 'cloud' ? 'cloud' : 'local', id: c.run_id };
 }
 
+/* ── ONE number for a run, across every lineage surface ──────────────────────
+   A run has two identifiers: its provenance RECORD id (the stable key — every
+   run has one, local or cloud) and, for a rented-GPU run, the CLOUD run id. The
+   lineage surfaces disagreed: the graph card and the tree printed the cloud id
+   ("#103") while the inspector printed the record id ("Run #107"), so clicking a
+   card opened a panel bearing a different number with nothing tying them.
+
+   The record id wins as THE run number: a local run has no cloud id at all, so
+   the cloud id cannot BE a run's identity. The cloud id is not hidden — it is
+   shown as an explicit secondary ("Run #107 · cloud #103"), never as a bare
+   number that reads like the run's own.
+
+   Display only: no stored key changes. What was keyed by record id (checkpoint
+   selections, notes) or by cloud run id (Runs deep links, checkpoint replays)
+   still addresses exactly what it did before. */
+
+// The run's own number as text: `#107`. Unknown id → `#?`, never `#undefined`.
+export function runNumber(node) {
+  const id = node?.record_id;
+  return `#${id == null ? '?' : id}`;
+}
+
+// The cloud run id when this run trained in the cloud and has one, else null —
+// a local run answers null, which is exactly why it cannot be the identity.
+export function cloudNumber(node) {
+  if (!node || node.source !== 'cloud') return null;
+  return node.run_id == null ? null : node.run_id;
+}
+
+// Full identity for a heading or tooltip: `Run #107 · cloud #103`, or plain
+// `Run #107` when no cloud run is behind it.
+export function runIdentityLabel(node) {
+  const cloud = cloudNumber(node);
+  return `Run ${runNumber(node)}${cloud == null ? '' : ` · cloud #${cloud}`}`;
+}
+
 // Per-run grouped cloud checkpoints for the Checkpoints panel. Prefers the
 // server's grouped payload; if only the legacy flat list is present, rebuilds
 // groups by run_id so an older server still renders one header per run.

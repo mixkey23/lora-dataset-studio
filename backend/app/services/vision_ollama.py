@@ -318,6 +318,15 @@ def unload_vision_model(*, ollama_url: str | None = None, model: str | None = No
     except Exception as e:
         logger.warning('vision_ollama: unload url/model resolution échouée : %s', e)
         return False
+    # Whatever the outcome, this process is no longer *asking* for the model to
+    # stay resident: drop any keep-warm lease so a later revoke() doesn't fire a
+    # second, pointless unload. Batch passes end with this call, which is exactly
+    # where their (unleased) warm period ends too.
+    try:
+        from .vision_keepalive import forget_lease
+        forget_lease()
+    except Exception:
+        pass
     for attempt in (1, 2):
         try:
             requests.post(f'{url}/api/generate', json=payload, timeout=(10, 30))

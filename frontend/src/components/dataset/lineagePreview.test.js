@@ -4,6 +4,8 @@ import {
   checkpointKey, toggleCheckpointSelection, selectedCheckpointRefs,
   describePreviewSelection, parseSeedInput,
   checkpointDeployed, lineageImportPayload,
+  lineageDeletePayload, checkpointDeleteTarget, checkpointIsBestSettings,
+  checkpointUndeployAction, describeCheckpointDelete,
 } from './lineagePreview.js';
 
 const pills = new Map([
@@ -100,4 +102,167 @@ test('parseSeedInput: blank → null (engine picks), int → number, junk → er
   assert.ok(parseSeedInput('-1').error);
   assert.ok(parseSeedInput('1.5').error);
   assert.ok(parseSeedInput('abc').error);
+});
+
+// --- 🗑 Delete this save (graph popover) -----------------------------------
+
+test('lineageDeletePayload: a cloud pill carries its cloud_run_id', () => {
+  const node = { source: 'cloud', run_id: 42, train_type: 'zimage', variant: 'base', base_model: '' };
+  const body = lineageDeletePayload(node, { step: 2000, filename: 'e2000.safetensors' });
+  assert.equal(body.cloud_run_id, 42);
+  assert.equal(body.filename, 'e2000.safetensors');
+});
+
+test('lineageDeletePayload: a local pill carries base/family/variant, no run id', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'sd_xl_base.safetensors' };
+  const body = lineageDeletePayload(node, { step: 1000, filename: 'lora_001000.safetensors' });
+  assert.equal('cloud_run_id' in body, false);
+  assert.deepEqual(body, {
+    filename: 'lora_001000.safetensors',
+    base_model: 'sd_xl_base.safetensors', train_type: 'sdxl', variant: 'base',
+  });
+});
+
+test('lineageDeletePayload: null rather than a body that would hit the wrong file', () => {
+  assert.equal(lineageDeletePayload(null, { filename: 'x' }), null);
+  assert.equal(lineageDeletePayload({ source: 'local' }, { step: 1 }), null);   // no filename
+  // a cloud node with no resolved run would be deleted as a LOCAL file — refuse
+  assert.equal(lineageDeletePayload({ source: 'cloud', run_id: null }, { filename: 'x' }), null);
+});
+
+test('checkpointIsBestSettings matches on the basename, both sides', () => {
+  const pill = { filename: 'lora_001000.safetensors' };
+  assert.equal(checkpointIsBestSettings(pill, 'loras/zimage/lora_001000.safetensors'), true);
+  const winPath = ['C:', 'loras', 'lora_001000.safetensors'].join(String.fromCharCode(92));
+  assert.equal(checkpointIsBestSettings(pill, winPath), true);
+  assert.equal(checkpointIsBestSettings(pill, 'lora_002000.safetensors'), false);
+  assert.equal(checkpointIsBestSettings(pill, null), false);   // pin unknown → no false alarm
+});
+
+
+test('checkpointIsBestSettings also matches the DEPLOYED name of a deployed pill', () => {
+  const pill = { filename: 'lora_001000.safetensors', testable: true,
+    deployed_filename: 'z image/lora_nova_000001000_rc90_v2.safetensors' };
+  assert.equal(checkpointIsBestSettings(pill, 'lora_nova_000001000_rc90_v2.safetensors'), true);
+});
+
+test('checkpointDeleteTarget: a DEPLOYED pill aims at the ComfyUI copy', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const pill = { step: 1000, filename: 'lora_001000.safetensors', testable: true,
+    deployed_filename: 'sdxl/lora_nova_000001000_rl7.safetensors' };
+  const t = checkpointDeleteTarget(node, pill);
+  assert.equal(t.kind, 'deployed');
+  assert.equal(t.path, 'train/checkpoint/delete');          // the imported-LoRA route
+  assert.deepEqual(t.body, { filename: 'sdxl/lora_nova_000001000_rl7.safetensors', train_type: 'sdxl' });
+  assert.match(t.label, /ComfyUI/);
+});
+
+test('checkpointDeleteTarget: the SAME pill undeployed aims at the training save', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const pill = { step: 1000, filename: 'lora_001000.safetensors', testable: false };
+  const t = checkpointDeleteTarget(node, pill);
+  assert.equal(t.kind, 'save');
+  assert.equal(t.path, 'train/run-checkpoint/delete');       // the RUN save route
+  assert.equal(t.body.filename, 'lora_001000.safetensors');
+  assert.match(t.label, /training save/i);
+});
+
+test('checkpointDeleteTarget: a cloud save carries cloud_run_id, a cloud deploy does not', () => {
+  const node = { source: 'cloud', run_id: 42, status: 'done', train_type: 'zimage', variant: 'base', base_model: '' };
+  const save = checkpointDeleteTarget(node, { step: 2000, filename: 'e2000.safetensors' });
+  assert.equal(save.body.cloud_run_id, 42);
+  const deployed = checkpointDeleteTarget(node, { step: 2000, filename: 'e2000.safetensors',
+    testable: true, deployed_filename: 'z image/lds42_e2000_rc42.safetensors' });
+  assert.equal(deployed.kind, 'deployed');
+  assert.equal('cloud_run_id' in deployed.body, false);      // the loras folder has no run scope
+});
+
+test('checkpointDeleteTarget: nothing to delete → no action', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  assert.equal(checkpointDeleteTarget(node, { step: 1, filename: 'a.safetensors', present: false }), null);
+  // deployed but the deployed copy's own name is unknown → the route would reject it
+  assert.equal(checkpointDeleteTarget(node, { step: 1, filename: 'a.safetensors', testable: true }), null);
+  // a cloud run still syncing epochs down keeps its saves
+  const training = { source: 'cloud', run_id: 7, status: 'training', train_type: 'zimage' };
+  assert.equal(checkpointDeleteTarget(training, { step: 1, filename: 'a.safetensors' }), null);
+});
+
+test('checkpointUndeployAction: same file as the deployed target, reversible wording', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const pill = { step: 1000, filename: 'lora_001000.safetensors', testable: true,
+    deployed_filename: 'sdxl/lora_nova_000001000_rl7.safetensors' };
+  const target = checkpointDeleteTarget(node, pill);
+  const undeploy = checkpointUndeployAction(node, pill);
+  // The invariant: the explicit ⏏ Undeploy is the SAME operation the delete
+  // target already described — route and body identical, only the framing differs.
+  assert.equal(undeploy.path, target.path);
+  assert.deepEqual(undeploy.body, target.body);
+  assert.equal(undeploy.filename, target.filename);
+  assert.equal(undeploy.label, 'Undeploy');
+  assert.match(undeploy.title, /Reversible/);
+  assert.match(undeploy.title, /deploy it again/);
+});
+
+test('checkpointUndeployAction: nothing to undeploy on a pill that is not deployed', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  // a plain pill has a delete target, but it aims at the SAVE — never an undeploy
+  assert.equal(checkpointUndeployAction(node, { step: 1, filename: 'a.safetensors' }), null);
+  // deployed but the ComfyUI copy's own name is unknown → no action at all
+  assert.equal(checkpointUndeployAction(node, { step: 1, filename: 'a.safetensors', testable: true }), null);
+  // a cloud run still syncing: the whole pill offers nothing
+  const training = { source: 'cloud', run_id: 7, status: 'training', train_type: 'zimage' };
+  assert.equal(checkpointUndeployAction(training,
+    { step: 1, filename: 'a.safetensors', testable: true, deployed_filename: 'z image/a.safetensors' }), null);
+});
+
+test('describeCheckpointDelete names the target of the moment and what survives', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const deployed = describeCheckpointDelete(node,
+    { step: 1000, filename: 'lora_001000.safetensors', testable: true,
+      deployed_filename: 'sdxl/lora_nova_000001000_rl7.safetensors' });
+  assert.equal(deployed.kind, 'deployed');
+  assert.match(deployed.message, /REMOVE FROM COMFYUI/);
+  assert.match(deployed.message, /training save in the run folder is KEPT/);
+  assert.match(deployed.message, /frees no space/);
+  assert.match(deployed.message, /trash/i);
+  assert.doesNotMatch(deployed.message, /DELETE THE TRAINING SAVE/);
+
+  const save = describeCheckpointDelete(node, { step: 1000, filename: 'lora_001000.safetensors' });
+  assert.equal(save.kind, 'save');
+  assert.match(save.message, /DELETE THE TRAINING SAVE/);
+  assert.match(save.message, /isn't imported/);
+  assert.match(save.message, /trash — recoverable until you empty it in Settings/);
+  assert.doesNotMatch(save.message, /REMOVE FROM COMFYUI/);
+});
+
+test('describeCheckpointDelete warns on ★ best settings, wording per target', () => {
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const pill = { step: 1000, filename: 'lora_001000.safetensors', testable: true,
+    deployed_filename: 'sdxl/lora_001000.safetensors' };
+  const best = describeCheckpointDelete(node, pill, { bestSettingsLora: 'loras/lora_001000.safetensors' });
+  assert.equal(best.isBest, true);
+  assert.match(best.message, /★ BEST SETTINGS/);
+  assert.match(best.message, /saved combo will stop working/);
+  const plain = describeCheckpointDelete(node, pill, { bestSettingsLora: 'loras/other.safetensors' });
+  assert.equal(plain.isBest, false);
+  assert.doesNotMatch(plain.message, /BEST SETTINGS/);
+});
+
+test('describeCheckpointDelete warns for a pin held in ANY family', () => {
+  // The pin is stored per family, so the payload hands over a LIST. A dataset
+  // with a winning ZIT combo and a winning SDXL one must be warned about both.
+  const node = { source: 'local', train_type: 'sdxl', variant: 'base', base_model: 'b' };
+  const pill = { step: 1000, filename: 'lora_001000.safetensors', testable: true,
+    deployed_filename: 'sdxl/lora_001000.safetensors' };
+  const list = ['zimage/other_002000.safetensors', 'loras/lora_001000.safetensors'];
+  assert.equal(describeCheckpointDelete(node, pill, { bestSettingsLora: list }).isBest, true);
+  assert.equal(
+    describeCheckpointDelete(node, pill, { bestSettingsLora: ['loras/nope.safetensors'] }).isBest,
+    false);
+  // An empty list is "no pin", not "everything is pinned".
+  assert.equal(describeCheckpointDelete(node, pill, { bestSettingsLora: [] }).isBest, false);
+});
+
+test('describeCheckpointDelete: null when there is nothing to delete', () => {
+  assert.equal(describeCheckpointDelete({ source: 'local' }, { step: 1 }), null);
 });

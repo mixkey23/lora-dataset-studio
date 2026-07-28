@@ -5,6 +5,16 @@ import { isSmallImageRescueRow } from '../../utils/smallImageRescue';
 import CaptionEditorDialog from './CaptionEditorDialog';
 import PromptEditPopover from './PromptEditPopover';
 import PexelsAttribution from './PexelsAttribution';
+import { ENGINE_ACCENTS, ENGINE_LABELS } from './engineSelection.js';
+import { canRegenerateGeneric, improveRerunAffordance, isImageImproveRow } from './improveRerun.js';
+import { FACE_BADGE_CLASS, PROVENANCE_BADGE_CLASS, TILE_BADGE_STACK_CLASS,
+  WATERMARK_BADGE_CLASS } from './tileBadgeLayout.js';
+
+const DERIVATION_LABEL = {
+  klein_small_image: 'Klein rescue',
+  small_image_source: 'rescue original',
+  klein_image_improve: 'Klein improve',
+};
 
 const STATUS_CLS = {
   keep: 'border-green-500',
@@ -60,7 +70,7 @@ const WATERMARK_BADGE = {
 
 export default function DatasetGridItem({ img, datasetId, onStatus, onCaption, onCrop, onDelete,
                                           onMirror, mirrorBusy = false, busy = false,
-                                          onRegenerate, onView, nonce = 0, faceThresholds,
+                                          onRegenerate, onReimprove, onView, nonce = 0, faceThresholds,
                                           selected = false, onToggleSelect, tileSize = 'M',
                                           datasetKind = 'character', dualCaptions = false }) {
   const [cap, setCap] = useState(img.caption || '');
@@ -82,10 +92,11 @@ export default function DatasetGridItem({ img, datasetId, onStatus, onCaption, o
   const isRescueDerived = isSmallImageRescueRow(img);
   // A manual Klein improvement is derived from THIS image, not the dataset's
   // main reference. Sending it through the generic regenerate route would lose
-  // that source and silently make an unrelated variation instead.
-  const isImageImproveCandidate = img.derivation_kind === 'klein_image_improve';
-  const canRegenerate = !isRescueDerived && !isImageImproveCandidate && img.source === 'generated'
-    && !(img.status === 'pending' && !img.filename);
+  // that source and silently make an unrelated variation instead — so it gets
+  // its OWN re-run below (same parent, current improve settings) instead.
+  const isImageImproveCandidate = isImageImproveRow(img);
+  const canRegenerate = canRegenerateGeneric(img, { isRescueDerived });
+  const rerunImprove = onReimprove ? improveRerunAffordance(img) : null;
 
   const fb = faceBadge(img, faceThresholds);
   const wb = WATERMARK_BADGE[img.watermark_state];
@@ -97,6 +108,15 @@ export default function DatasetGridItem({ img, datasetId, onStatus, onCaption, o
   // object-contain (letterboxed on the existing black tile background); S/M
   // stay object-cover so the dense overview grid reads as a clean tiled wall.
   const imgFitCls = tileSize === 'L' ? 'object-contain' : 'object-cover';
+  // Provenance badge text. Kept as data (not inline JSX) so the SAME wording
+  // can go into title/aria-label — the badge is clamped to two lines at the
+  // bottom of a narrow tile, and a truncated engine name must stay readable
+  // on hover and to a screen reader.
+  const originText = DERIVATION_LABEL[img.derivation_kind]
+    || (img.source === 'import' ? 'real' : 'generated');
+  const engineLabel = ENGINE_ACCENTS[img.engine] ? ENGINE_LABELS[img.engine] : null;
+  const provenanceTitle = [originText, img.framing, engineLabel && `made with ${engineLabel}`]
+    .filter(Boolean).join(' · ');
 
   return (
     <div tabIndex={0} aria-label={`${displayLabel(img.variation_label) || 'Dataset image'} card`}
@@ -139,25 +159,35 @@ export default function DatasetGridItem({ img, datasetId, onStatus, onCaption, o
             )}
           </div>
         )}
-        <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded text-[10px] bg-black/60 text-white pointer-events-none">
-          {img.derivation_kind === 'klein_small_image'
-            ? 'Klein rescue'
-            : img.derivation_kind === 'small_image_source'
-              ? 'rescue original'
-              : isImageImproveCandidate
-                ? 'Klein improve'
-              : img.source === 'import' ? 'real' : 'generated'}{img.framing ? ` · ${img.framing}` : ''}
-        </span>
+        {/* Bottom-anchored badge stack. A container query (index.css) lifts the
+            provenance badge back to the top-left as soon as the TILE — not the
+            window — is wide enough to hold it next to the action buttons. */}
+        <div className={TILE_BADGE_STACK_CLASS}>
+          {wb && (
+            <span className={`${WATERMARK_BADGE_CLASS} bg-black/70 ${wb.cls}`}
+              title={(img.watermark_state === 'detected' && WATERMARK_ROUTE_HINT[img.watermark_route]) || wb.label}>
+              {wb.icon} {wb.text}
+            </span>
+          )}
+          {/* Last child = closest to the bottom edge, and the engine pill names
+              which engine made it — the only way a multi-engine batch is
+              comparable ("this one came out of ChatGPT, that one out of
+              Klein"). The server sends `engine` ONLY when it can tell for sure,
+              so older rows show no pill rather than a made-up one. */}
+          <span className={`${PROVENANCE_BADGE_CLASS} bg-black/60 text-white`}
+            title={provenanceTitle} aria-label={provenanceTitle}>
+            {originText}{img.framing ? ` · ${img.framing}` : ''}
+            {engineLabel && (
+              <span className={`dataset-tile-badge__engine ml-1 px-1 rounded ${ENGINE_ACCENTS[img.engine].pill}`}>
+                {engineLabel}
+              </span>
+            )}
+          </span>
+        </div>
         {fb && (
-          <span className={`absolute top-6 left-1 px-1.5 py-0.5 rounded text-[10px] bg-black/70 ${fb.cls} pointer-events-none flex items-center gap-0.5`}
+          <span className={`${FACE_BADGE_CLASS} px-1.5 py-0.5 rounded bg-black/70 ${fb.cls}`}
             title={`Resemblance to the reference face — ${fb.label}`}>
             {fb.icon} 🎭 {fb.label}
-          </span>
-        )}
-        {wb && (
-          <span className={`absolute bottom-1 right-1 px-1.5 py-0.5 rounded text-[10px] bg-black/70 ${wb.cls} flex items-center gap-0.5`}
-            title={(img.watermark_state === 'detected' && WATERMARK_ROUTE_HINT[img.watermark_route]) || wb.label}>
-            {wb.icon} {wb.text}
           </span>
         )}
         <div className="dataset-grid-item__actions absolute top-1 right-1 flex max-w-[calc(100%_-_0.5rem)] flex-wrap justify-end gap-1">
@@ -174,6 +204,15 @@ export default function DatasetGridItem({ img, datasetId, onStatus, onCaption, o
               title="Edit the prompt, then regenerate this variation"
               aria-label="Edit the prompt, then regenerate this variation"
               className="px-1.5 py-0.5 rounded bg-black/60 text-white text-[10px]">✏️</button>
+          )}
+          {rerunImprove && (
+            <button type="button"
+              onClick={(e) => { e.stopPropagation(); onReimprove?.(img.id); }}
+              disabled={busy || !rerunImprove.enabled}
+              title={rerunImprove.title} aria-label={rerunImprove.title}
+              className="grid min-h-7 min-w-7 place-items-center rounded bg-black/60 text-[10px] text-white disabled:cursor-not-allowed disabled:opacity-45">
+              <span aria-hidden="true">🔄✨</span>
+            </button>
           )}
           {url && onMirror && (
             <button type="button"

@@ -15,6 +15,18 @@ or a future change reintroduces a custom node the target ComfyUI lacks, the rout
 answers one actionable "install pack X, restart ComfyUI" 409 instead of ComfyUI's
 raw 400 'missing_node_type'.
 
+Widget VALUES are part of that portability, and this is where it was missed
+(2026-07-27, reported by IndependentProcess0 on Reddit). Node 77 used to sample
+with `scheduler: "beta57"`, which is NOT a ComfyUI scheduler: the RES4LYF pack
+appends it to the CORE list at import (`SCHEDULER_NAMES.append("beta57")`), so on
+the machine this workflow was captured on even a plain KSampler accepted it — and
+on every install without that pack, generation died with ComfyUI's raw
+"Value not in list: scheduler". The graph contained no third-party NODE, so the
+preflight above saw nothing wrong. It now uses `simple`, which every ComfyUI has
+and which four other shipped graphs already use. Do not "improve" it back to a
+value that works on your machine without checking it against a stock install —
+`backend/tests/test_workflow_portability.py` enforces exactly that, offline.
+
 Lifted from the parent project's app/services/klein_edit_helper.py for LoRA
 Dataset Studio: SRC's module-level COMFYUI_INPUT_DIR/COMFYUI_OUTPUT_DIR constants
 become live `cfg.comfyui_dir(...)` calls (config.json changes take effect without
@@ -26,12 +38,12 @@ from __future__ import annotations
 import logging
 import os
 import random
-import shutil
 import time
 import uuid
 
 from .. import config as cfg
 from . import comfy_model_paths
+from ..utils import comfy_fs
 from ..utils.comfyui import load_workflow_local
 from ..job_queue import queue_manager
 
@@ -50,7 +62,11 @@ _REQUIRED_NODES = ('52', '6', '77', '9', '114', '10', '90')
 # action that provides each. REQUIRED = the graph is invalid without it (block +
 # auto-download); RECOMMENDED = quality only (the consistency LoRA — degrade).
 KLEIN_REQUIRED = ('klein_model', 'klein_text_encoder', 'klein_vae')
-KLEIN_RECOMMENDED = ('klein_lora',)
+KLEIN_RECOMMENDED = ('klein_lora', 'klein_enhancement_lora')
+# The detail LoRA node 139 of the improve workflow loads. Kept as a constant
+# because the node is BYPASSED when the file is absent, so its presence is what
+# decides whether the "Upscale & improve" enhancement strength does anything.
+ENHANCEMENT_LORA_NAME = os.path.join('klein', 'realistic.safetensors')
 
 _MODEL_SUFFIXES = ('.safetensors', '.gguf', '.sft')
 
@@ -159,8 +175,16 @@ def resolve_klein_unet(selected=None):
     for sub, names in folders:
         if canonical in names:
             return os.path.join(sub, canonical)
-    sub, names = folders[0]
-    return os.path.join(sub, names[0])
+    # Last-resort pick: only from files a loader can actually OPEN. Listing and
+    # loading are different questions, and conflating them let the Krea resolver
+    # choose a .gguf on its own (see comfy_model_paths.is_loadable_model). An
+    # explicit pick above is still honoured as-is -- if the user names a file,
+    # the failure must be about THEIR file, not silently about another one.
+    for sub, names in folders:
+        for n in names:
+            if comfy_model_paths.is_loadable_model(n):
+                return os.path.join(sub, n)
+    return None
 
 
 def resolve_klein_vae():
@@ -291,6 +315,8 @@ def klein_missing_assets():
     _, lora_path = _consistency_lora()
     if not (lora_path and os.path.exists(lora_path)):
         missing.append('klein_lora')
+    if not _lora_abs(ENHANCEMENT_LORA_NAME):
+        missing.append('klein_enhancement_lora')
     return missing
 
 
@@ -348,6 +374,9 @@ def _klein_asset_paths():
     _, lora_path = _consistency_lora()
     if lora_path and os.path.exists(lora_path):
         paths['klein_lora'] = lora_path
+    enhancement = _lora_abs(ENHANCEMENT_LORA_NAME)
+    if enhancement:
+        paths['klein_enhancement_lora'] = enhancement
     return paths
 
 
@@ -377,6 +406,41 @@ def klein_invalid_assets():
                     'verdict': res['verdict'], 'blocking': res['blocking'],
                     'reason': res['reason']})
     return out
+
+
+def klein_blocking_invalid(invalid=None) -> bool:
+    """Is a REQUIRED Klein asset present but unloadable? Advisory `too_small` does
+    not count — a small-but-loadable file is the user's, not ours."""
+    return any(i['blocking'] and i['asset'] in KLEIN_REQUIRED
+               for i in (klein_invalid_assets() if invalid is None else invalid))
+
+
+def klein_engine_ready(comfy_ok, *, missing=None, invalid=None, unsupported_enums=None) -> bool:
+    """THE Klein readiness verdict — ONE implementation, four conditions.
+
+    It lived inline in capabilities (as `klein_ready`, behind `engines.klein` and
+    `watermark_klein`) while watermark_klein.is_available() judged the same engine
+    on presence alone. Two sincere answers to one question is how a truncated
+    weight gets a green button on one screen and a refusal on the next — the exact
+    shape of the Setup incident (54e5011). The looser copy also decided a SILENT
+    fallback: the bank/dataset cleaner drops to LaMa when Klein is "unavailable",
+    so an over-permissive verdict meant asking ComfyUI to load a file it cannot
+    open instead of degrading cleanly.
+
+    Callers that already hold the raw ingredients (capabilities recomputes them for
+    its payload) pass them in; everyone else lets this fetch them. Each probe is
+    cheap: disk listdir for the assets, a header read + cache for integrity, a
+    cached /object_info for the widget values (which fails OPEN — an unreachable
+    ComfyUI is already answered by `comfy_ok`)."""
+    if not comfy_ok:
+        return False
+    enums = klein_unsupported_enums() if unsupported_enums is None else unsupported_enums
+    if enums:
+        return False
+    gaps = klein_missing_assets() if missing is None else missing
+    if any(a in gaps for a in KLEIN_REQUIRED):
+        return False
+    return not klein_blocking_invalid(invalid)
 
 
 # --- Custom-node preflight -------------------------------------------------
@@ -434,6 +498,42 @@ def klein_missing_nodes(workflow=None):
     return out
 
 
+_enums_ok_until = 0.0
+
+
+def klein_unsupported_enums(workflow=None):
+    """[{node_id, class_type, input, value, pack, url}] for every widget value the
+    Klein edit workflow pins that the target ComfyUI does NOT accept. Loads the
+    shipped 'improve skin.json' when no `workflow` is given.
+
+    Sibling of `klein_missing_nodes`, and the gap it leaves: that one compares
+    class_types, so a graph built entirely from CORE nodes passes it — and then
+    dies on a core KSampler because one of its VALUES (the `beta57` scheduler,
+    which the RES4LYF pack registers into core) isn't there. Same probe, same
+    /object_info payload, one level deeper into it.
+
+    Same success-only TTL as the node verdict, and for the same reason: the
+    capabilities probe calls this every 30 s, /object_info is a multi-MB payload,
+    and its own cache is only 60 s — without this the app would re-download it
+    every minute, forever, on a machine that is perfectly fine. Only an
+    "everything supported" verdict is cached; a gap or an unreachable probe is
+    never cached, so installing the missing pack and restarting ComfyUI clears the
+    warning immediately instead of after a delay.
+
+    FAIL-OPEN: [] when /object_info can't be fetched."""
+    global _enums_ok_until
+    from ..utils.comfyui import unsupported_enum_values
+    shipped = workflow is None
+    if shipped:
+        if time.time() < _enums_ok_until:
+            return []
+        workflow = load_workflow_local(str(WORKFLOW_IMPROVE_SKIN_PATH)) or {}
+    found = unsupported_enum_values(workflow)
+    if shipped and not found:
+        _enums_ok_until = time.time() + _NODES_OK_TTL_S
+    return found
+
+
 def format_missing_nodes_message(missing_nodes):
     """Human sentence for a Klein node-missing 409: each missing class_type with the
     pack that provides it + its GitHub link, then the fix instruction. Reused by
@@ -484,7 +584,8 @@ def _comfy_output_dir():
 def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
                        extra_metadata=None, lora_strength=None, source_path=None,
                        extra_ref_paths=None, sampler_steps=None,
-                       base_lora_strength=None, generation_loras=None):
+                       base_lora_strength=None, generation_loras=None,
+                       output_megapixels=None):
     """Copy the source into ComfyUI input, configure the single Klein edit
     workflow, and enqueue it. Returns the app job_id. Raises ValueError on a
     missing source / unloadable workflow / missing required node, RuntimeError
@@ -530,10 +631,14 @@ def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
     if any(a in missing for a in KLEIN_REQUIRED):
         raise KleinModelsMissing(missing)
 
-    comfy_input_dir = _comfy_input_dir()
+    # The source image reaches ComfyUI over the FILESYSTEM, not the API — see
+    # utils/comfy_fs.py. Staged through the guard so a folder that isn't shared
+    # with ComfyUI's container/host says so (409) instead of raising a bare OSError
+    # the routes can only turn into a detail-free 500 (reported by nofaceman).
+    comfy_input_dir = comfy_fs.ensure_input_usable(_comfy_input_dir())
     uid = uuid.uuid4().hex[:8]
     comfy_input = f"edit_source_{uid}_{source_filename}"
-    shutil.copy2(source_path, os.path.join(comfy_input_dir, comfy_input))
+    comfy_fs.stage_input_copy(source_path, comfy_input, comfy_input_dir)
 
     workflow["52"]["inputs"]["image"] = comfy_input
     # Prompt into the CLIPTextEncode widget directly (node 6). The old RES4LYF
@@ -545,6 +650,11 @@ def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
         workflow["77"]["inputs"]["steps"] = max(1, int(sampler_steps))
     if base_lora_strength is not None and "139" in workflow:
         workflow["139"]["inputs"]["strength_model"] = float(base_lora_strength)
+    # Output size: node 174 rescales the source to a total pixel budget before the
+    # sampler, so it IS the resolution of the result. Hardcoded at 2 MP until now,
+    # which made "Upscale" a fixed 2 MP pass whatever the source was worth.
+    if output_megapixels is not None and "174" in workflow:
+        workflow["174"]["inputs"]["megapixels"] = float(output_megapixels)
     # UNIQUE prefix per job: SaveImage numbers files from what's currently in
     # ComfyUI's output folder, and the app MOVES each result out right after
     # completion — with a shared prefix the counter kept re-issuing the same
@@ -568,7 +678,7 @@ def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
             logger.warning(f"klein multi-ref: extra ref missing on disk: {ref_path}")
             continue
         ref_input = f"edit_ref{i}_{uid}_{os.path.basename(ref_path)}"
-        shutil.copy2(ref_path, os.path.join(comfy_input_dir, ref_input))
+        comfy_fs.stage_input_copy(ref_path, ref_input, comfy_input_dir)
         load_id, scale_id = f"ds_ref{i}_load", f"ds_ref{i}_scale"
         enc_id, lat_id = f"ds_ref{i}_encode", f"ds_ref{i}_latent"
         workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_input},
@@ -614,6 +724,15 @@ def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
     if "139" not in workflow:
         logger.warning("workflow node 139 missing — consistency LoRA injection skipped")
     elif not lora_path or not os.path.exists(lora_path):
+        # A strength the CALLER deliberately passed must never be silently ignored:
+        # the job would run, look wrong, and give no clue why. Reported as a missing
+        # ASSET so the caller's existing auto-download handles it, not a bare failure.
+        # Gated on an EXPLICIT lora_strength: generation leaves it None and takes
+        # klein.consistency_strength from config, where the documented contract is to
+        # degrade and fetch the LoRA in the background — erroring there would stop
+        # people generating at all over an optional quality LoRA.
+        if lora_strength is not None and float(lora_strength) > 0:
+            raise KleinModelsMissing(['klein_lora'])
         logger.warning(f"consistency LoRA not found at {lora_path} — injection skipped")
     elif not strength or float(strength) <= 0:
         logger.info("consistency LoRA strength 0 — injection skipped (LoRA off)")
@@ -667,9 +786,20 @@ def enqueue_klein_edit(user_id, source_filename, edit_prompt, klein_model=None,
     # source app's ComfyUI and is NOT part of the Klein install — bypass it when
     # its file is absent so ComfyUI doesn't fail validation on a missing LoRA. The
     # consistency LoRA injected above (if any) stays in the chain.
-    base_lora = (workflow.get("139", {}).get("inputs", {}).get("lora_name") or '').replace('/', os.sep)
+    # Unlike the config-sourced names above (user-typed, '/'-separated), this comes
+    # straight from the shipped JSON's own value — a literal Windows '\' baked in
+    # from the source app's ComfyUI (see module docstring) — so both separators
+    # must be normalized, not just '/'.
+    base_lora = (workflow.get("139", {}).get("inputs", {}).get("lora_name") or '') \
+        .replace('\\', os.sep).replace('/', os.sep)
     base_lora_path = _lora_abs(base_lora)   # base + extra_model_paths loras roots
     if "139" in workflow and not base_lora_path:
+        # Same rule as the consistency LoRA: bypassing is fine at strength 0 (the node
+        # would contribute nothing anyway), but silently dropping it while the user
+        # asked for a real strength is what made this setting look broken — it moved
+        # no pixel and said nothing. Surface it as a missing asset so it gets fetched.
+        if base_lora_strength is not None and float(base_lora_strength) > 0:
+            raise KleinModelsMissing(['klein_enhancement_lora'])
         logger.info("base LoRA %r absent — bypassing node 139", base_lora)
         _bypass_node(workflow, "139", "model")
 

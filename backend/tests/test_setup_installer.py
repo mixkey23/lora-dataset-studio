@@ -296,12 +296,12 @@ def test_run_scrape_extras_targets_scrape_requirements(monkeypatch):
     assert any('requirements-scrape.txt' in str(part) for part in seen['cmd'])
 
 
-def test_klein_dest_path_under_validated_base(app, tmp_path):
+def test_download_dest_path_under_validated_base(app, tmp_path):
     from app import setup_installer, config
     base = _make_comfyui(tmp_path)
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(base)}})
-        dest = setup_installer._klein_dest_path('klein_lora')
+        dest = setup_installer._download_dest_path('klein_lora')
     assert dest == str(base / 'models' / 'loras' / 'klein'
                        / 'Flux2-Klein-9B-consistency-V2.safetensors')
 
@@ -314,17 +314,17 @@ def test_klein_model_dest_is_unet_klein(app, tmp_path):
     base = _make_comfyui(tmp_path)
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(base)}})
-        dest = setup_installer._klein_dest_path('klein_model')
+        dest = setup_installer._download_dest_path('klein_model')
     assert dest.endswith(os.path.join('models', 'unet', 'klein',
                                       'flux-2-klein-9b-kv-fp8.safetensors'))
 
 
-def test_klein_dest_path_requires_valid_comfyui(app, tmp_path):
+def test_download_dest_path_requires_valid_comfyui(app, tmp_path):
     from app import setup_installer, config
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(tmp_path / 'not-comfyui')}})
         with pytest.raises(setup_installer.Precondition):
-            setup_installer._klein_dest_path('klein_lora')
+            setup_installer._download_dest_path('klein_lora')
 
 
 def test_manual_command_klein_lora_is_curl_to_real_url(app, tmp_path):
@@ -349,7 +349,7 @@ def test_manual_command_klein_uses_placeholder_when_unconfigured(app, tmp_path):
     assert 'flux2-vae.safetensors' in cmd
 
 
-def test_run_klein_download_401_logs_recovery_steps(app, tmp_path, monkeypatch):
+def test_run_model_download_401_logs_recovery_steps(app, tmp_path, monkeypatch):
     """The KV UNET is a public download, but if HF ever denies access (re-gated, or
     a stale token was sent) a 401/403 must still log actionable recovery steps —
     that safety net is keyed on the spec's license_url, not the (now-False) gated
@@ -360,7 +360,7 @@ def test_run_klein_download_401_logs_recovery_steps(app, tmp_path, monkeypatch):
         config.save_config({'comfyui': {'base_dir': str(base)}})
         monkeypatch.setattr(setup_installer.requests, 'get', _FakeGet(status=401))
         setup_installer._runs['klein_model'] = setup_installer._new_run()
-        rc = setup_installer._run_klein_download('klein_model')
+        rc = setup_installer._run_model_download('klein_model')
     assert rc == 1
     log = setup_installer._runs['klein_model']['log']
     assert any('denied access' in l for l in log)
@@ -368,46 +368,59 @@ def test_run_klein_download_401_logs_recovery_steps(app, tmp_path, monkeypatch):
     assert any('HF_TOKEN' in l for l in log)
 
 
-def test_run_klein_download_accepts_legacy_unet_variant(app, tmp_path, monkeypatch):
+def test_run_model_download_accepts_legacy_unet_variant(app, tmp_path, monkeypatch):
     """An install that fetched the pre-KV model (flux-2-klein-9b-fp8.safetensors)
     must NOT be told to re-download the KV build: the legacy filename sitting in
     models/unet/klein/ counts as already installed (both resolve by name), so the
-    network is never touched."""
+    network is never touched.
+
+    The fixture writes a REAL safetensors header now: "already installed" means the
+    loader can open it, so a garbage placeholder would (correctly) be treated as a
+    corrupted download and re-fetched — see test_setup_presence_integrity."""
+    import json
+    import struct
     from app import setup_installer, config
     base = _make_comfyui(tmp_path)
     def boom(*a, **k):
         raise AssertionError('network must not be hit when a legacy Klein UNET exists')
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(base)}})
-        legacy = os.path.join(os.path.dirname(setup_installer._klein_dest_path('klein_model')),
+        legacy = os.path.join(os.path.dirname(setup_installer._download_dest_path('klein_model')),
                               'flux-2-klein-9b-fp8.safetensors')
         os.makedirs(os.path.dirname(legacy), exist_ok=True)
+        _hdr = json.dumps({'w': {'dtype': 'F16', 'shape': [1], 'data_offsets': [0, 2]}}).encode()
         with open(legacy, 'wb') as f:
-            f.write(b'pre-KV klein unet')
+            f.write(struct.pack('<Q', len(_hdr)) + _hdr + b'\x00' * 64)
         monkeypatch.setattr(setup_installer.requests, 'get', boom)
         setup_installer._runs['klein_model'] = setup_installer._new_run()
-        rc = setup_installer._run_klein_download('klein_model')
+        rc = setup_installer._run_model_download('klein_model')
     assert rc == 0
     assert any('already present' in l and 'flux-2-klein-9b-fp8.safetensors' in l
                for l in setup_installer._runs['klein_model']['log'])
 
 
-def test_run_klein_download_streams_to_part_then_renames(app, tmp_path, monkeypatch):
+def test_run_model_download_streams_to_part_then_renames(app, tmp_path, monkeypatch):
     from app import setup_installer, config
     base = _make_comfyui(tmp_path)
-    payload = b'x' * (10 * 1024 * 1024)
+    # A structurally valid safetensors: the worker now VERIFIES what it wrote
+    # before renaming it in (an auth wall answering 200 with an HTML page used to
+    # land as a perfect-looking weight file), so a blob of 'x' is legitimately
+    # rejected — see test_krea_install.test_a_login_page_served_as_200_is_rejected.
+    import struct
+    _hdr = b'{"__metadata__":{"lds":"test"}}'
+    payload = struct.pack('<Q', len(_hdr)) + _hdr + b'\0' * (10 * 1024 * 1024)
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(base)}})
         monkeypatch.setattr(setup_installer.requests, 'get', _FakeGet(payload=payload))
         setup_installer._runs['klein_vae'] = setup_installer._new_run()
-        rc = setup_installer._run_klein_download('klein_vae')
-        dest = setup_installer._klein_dest_path('klein_vae')
+        rc = setup_installer._run_model_download('klein_vae')
+        dest = setup_installer._download_dest_path('klein_vae')
     assert rc == 0
     assert os.path.isfile(dest)
     assert not os.path.exists(dest + '.part')   # atomic rename left no partial
 
 
-def test_run_klein_download_sends_bearer_when_token_set(app, tmp_path, monkeypatch):
+def test_run_model_download_sends_bearer_when_token_set(app, tmp_path, monkeypatch):
     from app import setup_installer, config
     base = _make_comfyui(tmp_path)
     cap = {}
@@ -417,26 +430,124 @@ def test_run_klein_download_sends_bearer_when_token_set(app, tmp_path, monkeypat
         monkeypatch.setattr(setup_installer.requests, 'get',
                             _FakeGet(payload=b'z' * 1024, capture=cap))
         setup_installer._runs['klein_model'] = setup_installer._new_run()
-        setup_installer._run_klein_download('klein_model')
+        setup_installer._run_model_download('klein_model')
     assert cap['headers'].get('Authorization') == 'Bearer hf_secret'
 
 
-def test_run_klein_download_skips_when_already_present(app, tmp_path, monkeypatch):
+def _safetensors_blob(size=1024):
+    """A structurally VALID .safetensors: 8 little-endian bytes giving the JSON
+    header length, the header, then payload. What model_integrity accepts."""
+    import struct
+    hdr = b'{"__metadata__":{"lds":"test"}}'
+    return struct.pack('<Q', len(hdr)) + hdr + b'\0' * size
+
+
+def test_run_model_download_skips_when_already_present(app, tmp_path, monkeypatch):
     from app import setup_installer, config
     base = _make_comfyui(tmp_path)
     def boom(*a, **k):
         raise AssertionError('network must not be hit when the file already exists')
     with app.app_context():
         config.save_config({'comfyui': {'base_dir': str(base)}})
-        dest = setup_installer._klein_dest_path('klein_lora')
+        dest = setup_installer._download_dest_path('klein_lora')
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, 'wb') as f:
-            f.write(b'already downloaded')
+            # A LOADABLE file. It used to be b'already downloaded' -- 18 bytes of
+            # prose, which is precisely the shape this skip must no longer accept.
+            f.write(_safetensors_blob())
         monkeypatch.setattr(setup_installer.requests, 'get', boom)
         setup_installer._runs['klein_lora'] = setup_installer._new_run()
-        rc = setup_installer._run_klein_download('klein_lora')
+        rc = setup_installer._run_model_download('klein_lora')
     assert rc == 0
     assert any('already present' in l for l in setup_installer._runs['klein_lora']['log'])
+
+
+def test_a_file_that_cannot_be_loaded_is_replaced_not_skipped(app, tmp_path, monkeypatch):
+    """The dead end reported by zigzag4794 (Discord).
+
+    His Klein UNET was on disk, in the right folder, at a plausible 9.5 GB, and
+    capabilities reported it under `klein_invalid` with verdict
+    `truncated_or_garbage` -- an interrupted download. The app's advice for that
+    is "download it again", and the downloader answered "already present: <path>"
+    and returned SUCCESS on any existing file. So the one remedy the UI offered
+    could not work, and there was no way out from inside the app.
+
+    Presence is not readability. The same validator the readiness probe uses gets
+    asked first now, and a blocking verdict makes this a replacement."""
+    from app import setup_installer, config
+    base = _make_comfyui(tmp_path)
+    good = _safetensors_blob(4096)
+    with app.app_context():
+        config.save_config({'comfyui': {'base_dir': str(base)}})
+        dest = setup_installer._download_dest_path('klein_vae')
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, 'wb') as f:
+            # Declares a 4 GB JSON header it does not have: structurally garbage,
+            # exactly what a cut-short download leaves behind.
+            import struct
+            f.write(struct.pack('<Q', 4 * 1024 ** 3) + b'\0' * 512)
+        monkeypatch.setattr(setup_installer.requests, 'get', _FakeGet(payload=good))
+        setup_installer._runs['klein_vae'] = setup_installer._new_run()
+        rc = setup_installer._run_model_download('klein_vae')
+    log = setup_installer._runs['klein_vae']['log']
+    assert rc == 0
+    assert not any('already present' in l for l in log)
+    assert any('cannot be loaded' in l for l in log)
+    # It is replaced, but only by the copy that arrived — see
+    # test_setup_download_replace_order.py for the ordering that guarantees it.
+    assert any('until a fresh copy has actually downloaded' in l for l in log)
+    with open(dest, 'rb') as f:
+        assert f.read() == good        # the broken file is gone, the good one is in
+
+
+def test_an_advisory_small_file_is_never_deleted(app, tmp_path, monkeypatch):
+    """`too_small` is advisory: the file LOADS, it is merely suspicious. Deleting a
+    user's weights on a hunch is not a repair, so the skip stands."""
+    from app import setup_installer, config
+    base = _make_comfyui(tmp_path)
+    def boom(*a, **k):
+        raise AssertionError('a loadable file must never be re-downloaded')
+    with app.app_context():
+        config.save_config({'comfyui': {'base_dir': str(base)}})
+        dest = setup_installer._download_dest_path('klein_model')
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, 'wb') as f:
+            f.write(_safetensors_blob(64))          # valid, but far under the 1 GB floor
+        monkeypatch.setattr(setup_installer.requests, 'get', boom)
+        setup_installer._runs['klein_model'] = setup_installer._new_run()
+        rc = setup_installer._run_model_download('klein_model')
+    assert rc == 0
+    assert os.path.isfile(dest)
+    assert any('already present' in l for l in setup_installer._runs['klein_model']['log'])
+
+
+def test_a_broken_weight_is_re_queued_by_the_one_click_installs():
+    """Before: `klein_missing` says nothing (the file is there), so the plan was
+    empty, the Setup card said "everything is in place", and the engine stayed
+    dark. A file no loader can open is not installed."""
+    from app import setup_installer
+    caps = {
+        'face_scoring': True, 'masks': True, 'watermark_inpaint': True, 'scrape_deps': True,
+        'ollama': {'reachable': False},
+        'comfyui': {
+            'dir_valid': True, 'reachable': True, 'klein_missing': [],
+            'klein_invalid': [{'asset': 'klein_model', 'filename': 'k.safetensors',
+                               'verdict': 'truncated_or_garbage', 'blocking': True}],
+        },
+    }
+    assert setup_installer.install_all_plan(caps) == ['klein_model']
+
+    # Same rule for the Krea group button, and the advisory verdict still doesn't count.
+    krea = {'comfyui': {
+        'dir_valid': True, 'reachable': True, 'krea_missing': [], 'krea_nodes_installed': True,
+        'krea_nodes_missing': [],
+        'krea_invalid': [
+            {'asset': 'krea_model', 'filename': 'a.safetensors',
+             'verdict': 'html_or_text', 'blocking': True},
+            {'asset': 'krea_vae', 'filename': 'b.safetensors',
+             'verdict': 'too_small', 'blocking': False},
+        ]}}
+    assert setup_installer.install_group_plan('krea', krea) == ['krea_model']
 
 
 def test_start_klein_blocks_on_low_disk(app, tmp_path, monkeypatch):
@@ -1142,7 +1253,7 @@ def test_model_download_not_blocked_by_pip_queue(app, tmp_path, monkeypatch):
     with a pip install, never sit in the pip queue."""
     from app import setup_installer, config
     monkeypatch.setattr(setup_installer, '_execute', lambda a: None)
-    monkeypatch.setattr(setup_installer, '_check_klein_precondition', lambda a: None)
+    monkeypatch.setattr(setup_installer, '_check_download_precondition', lambda a: None)
     setup_installer._pip_current = 'masks'   # simulate a pip install already running
     setup_installer._pip_queue.clear()
     base = _make_comfyui(tmp_path)
@@ -1225,6 +1336,7 @@ def _caps(**over):
     just the pieces it needs MISSING, so the plan reflects exactly that gap."""
     caps = {
         'python': {'ml_supported': True},
+        'scrape_deps': True,
         'face_scoring': True, 'masks': True, 'watermark_inpaint': True,
         'ollama': {'reachable': True, 'vision_model_ready': True, 'vision_model': 'qwen3-vl:8b'},
         'comfyui': {'dir_valid': True, 'klein_missing': []},
@@ -1243,11 +1355,11 @@ def test_install_all_plan_empty_when_everything_installed():
 def test_install_all_plan_none_and_empty_caps_are_safe():
     """None (couldn't probe) folds to {} — never raises. With nothing detected, the ML
     tiles read missing (default present=falsey) and Ollama/ComfyUI are absent so their
-    gated actions are skipped; only the always-runnable ML extras remain."""
+    gated actions are skipped; only the always-runnable extras remain."""
     from app import setup_installer
-    ml_only = ['face_scoring', 'masks', 'watermark_inpaint']
-    assert setup_installer.install_all_plan(None) == ml_only
-    assert setup_installer.install_all_plan({}) == ml_only
+    ungated = ['scrape_extras', 'face_scoring', 'masks', 'watermark_inpaint']
+    assert setup_installer.install_all_plan(None) == ungated
+    assert setup_installer.install_all_plan({}) == ungated
 
 
 def test_install_all_plan_lists_missing_ml_extras():
@@ -1264,6 +1376,20 @@ def test_install_all_plan_skips_face_masks_on_unsupported_python():
     caps = _caps(python={'ml_supported': False},
                  face_scoring=False, masks=False, watermark_inpaint=False)
     assert setup_installer.install_all_plan(caps) == ['watermark_inpaint']
+    # scrape_extras is pure-python, so the SAME unsupported interpreter still gets it.
+    caps = _caps(python={'ml_supported': False}, scrape_deps=False,
+                 face_scoring=False, masks=False, watermark_inpaint=False)
+    assert setup_installer.install_all_plan(caps) == ['scrape_extras', 'watermark_inpaint']
+
+
+def test_install_all_plan_includes_missing_scrape_extras():
+    """Regression: scrape_extras had a worker, an action id and a UI button but no entry
+    in _INSTALL_ALL_ORDER, so 'Install everything' could never repair the scraper stack —
+    a user missing one package (instaloader) was told everything was already in place and
+    kept hitting the runtime error. Present deps => absent from the plan (idempotent)."""
+    from app import setup_installer
+    assert setup_installer.install_all_plan(_caps(scrape_deps=False)) == ['scrape_extras']
+    assert setup_installer.install_all_plan(_caps(scrape_deps=True)) == []
 
 
 def test_install_all_plan_ollama_model_only_when_reachable_and_named():
@@ -1297,12 +1423,13 @@ def test_install_all_plan_full_order():
     stable order (drives the 'X / N' progress list)."""
     from app import setup_installer
     caps = _caps(
+        scrape_deps=False,
         face_scoring=False, masks=False, watermark_inpaint=False,
         ollama={'reachable': True, 'vision_model_ready': False, 'vision_model': 'qwen3-vl:8b'},
         comfyui={'dir_valid': True,
                  'klein_missing': ['klein_model', 'klein_text_encoder', 'klein_vae', 'klein_lora']})
     assert setup_installer.install_all_plan(caps) == [
-        'face_scoring', 'masks', 'watermark_inpaint', 'ollama_model',
+        'scrape_extras', 'face_scoring', 'masks', 'watermark_inpaint', 'ollama_model',
         'klein_model', 'klein_text_encoder', 'klein_vae', 'klein_lora']
 
 
@@ -1373,3 +1500,55 @@ def test_run_ml_capability_pins_pillow_when_targeting_flask_venv(app, monkeypatc
     cmd = seen['cmd']
     assert cmd[0] == sys.executable
     assert any(str(p).lower().startswith('pillow==') for p in cmd)
+
+
+# --- bank scoring: a BORROWED interpreter is never installed into --------------
+# bank_scoring.python is what the ⚡ "use a GPU Python you already have" picker
+# writes, and that dialog promises twice that borrowed environments "are checked,
+# never changed". The Install / ↻ Reinstall button used to take that same value
+# as its install TARGET — i.e. pip into the user's ai-toolkit or ComfyUI venv.
+
+def test_run_bank_scoring_refuses_a_borrowed_interpreter(app, monkeypatch, tmp_path):
+    """A bank_scoring.python the app did not build (the borrow case) is refused:
+    return 1, no pip at all, and the log hands over the command instead."""
+    from app import setup_installer, config
+    borrowed = tmp_path / 'ai-toolkit' / 'venv' / 'Scripts' / 'python.exe'
+    borrowed.parent.mkdir(parents=True)
+    borrowed.touch()
+
+    def boom(*a, **k):
+        raise AssertionError('must not run pip against a borrowed environment')
+
+    monkeypatch.setattr(setup_installer.subprocess, 'Popen', boom)
+    with app.app_context():
+        config.save_config({'bank_scoring': {'python': str(borrowed)}})
+        setup_installer._runs['bank_scoring'] = setup_installer._new_run()
+        rc = setup_installer._run_bank_scoring('bank_scoring')
+    assert rc == 1
+    log = setup_installer._runs['bank_scoring']['log']
+    assert any('did not create' in l for l in log)
+    assert any('never changed' in l for l in log)
+    # the way out, both ways: the exact command, and how to go back to the default
+    assert any('-m pip install' in l and str(borrowed) in l for l in log)
+    assert any('bank_scoring.python' in l for l in log)
+
+
+def test_run_bank_scoring_still_installs_into_the_managed_venv(app, monkeypatch):
+    """The refusal must not swallow the normal path: with nothing configured the
+    button still builds the app's own venv and installs into THAT."""
+    from app import setup_installer, config
+    seen = []
+    monkeypatch.setattr(setup_installer, '_find_base_python', lambda a: r'C:\pybase\python.exe')
+    monkeypatch.setattr(setup_installer.subprocess, 'Popen', _fake_venv_popen(seen))
+    with app.app_context():
+        config.save_config({})
+        managed = setup_installer._bank_scoring_env_python()
+        setup_installer._runs['bank_scoring'] = setup_installer._new_run()
+        rc = setup_installer._run_bank_scoring('bank_scoring')
+        saved = config.get('bank_scoring.python')
+    assert rc == 0
+    torch_cmd = next(c for c in seen if 'torch' in c)
+    assert torch_cmd[0] == managed and setup_installer._TORCH_CPU_INDEX in torch_cmd
+    clip_cmd = next(c for c in seen if any('open_clip' in str(p) for p in c))
+    assert clip_cmd[0] == managed
+    assert saved == managed

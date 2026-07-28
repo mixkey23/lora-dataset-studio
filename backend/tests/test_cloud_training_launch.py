@@ -794,7 +794,11 @@ def test_request_stop_targets_only_the_given_run(ct, app, client, monkeypatch):
     with app.app_context():
         r1 = ct.launch_cloud_training('local', ds1)
         r2 = ct.launch_cloud_training('local', ds2)
-        assert ct.request_stop(r1['run_id']) is True
+        # request_stop reports what actually happened (dict, not a courtesy
+        # bool): here no monitor thread was started and no pod exists yet, so
+        # the run is closed on the spot.
+        res = ct.request_stop(r1['run_id'])
+        assert res['ok'] is True and res['mode'] == 'forced'
         assert ct._stop_event_for(r1['run_id']).is_set() is True
         assert ct._stop_event_for(r2['run_id']).is_set() is False
 

@@ -146,9 +146,11 @@ test('opening the panel after a partial read clears the whole badge', () => {
 
 test('parseTarget splits path and workspace query params', () => {
   assert.deepEqual(parseTarget('/settings/engines'),
-    { path: '/settings/engines', section: null, panel: null });
+    { path: '/settings/engines', section: null, panel: null, step: null });
   assert.deepEqual(parseTarget('/datasets?section=curation&panel=watermarks'),
-    { path: '/datasets', section: 'curation', panel: 'watermarks' });
+    { path: '/datasets', section: 'curation', panel: 'watermarks', step: null });
+  assert.deepEqual(parseTarget('/setup?step=quality'),
+    { path: '/setup', section: null, panel: null, step: 'quality' });
   assert.equal(parseTarget('https://example.com'), null);
   assert.equal(parseTarget(undefined), null);
 });
@@ -185,10 +187,13 @@ test('isValidTarget accepts good routes and rejects malformed ones', () => {
     '/datasets', '/studio', '/cloud', '/guide', '/help', '/setup',
     '/settings/engines', '/settings/maintenance', '/guide/using-the-app',
     '/datasets?section=scrape&panel=scan', '/datasets?section=add',
+    '/setup?step=quality', '/setup?step=comfyui',
   ]) {
     assert.equal(isValidTarget(ok), true, ok);
   }
   for (const bad of [
+    '/setup?step=nope',
+    '/settings/engines?step=quality',
     '/settings/does-not-exist',
     '/datasets?section=nope',
     '/datasets?section=curation&panel=nope',
@@ -201,4 +206,22 @@ test('isValidTarget accepts good routes and rejects malformed ones', () => {
   ]) {
     assert.equal(isValidTarget(bad), false, String(bad));
   }
+});
+
+// A merge that folds two entries into ONE object is valid JavaScript: the
+// duplicate keys just overwrite each other, JS keeps the last, and the earlier
+// entries disappear from WHATS_NEW without a sound. Every other test here still
+// passes -- the surviving object has a perfect shape and a unique id. Four
+// entries were lost that way while resolving cherry-pick conflicts on this file,
+// and nothing caught it. Counting the id: lines in the SOURCE and comparing with
+// the parsed array is what makes that class of loss impossible to miss.
+test('no entry is swallowed by a merge (source id: lines == parsed entries)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const src = readFileSync(fileURLToPath(new URL('./whatsNew.js', import.meta.url)), 'utf8');
+  const body = src.slice(src.indexOf('export const WHATS_NEW = ['));
+  const idLines = (body.match(/^ {4}id: '/gm) || []).length;
+  assert.equal(idLines, WHATS_NEW.length,
+    `${idLines} "id:" lines in the source but ${WHATS_NEW.length} entries parsed `
+    + '- an entry was folded into its neighbour (duplicate keys in one object)');
 });

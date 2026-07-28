@@ -80,6 +80,17 @@ def progress(job, done=None, total=None, detail=None):
         job['_touched'] = time.time()
 
 
+def fail(job, message):
+    """Stop a pass on a condition that is NOT an image problem — the source
+    folder went away, a drive is unplugged. The runner's generic handler prefixes
+    the exception type (`RuntimeError: ...`), which is noise in a toast, so a job
+    that wants to explain itself in plain words sets the error here and returns."""
+    with _lock:
+        job['error'] = str(message)
+        job['detail'] = str(message)
+        job['_touched'] = time.time()
+
+
 def bump(job, n=1):
     with _lock:
         job['done'] += n

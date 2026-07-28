@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { postJson } from '../api/fetchClient';
 import { useToast } from '../components/common/Toast';
+import { useCapabilities } from '../context/CapabilitiesContext';
 import TrainingProgress from '../components/dataset/TrainingProgress';
 import ContinueDialog from '../components/dataset/ContinueDialog';
 import RunLineageTree from '../components/dataset/RunLineageTree';
@@ -20,6 +21,15 @@ import {
   runRetryKey,
   trainingRunVariantLabel,
 } from '../utils/trainingRuns';
+import { confirmableRetryFlag } from '../utils/trainingRefusals';
+import { runSilenceWarning, stopOutcomeMessage } from '../utils/runSilence';
+import { runsHubContinueLanes } from '../utils/runsHubContinueLanes';
+import {
+  TRASH_REMINDER,
+  purgeAllResultMessage,
+  purgeRunResultMessage,
+  runStagingCleanup,
+} from '../utils/stagingCleanup';
 
 /* Dedicated hub for cloud training runs across ALL datasets: watch the ones in
    progress (live progress + samples), stop them, and download finished LoRAs —
@@ -27,7 +37,7 @@ import {
    /train/cloud/runs endpoint (actives + recent history + budget summary). */
 
 const POLL_MS = 5000;
-const FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image' };
+const FAMILY_LABEL = { zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL', flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image', anima: 'Anima' };
 
 // "Recent" history collapse: a UI preference, not run data — persisted globally
 // (same lazy-init + effect pattern as `datasetGridTileSize` in DatasetGrid.jsx /
@@ -90,7 +100,7 @@ function timeAgo(iso) {
 function famLabel(f) { return FAMILY_LABEL[f] || f || 'LoRA'; }
 
 // Short family names that fit the 5rem fallback thumbnail tile.
-const FAMILY_SHORT = { zimage: 'Z-Image', krea: 'Krea', sdxl: 'SDXL', flux: 'FLUX', flux2klein: 'Klein', qwen_image: 'Qwen' };
+const FAMILY_SHORT = { zimage: 'Z-Image', krea: 'Krea', sdxl: 'SDXL', flux: 'FLUX', flux2klein: 'Klein', qwen_image: 'Qwen', anima: 'Anima' };
 
 /** Card thumbnail: the LAST sample the run generated (backend stamps
  * `preview_url` when one exists on disk). Fallback: a quiet family tile —
@@ -171,6 +181,23 @@ function RecipeWarning({ run }) {
   );
 }
 
+/* A rented pod bills even when nothing is happening. Surfaced on the card as
+   soon as a run goes quiet — well before the watchdog would act, and the only
+   signal at all when the user turned automatic termination off. */
+function SilenceWarning({ run }) {
+  const warning = runSilenceWarning(run);
+  if (!warning) return null;
+  const critical = warning.level === 'critical';
+  return (
+    <div role="alert"
+      className={`w-full rounded-md border px-2.5 py-2 text-[0.6875rem] leading-relaxed ${
+        critical ? 'border-red-400/50 bg-red-500/10 text-red-200'
+          : 'border-amber-400/40 bg-amber-500/10 text-amber-200'}`}>
+      <span className="font-semibold">{critical ? '⛔' : '⚠'} Silent run:</span> {warning.text}
+    </div>
+  );
+}
+
 /* One compact line: the EFFECTIVE ai-toolkit settings this launch used
    (snapshotted at launch by the provenance registry). Absent on rows that
    predate the snapshot feature. Steps and variant are NOT repeated here —
@@ -202,6 +229,9 @@ function checkpointHref(run) {
 
 export default function CloudRunsPage() {
   const toast = useToast();
+  // ai-toolkit validity — the hub can now start a LOCAL continuation, so it needs
+  // the same capability truth the dataset panel uses to open/close that lane.
+  const { caps } = useCapabilities();
   const navigate = useNavigate();
   const location = useLocation();
   const [data, setData] = useState(null);
@@ -293,6 +323,43 @@ export default function CloudRunsPage() {
     } catch { /* transient — next tick retries */ }
   }, [historyLimit]);
 
+  // How much disk each run's staging still holds — what the per-run 🧹 names
+  // before moving it. Sizing walks thousands of files per run, so it is fetched
+  // ON DEMAND (mount, and again after a cleanup) and deliberately NOT folded
+  // into the 5 s poll: the hub must stay as light as it is today.
+  const [stagingSizes, setStagingSizes] = useState({});   // run_id -> bytes
+  const loadStagingSizes = useCallback(async () => {
+    try {
+      const r = await fetch('/api/dataset/train/cloud/staging-sizes', { credentials: 'include' });
+      if (r.ok) {
+        const d = await r.json();
+        setStagingSizes(d?.sizes || {});
+      }
+    } catch { /* sizes are a bonus — the cards render fine without them */ }
+  }, []);
+  useEffect(() => { loadStagingSizes(); }, [loadStagingSizes]);
+
+  // Per-run 🧹. Same trash mechanism and the same sparing rule as the global
+  // button (runStagingCleanup mirrors the backend), so a run one spares the
+  // other can never take. Sizes are refetched so the card's weight disappears.
+  const [purgingRun, setPurgingRun] = useState({});        // run_id -> bool
+  const purgeRun = useCallback(async (run) => {
+    const info = runStagingCleanup(run, stagingSizes);
+    if (!info.available || !window.confirm(info.confirmMessage)) return;
+    setPurgingRun((m) => ({ ...m, [run.run_id]: true }));
+    try {
+      const d = await postJson('/api/dataset/train/cloud/purge-run', { run_id: run.run_id });
+      const msg = purgeRunResultMessage(run, d);
+      toast[msg.kind === 'success' ? 'success' : 'info'](msg.text);
+      await loadStagingSizes();
+      poll();
+    } catch (e) {
+      toast.error(e?.message || 'Could not clean this run');
+    } finally {
+      setPurgingRun((m) => { const n = { ...m }; delete n[run.run_id]; return n; });
+    }
+  }, [stagingSizes, loadStagingSizes, poll, toast]);
+
   useEffect(() => {
     let alive = true;
     let t;
@@ -352,14 +419,17 @@ export default function CloudRunsPage() {
 
   const stop = async (run) => {
     const who = run.dataset_name || run.run_name || `run #${run.run_id}`;
-    if (!window.confirm(`Stop the cloud run for « ${who} »?\n\n`
+    if (!window.confirm(`Stop the cloud run for “${who}”?\n\n`
       + 'The pod is terminated. Any checkpoint reached so far is still downloaded '
       + 'and importable — you only lose the remaining steps.')) return;
     setStopping((m) => ({ ...m, [run.run_id]: true }));
     try {
       const d = await postJson('/api/dataset/train/cloud/stop', { run_id: run.run_id });
-      if (d.ok === false) toast.error('Could not stop the run — it may have already finished.');
-      else toast.info('Stopping the run — the pod is winding down…');
+      const m = stopOutcomeMessage(d);
+      // A failed termination is the expensive case: keep it on screen (the
+      // instance id in the text is what the user needs in the vast console).
+      if (m.level === 'error') toast.error(m.text, 20000);
+      else toast.info(m.text, m.level === 'warn' ? 12000 : undefined);
       poll();
     } finally {
       setStopping((m) => ({ ...m, [run.run_id]: false }));
@@ -370,7 +440,7 @@ export default function CloudRunsPage() {
     const local = data?.local_active;
     if (!canStopLocalRun(local) || stoppingLocalRef.current) return;
     const who = local.current.name || `dataset #${local.current.dataset_id}`;
-    if (!window.confirm(`Stop the local run for « ${who} »?\n\n`
+    if (!window.confirm(`Stop the local run for “${who}”?\n\n`
       + 'The training process is terminated and the pending local training queue is cleared. '
       + 'Checkpoints already saved remain available.')) return;
 
@@ -444,19 +514,64 @@ export default function CloudRunsPage() {
     setContinueInitialStep(null);
     setContinueRunTarget(run);
   };
+  // The LOCAL lane of the same gesture: the checkpoint the cloud run left behind
+  // was mirrored into this dataset's ai-toolkit run dir, so resuming it here is
+  // the ordinary /train/continue call the dataset panel makes — addressed by the
+  // run's OWN base/family/variant (never the dataset's persisted selection, which
+  // may point at another base entirely). A resume re-exports the CURRENT dataset,
+  // so it hits the same caption/quality guards as a fresh launch: loop on the
+  // confirmable refusals exactly like the panel does, accumulating the force flags.
+  const postLocalContinue = async (run, payload) => {
+    let body = {
+      extra_steps: payload.extraSteps,
+      ...(run.base_model != null ? { base_model: run.base_model } : {}),
+      ...(run.train_type ? { train_type: run.train_type } : {}),
+      ...(run.variant ? { variant: run.variant } : {}),
+      ...(payload.fromStep != null ? { from_step: payload.fromStep } : {}),
+      ...(payload.overrides ? { overrides: payload.overrides } : {}),
+      // The run's own masking, not a hub-wide default: the continuation must
+      // train like the checkpoint it resumes. Absent on a legacy row → the
+      // backend default (on), same as everywhere else.
+      masked: run.masked !== false,
+    };
+    for (;;) {
+      try {
+        return await postJson(`/api/dataset/${run.dataset_id}/train/continue`, body);
+      } catch (e) {
+        const flag = confirmableRetryFlag(e?.message, 'Continue anyway (force)');
+        if (flag === 'declined') return null;      // the confirm WAS the answer
+        if (!flag) throw e;
+        body = { ...body, [flag]: true };
+      }
+    }
+  };
   const submitContinue = async (payload) => {
     const run = continueRunTarget;
     setContinueRunTarget(null);
     setContinueInitialStep(null);
     if (!run || !payload) return;
+    const local = payload.lane === 'local';
     setContinuing((m) => ({ ...m, [run.run_id]: true }));
     try {
-      const d = await postJson('/api/dataset/train/cloud/continue',
-        { run_id: run.run_id, extra_steps: payload.extraSteps,
-          from_step: payload.fromStep, overrides: payload.overrides });
+      const d = local
+        ? await postLocalContinue(run, payload)
+        : await postJson('/api/dataset/train/cloud/continue',
+          { run_id: run.run_id, extra_steps: payload.extraSteps,
+            from_step: payload.fromStep, overrides: payload.overrides });
+      if (!d) return;                              // declined at a confirm prompt
       if (d.ok === false) toast.error(d.error || 'Continue failed');
-      else toast.success(`Continuing from step ${d.resumed_from} → ${d.target_steps} on a fresh pod…`);
+      else if (local) {
+        toast.success(`Continuing from step ${d.resumed_from} → ${d.target_steps} `
+          + 'on this machine — ComfyUI paused.');
+      } else {
+        toast.success(`Continuing from step ${d.resumed_from} → ${d.target_steps} on a fresh pod…`);
+      }
       poll();
+    } catch (e) {
+      // postJson THROWS on a refusal (400/409). Without this the local lane's
+      // real reason — "no checkpoint at step N", a busy GPU, a caption guard —
+      // was an unhandled rejection and the click looked like it did nothing.
+      toast.error(e?.message || 'Continue failed');
     } finally {
       setContinuing((m) => ({ ...m, [run.run_id]: false }));
     }
@@ -491,6 +606,18 @@ export default function CloudRunsPage() {
   const budget = data?.monthly_budget || 0;
   const spent = data?.month_spend || 0;
 
+  // ▶ Continue — WHERE it runs, for the run the dialog is open on. The rule lives
+  // in utils/runsHubContinueLanes.js (JSX-free, unit-tested): local is gated by
+  // ai-toolkit + the machine-wide single-flight training, cloud by the key, this
+  // DATASET's own active run and the concurrency limit.
+  const continueLanes = useMemo(
+    () => runsHubContinueLanes(continueRunTarget, {
+      aitoolkitValid: caps?.aitoolkit?.valid,
+      localActive: data?.local_active,
+      actives, configured, limit, familyLabel: famLabel,
+    }),
+    [continueRunTarget, caps, data, actives, configured, limit]);
+
   // ▶ Continue from a ◉ Graph checkpoint pill: open the Continue dialog on THAT
   // step. Cloud-only, mirroring the per-run Continue button (a local run has no
   // cloud-continue path). Prefer the live run row (full recipe/settings/steps);
@@ -501,6 +628,9 @@ export default function CloudRunsPage() {
     const target = row || {
       run_id: node.run_id, train_type: node.train_type, variant: node.variant,
       steps: node.steps,
+      // The local lane addresses the run dir by dataset + base: a node-derived
+      // target that dropped them could only ever be continued in the cloud.
+      dataset_id: node.dataset_id, base_model: node.base_model,
       resume_steps: (node.checkpoints || []).map((c) => c.step),
     };
     if (isTrainingRecipeReplayBlocked(target)) {
@@ -533,6 +663,7 @@ export default function CloudRunsPage() {
       || run.status === 'error_pod_kept' || baseLabel?.custom || run.version != null
       || run.gpu || run.cost_estimate != null || (run.source === 'cloud' && run.saves > 0)
       || run.share_key || (run.record_id != null && (run.lineage || run.checkpoint_ready)));
+    const cleanup = runStagingCleanup(run, stagingSizes);
     return (
       <div key={key} id={ident ? runRowDomId(ident.source, ident.id) : undefined}
         className={`flex flex-col gap-1.5 rounded-lg border border-border border-l-2 bg-app/40 p-2 ${cardAccent(run.status)}`}>
@@ -561,6 +692,15 @@ export default function CloudRunsPage() {
               <span className="whitespace-nowrap text-content-muted text-[0.6875rem] tabular-nums"
                 title="Wall-clock run duration (launch → finish)">
                 ⏱ {duration}
+              </span>
+            )}
+            {/* What this run still costs in DISK — the figure a targeted cleanup
+                needs. Absent when its staging is already gone (nothing to show,
+                and no 🧹 either). */}
+            {cleanup.size && (
+              <span className="whitespace-nowrap text-content-subtle text-[0.6875rem] tabular-nums"
+                title="Disk this run's staging folder still holds (dataset copy, samples, checkpoints)">
+                🗄 {cleanup.size} on disk
               </span>
             )}
             <span className="ml-auto whitespace-nowrap text-content-subtle text-[0.625rem]">
@@ -604,6 +744,18 @@ export default function CloudRunsPage() {
                 title={detailsOpen ? 'Hide details' : 'Show details (settings, cost, lineage, share…)'}
                 className="px-2 py-1 rounded-lg border border-border text-content-muted hover:text-content text-xs">
                 {detailsOpen ? '▴' : '▾'}
+              </button>
+            )}
+            {/* Per-run cleanup, so a long history no longer forces the all-or-
+                nothing purge. Only shown when there IS something to move and the
+                run is not spared (active pod, kept pod) — the same rule the
+                global 🧹 applies, read from runStagingCleanup. */}
+            {cleanup.available && (
+              <button type="button" onClick={() => purgeRun(run)}
+                disabled={!!purgingRun[run.run_id]}
+                title={cleanup.title}
+                className={`rounded-lg border border-red-500/30 bg-red-500/10 px-2 py-1 text-red-200 hover:bg-red-500/20 text-xs font-semibold disabled:opacity-40 ${run.share_key ? '' : 'ml-auto'}`}>
+                {purgingRun[run.run_id] ? '🧹 Cleaning…' : `🧹 Clean ${cleanup.size}`}
               </button>
             )}
           </div>
@@ -721,8 +873,10 @@ export default function CloudRunsPage() {
       {data && !configured && (
         <div className="rounded-lg border border-border bg-surface p-4 text-content-muted text-sm">
           Cloud training isn’t configured yet. Add your vast.ai API key in{' '}
-          <button type="button" onClick={() => navigate('/settings')}
-            className="text-sky-300 underline hover:text-sky-200">Settings</button>{' '}
+          {/* Land on the section that actually holds the key and the cloud
+              guard-rails, not the Settings landing page. */}
+          <button type="button" onClick={() => navigate('/settings/training')}
+            className="text-sky-300 underline hover:text-sky-200">Settings › Training</button>{' '}
           to rent GPUs on demand.
         </div>
       )}
@@ -837,6 +991,7 @@ export default function CloudRunsPage() {
               </div>
 
               <RecipeWarning run={run} />
+              <SilenceWarning run={run} />
               <TrainingProgress datasetId={run.dataset_id} trainType={run.train_type} variant={run.variant} cloud />
 
               <div className="flex flex-wrap items-center gap-2">
@@ -903,9 +1058,16 @@ export default function CloudRunsPage() {
             {!recentCollapsed && (
               <button type="button"
                 onClick={async () => {
-                  if (!window.confirm('Move the staging folders of all FINISHED runs to the trash?\n\nDataset copies, samples and checkpoint duplicates already imported. Active runs and pods kept for recovery are spared. Recoverable until you empty the trash in Settings.')) return;
+                  if (!window.confirm(`Move the staging folders of all FINISHED runs to the trash?\n\nDataset copies, samples and checkpoint duplicates already imported. Active runs and pods kept for recovery are spared.\n${TRASH_REMINDER}`)) return;
                   const d = await postJson('/api/dataset/train/cloud/purge', {});
-                  if (d.ok) toast.info(`Cleaned ${d.purged_runs} run(s) — ${(d.freed_bytes / 1e9).toFixed(1)} GB moved to the trash.`);
+                  if (d.ok) {
+                    // "62.6 GB moved to the trash" on its own reads as "space
+                    // reclaimed" — it is not, the trash is on the same disk. And
+                    // "Cleaned 0 run(s)" said nothing about WHY. Both fixed here.
+                    const msg = purgeAllResultMessage(d);
+                    toast[msg.kind === 'error' ? 'error' : msg.kind === 'success' ? 'success' : 'info'](msg.text);
+                  }
+                  await loadStagingSizes();
                   poll();
                 }}
                 className="ml-auto px-2.5 py-1 rounded-lg bg-red-500/10 border border-red-500/30 text-red-200 text-xs font-semibold">
@@ -974,6 +1136,7 @@ export default function CloudRunsPage() {
             ? continueRunTarget.resume_steps
             : [continueRunTarget.steps]).filter(Boolean)).map((step) => ({ step }))}
           initialFromStep={continueInitialStep}
+          lanes={continueLanes}
           settings={{ optimizer: continueRunTarget.settings?.optimizer,
             learning_rate: continueRunTarget.settings?.lr }}
           busy={!!continuing[continueRunTarget.run_id]}

@@ -10,12 +10,16 @@ const CapabilitiesContext = createContext(null)
 
 const EMPTY_CAPS = {
   configured: false,
-  engines: { nanobanana: false, chatgpt: false, klein: false },
+  engines: { nanobanana: false, chatgpt: false, openrouter: false, klein: false },
   comfyui: { reachable: false, api_url: '', models: {} },
   ollama: { reachable: false, installed: false, binary_path: '', url: '', vision_model: '', vision_model_ready: false },
   aitoolkit: { configured: false, valid: false },
   captioners: { joycaption: false, ollama: false },
   face_scoring: false,
+  // Wheel-range verdict for the optional ML extras (insightface/numpy<2 publish
+  // nothing outside 3.10–3.12). Defaults to SUPPORTED on purpose: an unknown
+  // probe must not hide an install button that would have worked.
+  python: { version: '', ml_supported: true, ml_range: '3.10–3.12' },
   masks: false,
   watermark_inpaint: false,
   watermark_allow_crop: true,

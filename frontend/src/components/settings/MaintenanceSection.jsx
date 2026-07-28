@@ -3,7 +3,9 @@ import { apiFetch, postJson } from '../../api/fetchClient'
 import DiagnosticReport from '../common/DiagnosticReport'
 import { copyToClipboard } from '../../utils/clipboard'
 import { Card, TextField } from './primitives'
+import ResetToDefault from './ResetToDefault'
 import { installMode, zipUpdateHeadline, progressLabel, progressPercent } from './updateStatus'
+import { versionLabel } from '../../utils/versionLabel'
 
 /* In-app updater: "Check for updates" hits the git-aware check (commits-behind for a
    clone, release tag for a packaged build). "Update & restart" pulls (git) or downloads
@@ -178,7 +180,12 @@ function UpdatesCard() {
               </a>{' '}and replace the folder.
             </p>
           ) : s.ok ? (
-            <p className="text-emerald-400"><span aria-hidden>✓</span> You’re up to date.</p>
+            <p className="text-emerald-400">
+              <span aria-hidden>✓</span> You’re up to date.{' '}
+              {/* Name the COMMIT on a git checkout: the release number alone would
+                  claim the last release while the tree may be well past it. */}
+              <span className="text-content-subtle">{versionLabel(s)}</span>
+            </p>
           ) : (
             <p className="text-content-muted"><span aria-hidden>⚠</span> {s.reason || 'Could not check for updates.'}</p>
           )}
@@ -197,7 +204,7 @@ function LogViewer() {
   const [lines, setLines] = useState([])
   const load = async () => {
     try {
-      const d = await apiFetch('/api/logs/tail?n=300')
+      const d = await apiFetch('/api/logs/tail?n=300', { background: true })
       setFile(d.file); setLines(d.lines || [])
     } catch { /* viewer is best-effort */ }
   }
@@ -299,11 +306,66 @@ function TrashCard() {
   )
 }
 
-export default function MaintenanceSection({ config, setField }) {
+/* The run image archive: a deduplicated copy of every image a training run was
+   launched on, so a comparison can still SHOW an image that has since been
+   deleted from its dataset. Content-addressed, so an unchanged dataset costs
+   nothing on its second launch — but it is still bytes, so its size is visible
+   and clearable here rather than growing invisibly. */
+function RunArchiveCard() {
+  const [info, setInfo] = useState(null)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let alive = true
+    apiFetch('/api/run-archive')
+      .then((d) => { if (alive) setInfo(d || null) })
+      .catch(() => { /* best-effort */ })
+    return () => { alive = false }
+  }, [])
+  const fmt = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB`
+    : b >= 1e6 ? `${Math.round(b / 1e6)} MB`
+    : b > 0 ? `${Math.max(1, Math.round(b / 1e3))} KB` : 'empty')
+  const clear = async () => {
+    if (!window.confirm('Delete every archived training image?\n\nYour runs, their settings and their captions are kept — you just lose the ability to look at images that have since been deleted from their dataset.')) return
+    setBusy(true)
+    try {
+      const d = await postJson('/api/run-archive/clear', {})
+      if (d?.ok) setInfo((v) => ({ ...(v || {}), size_bytes: 0 }))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Card title="Run image archive" help="When a training run is launched, a deduplicated copy of the images it trains on is kept so that comparing two runs can still show an image you have since deleted. Only new or edited images are copied, and the archive stops growing at its ceiling.">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-content">
+          <span aria-hidden>🗂</span> Archive size:{' '}
+          <span className="font-semibold tabular-nums">
+            {info == null ? '…' : fmt(info.size_bytes || 0)}
+          </span>
+          {info?.max_bytes ? (
+            <span className="text-content-subtle">
+              {' '}/ {fmt(info.max_bytes)} ceiling
+            </span>
+          ) : null}
+        </span>
+        {info && !info.enabled && (
+          <span className="text-xs text-content-subtle">Archiving is turned off.</span>
+        )}
+        <button type="button" onClick={clear} disabled={busy || !info?.size_bytes}
+          className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 disabled:opacity-40">
+          {busy ? 'Clearing…' : 'Clear archive'}
+        </button>
+      </div>
+    </Card>
+  )
+}
+
+export default function MaintenanceSection({ config, setField, configDefaults }) {
   return (
     <div className="space-y-6">
       <UpdatesCard />
       <TrashCard />
+      <RunArchiveCard />
       <Card title="Data" help="Where dataset images live on disk.">
         <TextField
           id="dataset-images-root"
@@ -311,7 +373,12 @@ export default function MaintenanceSection({ config, setField }) {
           value={config.paths.dataset_images_root}
           onChange={(v) => setField('paths', 'dataset_images_root', v)}
           placeholder="Defaults to data/datasets"
-        />
+        >
+          {/* Default is the EMPTY string ("use data/datasets"), so reset gives
+              the implicit state back instead of writing today's path in. */}
+          <ResetToDefault label="Dataset images root" section="paths" field="dataset_images_root"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </TextField>
       </Card>
       <DiagnosticReport />
       <LogViewer />

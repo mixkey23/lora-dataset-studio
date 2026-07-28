@@ -84,6 +84,44 @@ test('diffConfigs: a key present on only one side is a changed row, empty on the
   assert.equal(rows.find((r) => r.key === 'rank').changed, false);
 });
 
+// ---- the keys the backend ACTUALLY writes ------------------------------
+// This table used to list `learning_rate`, `timestep_weighting` and `network`,
+// none of which the launch snapshot writes (it writes `lr`, `timestep_type` and
+// `network_type`). Three of the most important rows therefore matched nothing
+// and the panel silently showed a fraction of the recipe.
+
+test('diffConfigs resolves the REAL snapshot keys, not only the aliases', () => {
+  const rows = diffConfigs(
+    { lr: '1e-4', timestep_type: 'sigmoid', network_type: 'lora' },
+    { lr: '5e-5', timestep_type: 'shift', network_type: 'lokr' },
+  );
+  const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
+  assert.equal(byKey.learning_rate.a, '1e-4');
+  assert.equal(byKey.learning_rate.b, '5e-5');
+  assert.equal(byKey.timestep_weighting.changed, true);
+  assert.equal(byKey.network.a, 'lora');
+  assert.equal(byKey.network.b, 'lokr');
+});
+
+test('configRows shows a recorded `false` as a value, never as "not recorded"', () => {
+  const rows = configRows({ dual_captions: false });
+  const dual = rows.find((r) => r.label === 'Dual captions');
+  assert.ok(dual, 'dual_captions must be listed');
+  assert.equal(dual.value, 'false');
+});
+
+test('diffConfigs surfaces the record-level facts the panel was blind to', () => {
+  const rows = diffConfigs(
+    { steps: 1000, masked: 'yes', base_model: 'official base', dataset_version: 'v2' },
+    { steps: 4000, masked: 'no', base_model: 'official base', dataset_version: 'v3' },
+  );
+  const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
+  assert.equal(byKey.masked.changed, true);
+  assert.equal(byKey.steps.changed, true);
+  assert.equal(byKey.dataset_version.changed, true);
+  assert.equal(byKey.base_model.changed, false);
+});
+
 // ---- toggleDiffSelection (bounded-to-2 pick state) ----------------------
 
 test('toggleDiffSelection adds, removes, and slides at a cap of two', () => {

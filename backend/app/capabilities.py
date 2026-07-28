@@ -6,6 +6,7 @@ every reachability probe goes through it so tests can patch one symbol.
 `_import_ok` is the equivalent seam for the slow subprocess import-probes.
 """
 import copy
+import json
 import os
 import re
 import shutil
@@ -17,31 +18,59 @@ from pathlib import Path
 import requests
 
 from . import config as cfg
+from .utils import comfy_fs
 
 _CACHE_TTL = 30
 _cache = None
 _cache_ts = 0.0
 
 _IMPORT_TTL = 600
-_import_cache = {}  # key -> (ts, ok)
+# How long an UNKNOWN verdict (the probe never answered) is remembered. Short,
+# because it must re-try soon against a warm import — but not zero: the Bank
+# panel polls its readiness every ~2 s, and an uncached unknown meant a fresh
+# 90 s `import torch` subprocess on EVERY poll.
+_UNKNOWN_TTL = 60
+# Budget for one cold import probe. Aligned with services.scoring_python
+# .PROBE_TIMEOUT (90 s), which the repo already documents as the honest floor
+# for a cold `import torch` behind an antivirus: at 60 s the SAME interpreter
+# answered 'CUDA' to one probe and 'no answer' to the other.
+_IMPORT_TIMEOUT = 90
+_import_cache = {}  # key -> (ts, ok|None)  — None = unknown, kept briefly
 
 _ZIMAGE_RE = re.compile(r'z[ -]?image', re.IGNORECASE)
 # Aligned with klein_edit_helper / utils.comfyui (was missing '.sft', so the
-# picker under-listed vs the resolvers). '.gguf' kept deliberately: the app
-# supports ComfyUI-GGUF quantised diffusion models, and dropping it would hide
-# models existing installs already see (see comfy_model_paths module docstring).
+# picker under-listed vs the resolvers). '.gguf' is listed but NOT loadable by the
+# shipped graphs — they emit core `UNETLoader`, which has no '.gguf' support (core
+# ComfyUI's supported_pt_extensions does not include it) and would need the
+# ComfyUI-GGUF pack's separate `UnetLoaderGGUF` node, which nothing here emits.
+# It stays listed so a .gguf a user already has is not silently invisible; what
+# makes that honest is `utils.comfyui.unavailable_model_files`, which names the
+# extension as the cause before anything is queued (naniii2352, Discord).
 _MODEL_SUFFIXES = ('.safetensors', '.gguf', '.sft')
 
 
-def _http_ok(url, timeout=3) -> bool:
+def _http_ok(url, timeout=3, reason=None) -> bool:
+    """True when `url` answers with anything below 500.
+
+    `reason`, when a dict is passed, is FILLED with why a False was returned:
+    'timeout' (the server accepted the connection and then didn't answer in time —
+    it is up, it is slow) or 'unreachable' (nothing answered). It is an out-param
+    rather than a richer return type on purpose: this function is the single
+    network seam the whole test suite patches (`lambda *a, **k: False`), and a
+    stub that ignores the dict simply leaves the reason unknown instead of
+    breaking. Callers must treat an unfilled dict as "don't know"."""
     try:
         resp = requests.get(url, timeout=timeout)
         return resp.status_code < 500
-    except Exception:
+    except Exception as e:
+        if isinstance(reason, dict):
+            reason['why'] = ('timeout' if isinstance(e, requests.exceptions.Timeout)
+                             else 'unreachable')
+            reason['waited'] = timeout
         return False
 
 
-def _import_ok(python: str, module_expr: str, timeout=60):
+def _import_ok(python: str, module_expr: str, timeout=_IMPORT_TIMEOUT):
     """True/False = the import deterministically succeeded/failed. None = TIMEOUT —
     unknown, NOT a proven absence. The very first `import rembg` after an install
     compiles numba/scikit-image caches while the antivirus scans 40 MB of fresh
@@ -56,19 +85,34 @@ def _import_ok(python: str, module_expr: str, timeout=60):
         return False
 
 
-def _cached_import(key: str, python: str, module_expr: str) -> bool:
+def _cached_import_state(key: str, python: str, module_expr: str):
+    """Three-valued, cached import probe: True / False / None.
+
+    None means the probe DID NOT ANSWER — a cold-import timeout, not a proven
+    absence. Callers that only gate a feature can flatten it to False
+    (_cached_import); callers whose wrong answer costs something real — the
+    GPU-exclusive window — must be able to tell the two apart.
+
+    Both verdicts are cached, with very different lifetimes: a decided answer
+    for _IMPORT_TTL (a venv does not change between two probes), an unknown for
+    _UNKNOWN_TTL so it re-tries soon against a now-warm import WITHOUT spawning
+    a fresh 90 s subprocess on every 2 s poll of the Bank panel."""
     now = time.time()
     cache_key = f'{key}:{python}:{module_expr}'
     cached = _import_cache.get(cache_key)
-    if cached is not None and now - cached[0] < _IMPORT_TTL:
-        return cached[1]
+    if cached is not None:
+        ttl = _IMPORT_TTL if cached[1] is not None else _UNKNOWN_TTL
+        if now - cached[0] < ttl:
+            return cached[1]
     ok = _import_ok(python, module_expr)
-    if ok is None:
-        # Timeout → report not-ready NOW but don't poison the cache: the next
-        # probe re-tries against a warm import instead of a 600 s false ✗.
-        return False
     _import_cache[cache_key] = (now, ok)
     return ok
+
+
+def _cached_import(key: str, python: str, module_expr: str) -> bool:
+    """The boolean gate: an unknown reads as not-ready (nothing is offered on a
+    capability we could not prove), but it is no longer re-probed on every call."""
+    return _cached_import_state(key, python, module_expr) is True
 
 
 def probe_gemini() -> dict:
@@ -86,12 +130,75 @@ def probe_openai() -> dict:
     return {'ok': key or sub, 'detail': ' + '.join(parts) if parts else 'key missing'}
 
 
+def probe_openrouter() -> dict:
+    """OpenRouter engine readiness. Presence of the key only — same contract as
+    probe_gemini. Deliberately NOT a live call: verifying the key would mean an
+    authenticated request on every capability poll, and OpenRouter bills per
+    request; a key that is set but out of credits is reported at generation time,
+    with the provider's own words."""
+    ok = bool(cfg.secret('OPENROUTER_API_KEY'))
+    return {'ok': ok, 'detail': 'key set' if ok else 'key missing'}
+
+
+def _object_info_timeout() -> int:
+    """The /object_info read budget, published so the UI can quote it. Lazy import:
+    utils.comfyui imports config, not capabilities, and this keeps it that way."""
+    from .utils import comfyui as _cu
+    return _cu.object_info_timeout()
+
+
+def comfyui_down_message(status, waited) -> str:
+    """THE sentence for a ComfyUI that isn't answering. Two causes, two remedies —
+    never one fits-all line.
+
+    'ComfyUI isn't running' used to be said for BOTH, and it is a lie in one of
+    them: a heavily-customised ComfyUI is up and simply takes longer than the
+    budget to enumerate its nodes and models. Someone who has just started ComfyUI
+    and reads "it isn't running" goes and checks the one thing they already know is
+    true, and finds nothing (j_o_e_l., Discord — he then measured the real number
+    himself). So the slow case names the delay, says the server IS up, and points
+    at the knob that fixes it."""
+    if status == 'timeout':
+        return (f'ComfyUI took more than {waited}s to answer. It is running — it is '
+                f'slow to enumerate its nodes and model files, which is normal on an '
+                f'install with many custom nodes. Raise "ComfyUI response timeout" in '
+                f'Settings ▸ Local tools ▸ ComfyUI.')
+    return ('No answer from ComfyUI — nothing is listening at that address. Start '
+            'ComfyUI, or correct the ComfyUI API URL in Settings ▸ Local tools.')
+
+
 def probe_comfyui() -> dict:
+    """{ok, detail, status, hint}. `status` is 'ok' / 'slow' / 'unreachable' /
+    'unconfigured' — the two failure modes are published SEPARATELY so every
+    surface (Test button, engine cards, the 409 on a blocked generation) can say
+    the true one instead of the convenient one.
+
+    The verdict itself still rides on the cheap `/history` probe. When that one
+    can't tell us why (it is the patched seam in tests, and a 3 s budget is short
+    enough to trip on a busy server), the LAST /object_info attempt is consulted:
+    that probe knows the difference first-hand, because it is the one that spends
+    the long budget."""
     api_url = (cfg.get('comfyui.api_url') or '').rstrip('/')
     if not api_url:
-        return {'ok': False, 'detail': 'comfyui.api_url not configured'}
-    ok = _http_ok(f'{api_url}/history')
-    return {'ok': ok, 'detail': api_url if ok else f'unreachable: {api_url}'}
+        return {'ok': False, 'detail': 'comfyui.api_url not configured',
+                'status': 'unconfigured',
+                'hint': 'Set the ComfyUI API URL in Settings ▸ Local tools.'}
+    reason = {}
+    ok = _http_ok(f'{api_url}/history', reason=reason)
+    if ok:
+        return {'ok': True, 'detail': api_url, 'status': 'ok', 'hint': ''}
+    from .utils import comfyui as _cu
+    health = _cu.object_info_health()
+    why, waited = reason.get('why'), reason.get('waited', 3)
+    if why != 'timeout' and health['status'] == 'timeout':
+        # /history gave up after 3 s while the heavy probe proved the server is
+        # THERE and merely slow. Believe the probe that waited longer.
+        why, waited = 'timeout', health['waited']
+    status = 'slow' if why == 'timeout' else 'unreachable'
+    return {'ok': False, 'status': status,
+            'detail': (f'slow: {api_url} (>{waited}s)' if status == 'slow'
+                       else f'unreachable: {api_url}'),
+            'hint': comfyui_down_message('timeout' if status == 'slow' else 'down', waited)}
 
 
 def probe_ollama() -> dict:
@@ -317,23 +424,144 @@ def clear_import_cache() -> None:
     _cache_ts = 0.0
 
 
+# Where an ai-toolkit checkout keeps the Python that runs it. There is NO single
+# answer: the README's `venv/`, a `.venv/`, a conda env, or a portable bundle that
+# ships `python_embeded/python.exe` (a community easy-install script does exactly
+# that — reported on Reddit by Psyko_2000). So we do not guess a layout: we knock
+# on the folder and on each of its immediate sub-folders with every interpreter
+# shape the app already knows (`scoring_python._INTERPRETER_SPOTS`) and keep the
+# ones that answer as a real file. An empty list means "we found nothing here",
+# which is a fact the UI can state honestly — never a claim that a venv is the
+# only way. Nothing is executed and nothing is written; it is a stat() sweep one
+# level deep, computed only for a checkout whose interpreter we could not resolve.
+def aitoolkit_python_candidates(root, limit: int = 4) -> list:
+    from .services.scoring_python import interpreters_in
+    try:
+        root = Path(root)
+        children = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    out, seen = [], set()
+    for folder in (root, *children[:64]):
+        for cand in interpreters_in(folder):
+            key = os.path.normcase(str(cand))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(str(cand))
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def probe_aitoolkit() -> dict:
     d = cfg.aitoolkit_path('dir')
     if not d:
-        return {'ok': False, 'detail': 'aitoolkit.dir not configured'}
+        return {'ok': False, 'detail': 'aitoolkit.dir not configured',
+                'has_run': False, 'python_candidates': []}
     venv_python = cfg.aitoolkit_path('venv_python')
     has_run = (d / 'run.py').exists()
-    ok = has_run and bool(venv_python) and venv_python.exists()
+    # is_file(), NOT exists(): the training launch gate (lora_training.is_installed)
+    # checks is_file(), so a venv_python that resolves to a directory or a broken
+    # link would make the diagnostic report ai-toolkit=yes while training still
+    # says "not installed". Keep the two in lockstep so the diagnostic never lies.
+    ok = has_run and bool(venv_python) and venv_python.is_file()
     if ok:
-        return {'ok': True, 'detail': str(d)}
+        return {'ok': True, 'detail': str(d), 'has_run': True,
+                'python_candidates': []}
     if has_run:
-        # The folder IS an ai-toolkit checkout — only the interpreter is
-        # missing (no venv/.venv: conda/uv/system installs, user-reported).
-        # Name the actionable fix instead of a blanket "invalid dir".
-        return {'ok': False,
-                'detail': (f'ai-toolkit found at {d} but no venv/.venv inside — '
-                           'set its Python interpreter in Settings → Local tools')}
-    return {'ok': False, 'detail': f'invalid aitoolkit dir: {d}'}
+        # The folder IS an ai-toolkit checkout — we just could not see which
+        # Python runs it (conda/uv/system/portable installs all land here).
+        # State the finding and hand over both ways out.
+        found = aitoolkit_python_candidates(d)
+        detail = (f'ai-toolkit found at {d} but no Python interpreter found '
+                  'inside — create a venv there, or set its Python interpreter '
+                  'in Settings → Local tools')
+        if found:
+            detail += f' (candidate: {found[0]})'
+        return {'ok': False, 'detail': detail, 'has_run': True,
+                'python_candidates': found}
+    return {'ok': False, 'detail': f'invalid aitoolkit dir: {d}',
+            'has_run': False, 'python_candidates': []}
+
+
+def _torch_import_state(python: str):
+    """`import torch` on this interpreter: True / False / None (unknown).
+
+    Stricter than `_cached_import_state` about what counts as a FAILED IMPORT.
+    That helper's seam reports False for anything that goes wrong, including a
+    path that cannot be executed at all — and "this file is not a working Python"
+    is a different problem from "this Python has no torch", with a different
+    sentence and, above all, one we must not state as a fact when a training
+    launch hangs on it. So a failed import is confirmed by a second, trivial
+    `pass` probe: if the interpreter cannot even run that, the answer is UNKNOWN.
+    The extra subprocess only ever runs in the already-failing case, and both
+    answers go through the same cache."""
+    state = _cached_import_state('aitoolkit_torch', python, 'import torch')
+    if state is not False:
+        return state
+    if _cached_import_state('aitoolkit_alive', python, 'pass') is not True:
+        return None
+    return False
+
+
+def aitoolkit_interpreter_report() -> dict:
+    """Can the interpreter ai-toolkit is configured with actually `import torch`?
+
+    {'python': str, 'torch': True|False|None, 'alternative': str}.
+
+    `torch` is THREE-valued on purpose and reuses the same cached subprocess seam
+    every other ML capability goes through: True = proven importable, False =
+    proven not, None = we did not find out (no interpreter on disk, or a cold
+    import that timed out). None must never be treated as a refusal — a first
+    `import torch` on a cold venv behind an antivirus takes tens of seconds.
+
+    `alternative` is the venv the checkout carries (`venv/`, `.venv/`) when an
+    EXPLICIT `aitoolkit.python` is set, is broken, and that venv works — the
+    swap we can then offer instead of leaving the user to guess. Empty
+    otherwise; it costs a second probe only in the already-broken case.
+
+    Deliberately NOT part of probe(): probe() is polled and must stay cheap and
+    never spawn a torch import. This is called from a launch attempt, from the
+    Test button, and from a crash report — moments where the answer is worth
+    paying for."""
+    out = {'python': '', 'torch': None, 'alternative': ''}
+    python = cfg.aitoolkit_path('venv_python')
+    if not python or not Path(python).is_file():
+        return out
+    out['python'] = str(python)
+    out['torch'] = _torch_import_state(str(python))
+    if out['torch'] is not False:
+        return out
+    # Broken, and only because of an explicit override? Then the checkout's own
+    # venv is the obvious way out — but only claim it after PROVING it works.
+    if not (cfg.get('aitoolkit.python') or '').strip():
+        return out
+    derived = cfg.aitoolkit_path('venv_python_derived')
+    if derived and Path(derived).is_file() and os.path.normcase(str(derived)) \
+            != os.path.normcase(str(python)):
+        if _torch_import_state(str(derived)) is True:
+            out['alternative'] = str(derived)
+    return out
+
+
+def probe_aitoolkit_test() -> dict:
+    """The Settings ▸ Local tools "Test" button for ai-toolkit. Same folder checks
+    as probe_aitoolkit, plus the one the folder checks cannot see: does the chosen
+    interpreter have torch? A Test that goes green on a Python without torch is
+    the exact trap of GitHub #19 (strouder) — everything configured, every run
+    dead on `No module named 'torch'`. An UNKNOWN probe keeps the green: we refuse
+    to fail a test on an answer we do not have."""
+    result = probe_aitoolkit()
+    if not result.get('ok'):
+        return result
+    from .services.training_diagnostics import interpreter_verdict
+    report = aitoolkit_interpreter_report()
+    verdict = interpreter_verdict(report['python'], report['torch'],
+                                  alternative=report['alternative'])
+    if verdict:
+        return {**result, 'ok': False, 'detail': verdict['message']}
+    return result
 
 
 def probe_musubi_tuner() -> dict:
@@ -432,6 +660,32 @@ def face_gpu_available() -> bool:
         "sys.exit(0 if 'CUDAExecutionProvider' in onnxruntime.get_available_providers() else 1)")
 
 
+def bank_scoring_gpu_available() -> bool:
+    """True only when the bank-scoring interpreter can actually run torch on
+    CUDA. The scoring child picks its own device (``cuda if
+    torch.cuda.is_available()``), and the PARENT has to know the same answer:
+    it decides whether to take the GPU-exclusive window, which unloads ComfyUI
+    and blocks a training start for the whole pass. The stock extra installs
+    CPU-only torch, so this is False until the user puts a CUDA build in that
+    interpreter — and a pass that never touches the GPU must never hold it.
+
+    UNKNOWN is NOT False here. 'the probe did not answer' and 'torch has no
+    CUDA' used to collapse into the same answer, and they have opposite costs:
+    the child decides on its own with `torch.cuda.is_available()`, so on a
+    machine that HAS a card an unanswered probe means we may be leaving the GPU
+    unprotected while the pass takes it — ComfyUI still loaded, a training start
+    still allowed. So an unknown resolves to 'is there a card at all' (cached
+    nvidia-smi read): a card-less machine still never holds a window it cannot
+    use, and a machine with one is protected until the probe answers."""
+    python = cfg.get('bank_scoring.python') or sys.executable
+    state = _cached_import_state(
+        'bank_scoring_gpu', python,
+        'import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)')
+    if state is None:
+        return gpu_vram_gb() is not None
+    return state
+
+
 def probe_masks() -> dict:
     python = cfg.get('masks.python') or sys.executable
     ok = _cached_import('masks', python, 'import rembg')
@@ -485,9 +739,11 @@ def probe_scrape_deps() -> dict:
     only (no import cost): the scrape stack runs IN-PROCESS, so the app's own
     interpreter is the one that must see the packages. curl_cffi + gallery_dl
     are the two hard requirements (picazor/civitai fetch, gallery enumeration);
-    bs4/cloudscraper ride along in the same install."""
+    bs4/cloudscraper/instaloader ride along in the same install. Every module the
+    scrape stack imports belongs here: an omission reads as "installed" while the
+    source that needs it still raises at runtime (instaloader did, until 2026-07)."""
     import importlib.util
-    missing = [m for m in ('curl_cffi', 'gallery_dl', 'bs4', 'cloudscraper')
+    missing = [m for m in ('curl_cffi', 'gallery_dl', 'bs4', 'cloudscraper', 'instaloader')
                if importlib.util.find_spec(m) is None]
     return {'ok': not missing,
             'detail': 'scrape deps OK' if not missing else f"missing: {', '.join(missing)}"}
@@ -656,6 +912,106 @@ def gpu_vram_gb():
     return gb
 
 
+# --- ai-toolkit torch probe (what actually trains) -----------------------------
+# ai-toolkit runs in ITS OWN venv, which LDS never installs — it only reads the
+# interpreter the user pointed at. Whether that venv's torch carries kernels for
+# the local GPU is invisible from here, and getting it wrong is silent: RTX 50
+# (Blackwell, sm_120) + a stable wheel = `is_available()` True, then a hard
+# "no kernel image is available for execution on the device" at the first real
+# computation. So: probe the venv, but only when it can matter.
+#
+# COST DISCIPLINE. `import torch` in a cold venv costs seconds, so the expensive
+# probe is gated behind a ~100 ms nvidia-smi capability read: a GPU below
+# compute 10.0 (everything up to Ada / RTX 40) can never hit the trap and pays
+# nothing at all. What we do run is cached 10 min — a venv does not change
+# between two runs.
+_cc_cache = {'ts': 0.0, 'cc': None}
+_TORCH_PROBE_TTL = 600
+_torch_probe_cache = {}   # interpreter path -> (ts, info)
+
+# First capability major that stable wheels may not cover (Blackwell = 12).
+# 10 is deliberately lower than 12: it keeps the gate honest if a future
+# generation lands before the wheels do.
+_RISKY_CC_MAJOR = 10
+
+_TORCH_PROBE_CODE = (
+    'import json, torch\n'
+    'cap = name = None\n'
+    'try:\n'
+    '    if torch.cuda.is_available():\n'
+    '        cap = list(torch.cuda.get_device_capability(0))\n'
+    '        name = torch.cuda.get_device_name(0)\n'
+    'except Exception:\n'
+    '    pass\n'
+    'print(json.dumps({"torch": torch.__version__, "cuda": torch.version.cuda,\n'
+    '                  "capability": cap, "device_name": name,\n'
+    '                  "arch_list": list(torch.cuda.get_arch_list())}))\n'
+)
+
+
+def gpu_compute_capability():
+    """(major, minor) of GPU 0 via nvidia-smi, cached 10 min. None = unknown."""
+    now = time.time()
+    if _cc_cache['ts'] and (now - _cc_cache['ts']) < _GPU_TTL:
+        return _cc_cache['cc']
+    cc = None
+    try:
+        proc = subprocess.run(
+            ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if proc.returncode == 0:
+            lines = (proc.stdout or '').strip().splitlines()
+            if lines:
+                major, _, minor = lines[0].strip().partition('.')
+                cc = (int(major), int(minor or 0))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        cc = None
+    _cc_cache.update(ts=now, cc=cc)
+    return cc
+
+
+def _torch_probe(python: str, timeout=90):
+    """Raw torch facts from `python`, as a dict, or None. None is UNKNOWN — torch
+    not importable, interpreter broken, cold-import timeout — never a claim."""
+    try:
+        proc = subprocess.run([python, '-c', _TORCH_PROBE_CODE],
+                              capture_output=True, text=True, timeout=timeout,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(((proc.stdout or '').strip().splitlines() or [''])[-1])
+    except Exception:
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def aitoolkit_torch_info():
+    """torch/GPU facts from the ai-toolkit venv — the interpreter that TRAINS —
+    or None when we cannot know (no ai-toolkit, no NVIDIA GPU, GPU old enough to
+    be covered by every wheel, torch not importable, probe timeout). Callers must
+    treat None as 'no information', never as a verdict."""
+    cc = gpu_compute_capability()
+    if cc is None or cc[0] < _RISKY_CC_MAJOR:
+        return None                       # cheap exit: no torch import at all
+    python = cfg.aitoolkit_path('venv_python')
+    if not python or not Path(python).is_file():
+        return None
+    key = str(python)
+    now = time.time()
+    hit = _torch_probe_cache.get(key)
+    if hit and (now - hit[0]) < _TORCH_PROBE_TTL:
+        return hit[1]
+    info = _torch_probe(key)
+    if info is None:
+        return None      # a cold-import timeout must not be cached as a fact
+    _torch_probe_cache[key] = (now, info)
+    return info
+
+
 def _is_comfyui_dir(d) -> bool:
     """A real ComfyUI install: classic (main.py at the root) OR the Desktop
     app's basedir (models/ + custom_nodes/, no main.py — a user had to
@@ -707,32 +1063,170 @@ def classify_comfyui_dir(path: str) -> dict:
                         but holds no main.py/models/ and no child ComfyUI.
 
     `resolved` is the path a valid/nested verdict would adopt (child for nested,
-    the folder itself otherwise). Pure + never raises — a filesystem hiccup degrades
-    to 'not_comfyui' rather than throwing into the request."""
+    the folder itself otherwise). Never raises — a filesystem hiccup degrades
+    to 'not_comfyui' rather than throwing into the request.
+
+    Every verdict also carries `input_check` = {path, ok, problem}: "this IS a
+    ComfyUI install" was only ever half the question, and the wizard used to
+    certify the half it could see. The other half is whether the app can actually
+    HAND FILES to that install — every local engine copies its source into
+    `input/`. When ComfyUI runs in another container that folder is not shared by
+    default, so the wizard went green and the first generation died on a bare 500
+    (reported on Discord by nofaceman). `ok` is None when there is nothing to probe
+    (no valid folder yet); a False NEVER blocks the wizard — someone may well
+    configure the app before mounting their volumes."""
     raw = (path or '').strip()
     if not raw:
-        return {'status': 'empty', 'resolved': '', 'suggestion': ''}
+        return {'status': 'empty', 'resolved': '', 'suggestion': '',
+                'input_check': _input_check('')}
     p = Path(raw)
     if _is_comfyui_dir(p):
-        return {'status': 'valid', 'resolved': str(p), 'suggestion': ''}
+        return {'status': 'valid', 'resolved': str(p), 'suggestion': '',
+                'input_check': _input_check(str(p))}
     child = p / 'ComfyUI'
     if _is_comfyui_dir(child):
-        return {'status': 'nested', 'resolved': str(child), 'suggestion': str(child)}
+        return {'status': 'nested', 'resolved': str(child), 'suggestion': str(child),
+                'input_check': _input_check(str(child))}
     try:
         exists, is_dir = p.exists(), p.is_dir()
     except OSError:
         exists, is_dir = False, False
     if not exists:
-        return {'status': 'missing', 'resolved': str(p), 'suggestion': ''}
+        return {'status': 'missing', 'resolved': str(p), 'suggestion': '',
+                'input_check': _input_check('')}
     if is_dir:
         try:
             is_empty = not any(p.iterdir())
         except OSError:
             is_empty = False
         if is_empty:
-            return {'status': 'empty_dir', 'resolved': str(p), 'suggestion': ''}
+            return {'status': 'empty_dir', 'resolved': str(p), 'suggestion': '',
+                    'input_check': _input_check('')}
     # A file at that path, or a non-empty folder that simply isn't a ComfyUI checkout.
-    return {'status': 'not_comfyui', 'resolved': str(p), 'suggestion': ''}
+    return {'status': 'not_comfyui', 'resolved': str(p), 'suggestion': '',
+            'input_check': _input_check('')}
+
+
+def _input_check(base_dir: str) -> dict:
+    """Can this process actually put a file in the input/ folder of the ComfyUI at
+    `base_dir`? Honours a SAVED `comfyui.input_dir` override, so the wizard judges
+    the folder the app would really use rather than a layout assumption.
+    {'path','ok','problem'}; ok=None = nothing probed. Never raises."""
+    if not base_dir:
+        return {'path': '', 'ok': None, 'problem': ''}
+    try:
+        override = cfg.get('comfyui.input_dir') or ''
+    except Exception:
+        override = ''
+    try:
+        target = cfg.resolve_comfyui_dir('input', base_dir, override)
+        path = str(target) if target else ''
+        verdict = comfy_fs.probe_folder('input', path)
+    except Exception:
+        return {'path': '', 'ok': None, 'problem': ''}
+    return {'path': comfy_fs.safe_path(path), 'ok': verdict['ok'],
+            'problem': verdict['problem']}
+
+
+def classify_comfyui_folders(base_dir: str, overrides: dict | None = None) -> dict:
+    """Resolve the four ComfyUI working folders for a candidate (possibly unsaved)
+    ComfyUI section, and say for each one where the path came from and whether it is
+    actually there. Feeds the Settings preview so an override is never a leap of
+    faith: an empty field SHOWS the derived path it falls back to, and a typed path
+    that does not exist says so instead of failing silently at generation time.
+
+    Returns {<config key>: {kind, source, resolved, exists, usable, problem}} where
+      source ∈ 'override' (the field is filled) | 'derived' (from the install dir)
+               | 'unset'  (no install dir and no override — nothing to resolve).
+
+    `exists` alone certifies half the contract: a folder can be there and still be
+    unusable from THIS process — the case that costs the most (ComfyUI in another
+    container, an input/ mounted read-only) because the URL test goes green and the
+    first generation dies on a copy. `usable` is the other half: for the folders the
+    app WRITES into it is a real write-then-delete probe, for the others a read
+    check. True/False, or None when there is nothing to probe (no path, or the path
+    is not on disk — `exists` already says that). `problem` is the sentence to show.
+    Read-only apart from the probe file it removes again, never raises."""
+    overrides = overrides or {}
+    out = {}
+    for kind in cfg.COMFY_DIR_KINDS:
+        key, _sub = cfg._COMFY_DERIVED[kind]
+        explicit = str(overrides.get(key) or '').strip()
+        p = cfg.resolve_comfyui_dir(kind, base_dir, explicit)
+        resolved = str(p) if p else ''
+        try:
+            exists = bool(resolved) and Path(resolved).is_dir()
+        except OSError:
+            exists = False
+        usable, problem = None, ''
+        if exists:
+            verdict = comfy_fs.probe_folder(kind, resolved)
+            usable, problem = verdict['ok'], verdict['problem']
+        out[key] = {'kind': kind,
+                    'source': 'override' if explicit else ('derived' if resolved else 'unset'),
+                    'resolved': resolved, 'exists': exists,
+                    'usable': usable, 'problem': problem}
+    return out
+
+
+# ComfyUI takes its custom folders on the COMMAND LINE only (--input-directory,
+# --output-directory, --models-directory); there is no config file to read. It does,
+# however, echo its own argv back in /system_stats.system.argv, so the running
+# instance can be ASKED what it was started with instead of guessing a layout.
+_COMFY_ARGV_FLAGS = {'--output-directory': 'output_dir', '--input-directory': 'input_dir',
+                     '--models-directory': 'models_dir'}
+
+
+def parse_comfy_argv_dirs(argv) -> dict:
+    """Extract the folder overrides ComfyUI was launched with from its own argv.
+
+    Both argparse spellings are accepted (`--input-directory X` and
+    `--input-directory=X`). RELATIVE paths are deliberately DROPPED: they resolve
+    against ComfyUI's working directory, which we do not know, and this app never
+    guesses a path by convention. `--base-directory` is likewise not turned into
+    input/output suggestions — the install-directory field already derives those, and
+    inventing them here would be a layout assumption, not an answer. Never raises."""
+    out = {}
+    if not isinstance(argv, (list, tuple)):
+        return out
+    items = [str(a) for a in argv]
+    for i, tok in enumerate(items):
+        flag, _, inline = tok.partition('=')
+        key = _COMFY_ARGV_FLAGS.get(flag)
+        if not key:
+            continue
+        value = inline if inline else (items[i + 1] if i + 1 < len(items) else '')
+        value = value.strip().strip('"')
+        # A following token that is itself a flag means the value was missing.
+        if not value or (not inline and value.startswith('-')):
+            continue
+        try:
+            if not os.path.isabs(value):
+                continue
+        except (OSError, ValueError):
+            continue
+        out[key] = os.path.normpath(value)
+    return out
+
+
+def detect_comfyui_folders(timeout=3) -> dict:
+    """Ask the RUNNING ComfyUI which custom folders it was started with.
+    NETWORK — one short GET, kept out of probe() like comfyui_runtime_info.
+
+    Returns {} when ComfyUI is not configured, not reachable, too old to echo its
+    argv (the field landed in 2025 releases), or simply started with no custom
+    folder flags. An empty dict means "nothing to offer", never "use the defaults" —
+    the caller leaves the manual field alone. Never raises."""
+    api = (cfg.get('comfyui.api_url') or '').rstrip('/')
+    if not api:
+        return {}
+    try:
+        r = requests.get(f'{api}/system_stats', timeout=timeout)
+        if r.status_code != 200:
+            return {}
+        return parse_comfy_argv_dirs(((r.json() or {}).get('system') or {}).get('argv'))
+    except Exception:
+        return {}
 
 
 def _detect_comfyui() -> dict:
@@ -781,6 +1275,7 @@ def probe(force=False) -> dict:
     musubi_tuner_probe = probe_musubi_tuner()
     gemini = probe_gemini()
     openai_ = probe_openai()
+    openrouter_ = probe_openrouter()
     face_scoring = probe_face_scoring()
     masks = probe_masks()
     bank_scoring = probe_bank_scoring()
@@ -813,12 +1308,52 @@ def probe(force=False) -> dict:
     # green (advisory too_small does not gate) — an honest badge points the user at
     # the broken file instead of letting a doomed generate crash ComfyUI.
     klein_invalid = _keh.klein_invalid_assets()
-    klein_blocking_invalid = any(
-        i['blocking'] and i['asset'] in _keh.KLEIN_REQUIRED for i in klein_invalid)
-    klein_ready = (comfy['ok'] and bool(_keh.resolve_klein_unet())
-                   and bool(_keh.resolve_klein_vae())
-                   and bool(_keh.resolve_klein_text_encoder())
-                   and not klein_blocking_invalid)
+    # Capability gap on the graph's WIDGET VALUES, not its nodes. The shipped Klein
+    # workflow used to pin `scheduler: "beta57"`, a value the third-party RES4LYF
+    # pack injects into ComfyUI's CORE list — so a stock install passed every asset
+    # AND node check here, went green, and then refused the very first generation
+    # with a raw ComfyUI 400 (reported by IndependentProcess0 on Reddit). That
+    # value is gone, but the blind spot it exposed is not: this is the net for the
+    # next one, and for a workflow file a user has edited themselves. Nothing is
+    # substituted (a scheduler changes the render), so the gap has to be visible
+    # BEFORE a batch is launched, which means here. /object_info is cached, and
+    # this fails OPEN — an unreachable ComfyUI reports no gap, `reachable` already
+    # says that.
+    klein_unsupported_enums = _keh.klein_unsupported_enums() if comfy['ok'] else []
+    # The verdict itself lives in klein_edit_helper so the watermark cleaner reads
+    # the SAME four conditions instead of its own laxer copy; the ingredients are
+    # already computed here for the payload, so they are handed over rather than
+    # re-probed.
+    klein_ready = _keh.klein_engine_ready(
+        comfy['ok'], missing=klein_missing, invalid=klein_invalid,
+        unsupported_enums=klein_unsupported_enums)
+    # Krea 2 Identity Edit — the second LOCAL engine. Readiness is honest and
+    # four-part (base model + identity LoRA + text encoder + VAE) AND depends on
+    # a custom-node pack, unlike Klein whose graph is core-nodes-only. Both gaps
+    # are published separately so the engine card can name the RIGHT one: "install
+    # the node pack" and "place the LoRA here" are different actions.
+    # Disk scan = cheap listdir, network-free. The node probe is /object_info,
+    # cached and fail-OPEN (unreachable ComfyUI reports no missing node here —
+    # `reachable` already says that, and two red flags for one cause is noise).
+    from .services import krea_edit_helper as _krh
+    krea_missing = _krh.krea_missing_assets()
+    krea_nodes_missing = _krh.krea_missing_nodes() if comfy['ok'] else []
+    # Pack ON DISK but not yet exposed by /object_info = "restart ComfyUI", NOT
+    # "install the pack". Now that the app installs the pack itself, telling
+    # someone to install what they just watched install would be the whole
+    # feature failing at the last inch.
+    krea_nodes_installed = _krh.krea_node_pack_installed()
+    # Present-but-INVALID, exactly like Klein's: the Krea base sits behind a HF
+    # licence gate and the identity LoRA behind a Civitai login, so a browser
+    # download without the licence/login saves the HTML gate PAGE as
+    # .safetensors — present, not loadable, and today the only symptom was a raw
+    # ComfyUI "Expecting value: line 1 column 1". Every Krea asset is required
+    # (KREA_REQUIRED == all of them), so any blocking-invalid one keeps the
+    # engine dark; the advisory too_small does not gate.
+    krea_invalid = _krh.krea_invalid_assets()
+    krea_blocking_invalid = any(i['blocking'] for i in krea_invalid)
+    krea_ready = (comfy['ok'] and not krea_missing and not krea_nodes_missing
+                  and not krea_blocking_invalid)
     # Qwen Multi-angle engine — same honest, resolver-driven readiness pattern
     # as Klein above, but FOUR components instead of three: the multi-angle
     # LoRA is REQUIRED (not optional like Klein's consistency LoRA), since
@@ -868,12 +1403,21 @@ def probe(force=False) -> dict:
     from .services import chatgpt_oauth
     sub_status = chatgpt_oauth.status()
 
+    from .services.face_dataset_service import MAX_FANOUT as _max_fanout
+
     caps = {
         'configured': cfg.is_configured(),
+        # Images one generation batch may queue at once. Published so the
+        # workspace can say "75 is over the limit" BEFORE the click instead of
+        # letting a multi-engine run be refused after the fact — the server
+        # stays the authority, the UI just mirrors the number it is told.
+        'max_fanout': _max_fanout,
         'engines': {
             'nanobanana': gemini['ok'],
             'chatgpt': openai_['ok'],
+            'openrouter': openrouter_['ok'],
             'klein': klein_ready,
+            'krea': krea_ready,
             'qwen_multiangle': qwen_ma_ready,
             'qwen_edit': qwen_edit_ready,
         },
@@ -885,6 +1429,16 @@ def probe(force=False) -> dict:
         },
         'comfyui': {
             'reachable': comfy['ok'],
+            # WHY it isn't reachable, when it isn't: 'ok' | 'slow' | 'unreachable'
+            # | 'unconfigured'. `reachable` alone made every screen say "ComfyUI
+            # isn't running" at a ComfyUI that was running and busy; `hint` is the
+            # matching sentence, so the wording lives in ONE place instead of being
+            # re-invented per card. See probe_comfyui / comfyui_down_message.
+            'status': comfy.get('status', 'ok' if comfy['ok'] else 'unreachable'),
+            'hint': comfy.get('hint', ''),
+            # Read budget currently granted to the heavy /object_info enumeration,
+            # so a screen can quote the number the user would raise.
+            'object_info_timeout_s': _object_info_timeout(),
             'api_url': cfg.get('comfyui.api_url') or '',
             'base_dir': base_dir,
             'dir_configured': bool(base_dir),
@@ -900,6 +1454,20 @@ def probe(force=False) -> dict:
             # (subset of klein_model / klein_text_encoder / klein_vae / klein_lora).
             # Empty required-trio => the Klein engine is asset-ready.
             'klein_missing': klein_missing,
+            # Widget values the shipped Klein graph needs that THIS ComfyUI doesn't
+            # offer: [{node_id, class_type, input, value, pack, url}]. Empty on a
+            # capable install AND on an unreachable one (fail-open).
+            'klein_unsupported_enums': klein_unsupported_enums,
+            # Krea 2 Edit gaps, kept apart from Klein's: asset KEYS not on disk
+            # (krea_edit_helper.KREA_ASSETS) and the custom-node class_types this
+            # ComfyUI doesn't expose. Empty + empty => the engine is ready.
+            'krea_missing': krea_missing,
+            'krea_nodes_missing': krea_nodes_missing,
+            'krea_nodes_installed': krea_nodes_installed,
+            # Krea assets PRESENT on disk but not real, loadable weights — same
+            # [{asset, filename, verdict, blocking, reason}] shape as
+            # klein_invalid, so one banner covers both engines.
+            'krea_invalid': krea_invalid,
             # Klein assets PRESENT on disk but not real, loadable weights:
             # [{asset, filename, verdict, blocking, reason}]. Distinct from
             # klein_missing (the file exists, it just can't load) — drives the Setup
@@ -934,6 +1502,11 @@ def probe(force=False) -> dict:
         'aitoolkit': {
             'configured': bool(cfg.get('aitoolkit.dir')),
             'valid': aitoolkit['ok'],
+            # Kept apart so Setup can report what it ACTUALLY found: "this isn't
+            # an ai-toolkit checkout" and "this checkout has no interpreter we
+            # can see" are different problems with different fixes.
+            'dir_valid': bool(aitoolkit.get('has_run')),
+            'python_candidates': list(aitoolkit.get('python_candidates') or []),
         },
         # Second local training engine (Wave 2), Qwen-Image only. ai-toolkit
         # stays required regardless (see 'aitoolkit' above) — this only gates

@@ -125,6 +125,76 @@ def test_banks_list(client, tmp_path):
     assert data['banks'][0]['total'] == 1
 
 
+def test_banks_list_previews_are_capped_stable_and_skip_rejects(client, tmp_path):
+    """The card's thumbnail strip: at most 5 ids, in inventory (id) order so the
+    strip doesn't reshuffle between reloads, rejected shots left out."""
+    files = {f'{i:02d}.jpg': flat(value=10 * i) for i in range(1, 8)}
+    bank_id, _src = _mkbank(client, tmp_path, files)
+
+    def previews():
+        banks = client.get('/api/banks').get_json()['banks']
+        return next(b for b in banks if b['id'] == bank_id)['preview_ids']
+
+    first = previews()
+    assert len(first) == 5
+    assert first == sorted(first)
+    assert previews() == first          # stable across reloads
+
+    # A rejected image drops out of the strip and the next one slides in.
+    r = client.post(f'/api/bank/{bank_id}/images/status',
+                    json={'ids': [first[0]], 'status': 'reject'})
+    assert r.status_code == 200
+    after = previews()
+    assert first[0] not in after
+    assert after[:4] == first[1:]
+
+
+def test_bank_preview_thumb_served_without_a_scan(client, tmp_path):
+    """A freshly created (never scanned) bank must still show thumbnails — the
+    thumb route generates them on demand."""
+    bank_id, _src = _mkbank(client, tmp_path, {'a.jpg': photo_like()})
+    b = client.get('/api/banks').get_json()['banks'][0]
+    assert b['scanned'] == 0 and len(b['preview_ids']) == 1
+    r = client.get(f"/api/bank/{bank_id}/thumb/{b['preview_ids'][0]}")
+    assert r.status_code == 200
+    assert r.mimetype == 'image/webp'
+
+
+def test_banks_list_preview_empty_for_imageless_bank(client, tmp_path):
+    _mkbank(client, tmp_path, {'notes.txt': b'not an image'})
+    assert client.get('/api/banks').get_json()['banks'][0]['preview_ids'] == []
+
+
+def test_banks_list_batches_the_promotable_counts(client, tmp_path, app):
+    """?dataset_id= embeds every bank's per-target promotable count in the LIST,
+    so the dataset-side bank chooser opens on one request instead of one per
+    bank. Same numbers as /bank/<id>/promotable, which stays for single asks."""
+    b1, _ = _mkbank(client, tmp_path / 'one', {'a.jpg': flat(), 'b.jpg': flat(80)}, name='B1')
+    b2, _ = _mkbank(client, tmp_path / 'two', {'c.jpg': flat(160)}, name='B2')
+    with app.app_context():
+        from app.services import face_dataset_service as svc
+        ds = svc.create_dataset('local', 'Target', 'dstgt').id
+    ids1 = [i['id'] for i in client.get(f'/api/bank/{b1}/images').get_json()['images']]
+    client.post(f'/api/bank/{b1}/images/status', json={'ids': ids1, 'status': 'keep'})
+
+    rows = {b['id']: b for b in
+            client.get(f'/api/banks?dataset_id={ds}').get_json()['banks']}
+    assert rows[b1]['promotable'] == 2
+    assert rows[b2]['promotable'] == 0          # nothing kept -> explicit zero
+    for bank_id in (b1, b2):
+        single = client.get(
+            f'/api/bank/{bank_id}/promotable?dataset_id={ds}').get_json()
+        assert single['count'] == rows[bank_id]['promotable']
+
+    # No dataset_id, or one that doesn't exist: the field is OMITTED rather than
+    # zeroed — "unknown" and "nothing to import" must not look the same.
+    plain = client.get('/api/banks').get_json()['banks']
+    assert all('promotable' not in b for b in plain)
+    for bad in (f'{ds + 999}', 'abc', ''):
+        got = client.get(f'/api/banks?dataset_id={bad}').get_json()['banks']
+        assert all('promotable' not in b for b in got), bad
+
+
 # --- quality scan ------------------------------------------------------------
 def test_scan_scores_flags_and_unreadable(client, tmp_path):
     bank_id, src = _mkbank(client, tmp_path, {
@@ -374,6 +444,69 @@ def test_images_sort_by_resolution(client, tmp_path, app):
     assert names('res_desc', status='pending') == ['b', 'd', 'e']
     # An unknown sort value is ignored (falls back to the default id order).
     assert names('bogus') == ['a', 'b', 'c', 'd', 'e']
+
+
+def test_images_sort_by_score_and_sharpness(client, tmp_path, app):
+    """Requested by nofaceman (Discord): the bank already MEASURES aesthetics and
+    sharpness — the grid must be able to ORDER on them, not only filter. Same
+    contract as the resolution sort: unscored rows sink to the END in BOTH
+    directions (a NULL-first order would bury the very images the sort is for),
+    the sort composes with every filter, it survives pagination, and the ids
+    endpoint "Select all in filter" walks (same URL, bigger pages) sees the same
+    order — so ▶ Review opens on what the user is looking at."""
+    files = {f'{n}.jpg': checkerboard(size=64) for n in ('a', 'b', 'c', 'd', 'e')}
+    bank_id, _src = _mkbank(client, tmp_path, files)
+    # Hand-set the raw scores (bypass the passes, which need the ML extras).
+    # 'e' is the never-analysed row: NULL everywhere.
+    scores = {'a': (6.5, 120.0), 'b': (8.2, 40.0), 'c': (3.1, 900.0),
+              'd': (7.0, 300.0), 'e': (None, None)}
+    with app.app_context():
+        from app.extensions import db
+        from app.models import BankImage
+        for row in BankImage.query.filter_by(bank_id=bank_id).all():
+            aes, blur = scores[row.relpath.split('.')[0]]
+            row.aesthetic_score, row.blur_score = aes, blur
+        db.session.commit()
+
+    def names(sort, **qs):
+        params = '&'.join(f'{k}={v}' for k, v in {'sort': sort, **qs}.items())
+        got = client.get(f'/api/bank/{bank_id}/images?{params}').get_json()
+        return [i['name'].split('.')[0] for i in got['images']]
+
+    # Best first, then the unscored 'e' — never at the top.
+    assert names('aesthetic_desc') == ['b', 'd', 'a', 'c', 'e']
+    # Worst first (find the rejects) — 'e' STILL last, not first.
+    assert names('aesthetic_asc') == ['c', 'a', 'd', 'b', 'e']
+    # Sharpness = Laplacian variance: sharpest first / blurriest first.
+    assert names('sharp_desc') == ['c', 'd', 'a', 'b', 'e']
+    assert names('sharp_asc') == ['b', 'a', 'd', 'c', 'e']
+
+    # Composes with pagination — the page boundary does not reshuffle the order,
+    # and the whole set is still there once the pages are concatenated.
+    first = client.get(f'/api/bank/{bank_id}/images?sort=aesthetic_desc&limit=2').get_json()
+    second = client.get(f'/api/bank/{bank_id}/images'
+                        '?sort=aesthetic_desc&limit=2&offset=2').get_json()
+    assert [i['name'].split('.')[0] for i in first['images']] == ['b', 'd']
+    assert [i['name'].split('.')[0] for i in second['images']] == ['a', 'c']
+    assert first['total'] == second['total'] == 5
+
+    # Composes with a filter: nothing lost, nothing invented. Reject 'c' and the
+    # remaining set is exactly the other four, in the sorted order.
+    cid = next(i['id'] for i in
+               client.get(f'/api/bank/{bank_id}/images').get_json()['images']
+               if i['name'] == 'c.jpg')
+    client.post(f'/api/bank/{bank_id}/images/status',
+                json={'ids': [cid], 'status': 'reject'})
+    assert names('aesthetic_desc', status='pending') == ['b', 'd', 'a', 'e']
+    assert names('sharp_asc', status='pending') == ['b', 'a', 'd', 'e']
+
+    # "Select all in filter" / ▶ Review walk the SAME endpoint with limit=500 —
+    # the ids come back in the active sort AND under the active filter, so the
+    # selection is exactly what the user is looking at, in that order.
+    walked = client.get(f'/api/bank/{bank_id}/images'
+                        '?sort=aesthetic_desc&status=pending&limit=500').get_json()
+    assert [i['name'].split('.')[0] for i in walked['images']] == ['b', 'd', 'a', 'e']
+    assert walked['total'] == 4
 
 
 def test_resolution_buckets_counts_and_filter(client, tmp_path, app):

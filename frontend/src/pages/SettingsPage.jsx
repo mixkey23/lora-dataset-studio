@@ -5,6 +5,7 @@ import { useToast } from '../components/common/Toast'
 import { useCapabilities } from '../context/CapabilitiesContext'
 import { SETTINGS_SECTIONS, sectionStatus, matchesQuery } from '../components/settings/registry'
 import { SectionHeader } from '../components/settings/primitives'
+import { shouldScrollToSection } from './settingsDeepLink'
 import { HelpBadge } from '../help/HelpMode'
 import { searchHelpTopics, helpTopics } from '../help/helpRegistry'
 import { openCollapsedAncestors, resolveFocusTarget } from '../help/revealTarget'
@@ -62,6 +63,15 @@ export default function SettingsPage() {
   // UI can SHOW the real default text (and "Load default to edit") rather than
   // an empty box. Never persisted; a blank override still means "use default".
   const [promptDefaults, setPromptDefaults] = useState({})
+  // Same, one set PER SUBJECT TYPE ({human,animal,…}: {kind: text}) — the identity
+  // card edits one subject at a time and must show that subject's real default.
+  const [promptDefaultsBySubject, setPromptDefaultsBySubject] = useState({})
+  // Read-only shipped defaults of the SCALAR settings (numbers, paths, selects),
+  // the same idea one level up: `config` arrives already merged over them, so
+  // without this the UI could not tell a customised 43 from the shipped 4 and
+  // had no value to offer a per-field "Reset to default". Server-derived on
+  // purpose — see components/settings/resetToDefault.js.
+  const [configDefaults, setConfigDefaults] = useState({})
   const [secretsPresence, setSecretsPresence] = useState({})
   const [secretInputs, setSecretInputs] = useState({})
   const [testResults, setTestResults] = useState({})
@@ -77,6 +87,8 @@ export default function SettingsPage() {
       setSavedConfig(data.config)
       setRuntime(data.runtime || { host: null, port: null })
       setPromptDefaults(data.identity_prompt_defaults || {})
+      setPromptDefaultsBySubject(data.identity_prompt_defaults_by_subject || {})
+      setConfigDefaults(data.config_defaults || {})
       setSecretsPresence(data.secrets)
     } catch (e) {
       toast.error(`Failed to load settings: ${e.message}`)
@@ -89,6 +101,13 @@ export default function SettingsPage() {
 
   const setField = (section, key, value) => {
     setConfig((prev) => ({ ...prev, [section]: { ...prev[section], [key]: value } }))
+  }
+
+  // The identity prompts are NESTED (identity_prompts.by_subject.<type>.<kind>
+  // for non-human subjects), which the flat section/key setter above cannot
+  // express. The card hands in a pure updater from promptOverride.js.
+  const setIdentityPrompts = (updater) => {
+    setConfig((prev) => ({ ...prev, identity_prompts: updater(prev.identity_prompts || {}) }))
   }
 
   const recordTestResult = (target, result) => {
@@ -210,6 +229,26 @@ export default function SettingsPage() {
   // require-token), rings that gate instead so the deep-link never dead-ends.
   const [searchParams] = useSearchParams()
   const focusId = searchParams.get('focus')
+
+  /* A deep link that names a section must SHOW it, not merely select it. Below
+     `lg` the rail stacks above the panel, so "Settings › Image engines →" left
+     the reader at the top of the page with the section off-screen. */
+  const panelRef = useRef(null)
+  useEffect(() => {
+    const el = panelRef.current
+    if (!el) return undefined
+    const decide = () => shouldScrollToSection({
+      hasSection: Boolean(section), hasFocus: Boolean(focusId), loading,
+      panelTop: el.getBoundingClientRect().top,
+      viewportHeight: window.innerHeight,
+    })
+    // One frame late: the panel has to be laid out before its position means
+    // anything, and the section only renders once the config has arrived.
+    const raf = requestAnimationFrame(() => {
+      if (decide()) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [section, focusId, loading])
   useEffect(() => {
     if (!focusId || loading || !config) return undefined
     const found = resolveFocusTarget(focusId)
@@ -259,7 +298,9 @@ export default function SettingsPage() {
   const sectionProps = {
     config, setField, secretsPresence, secretInputs, setSecretInputs,
     testResults, recordTestResult, saveSecretIfPending, saveConfigSection, handleDeleteSecret,
-    toggleEngine, handleSave, saving, runtime, promptDefaults, caps, refreshCaps: refresh, toast,
+    toggleEngine, handleSave, saving, runtime, promptDefaults, promptDefaultsBySubject,
+    configDefaults,
+    setIdentityPrompts, caps, refreshCaps: refresh, toast,
   }
 
   const activeId = SECTION_COMPONENTS[section] ? section : 'overview'
@@ -387,7 +428,7 @@ export default function SettingsPage() {
           </nav>
         </aside>
 
-        <div className="mt-2 space-y-6 lg:mt-0">
+        <div ref={panelRef} className="mt-2 scroll-mt-20 space-y-6 lg:mt-0">
           <SectionHeader eyebrow={active.eyebrow} title={active.title} description={active.description}
             badge={<HelpBadge topic={`settings-${activeId}`} />} />
           <ActiveSection {...sectionProps} />

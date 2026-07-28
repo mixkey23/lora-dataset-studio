@@ -149,6 +149,24 @@ def test_create_and_start_job(remote, monkeypatch):
     assert any(u.endswith('/api/queue/0/start') for u in urls)
 
 
+def test_find_job_by_name_reads_the_unfiltered_job_list(remote, monkeypatch):
+    """A 409 on create is only recoverable if the job can be resolved back by
+    name: GET /api/jobs with no `id` returns every job row."""
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append(url)
+        return FakeResp(200, {'jobs': [
+            {'id': 'j-9', 'name': 'other_run', 'status': 'completed'},
+            {'id': 'j-7', 'name': 'run_a', 'status': 'running', 'step': 42},
+        ]})
+
+    monkeypatch.setattr('app.services.aitoolkit_remote.requests.request', fake)
+    assert remote.find_job_by_name('run_a')['id'] == 'j-7'
+    assert remote.find_job_by_name('nope') is None
+    assert seen[0].endswith('/api/jobs')          # unfiltered listing, no ?id=
+
+
 def test_get_job_log_samples_files(remote, monkeypatch):
     def fake(method, url, **kw):
         if 'log' in url:

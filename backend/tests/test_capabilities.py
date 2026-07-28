@@ -1,4 +1,5 @@
 from unittest.mock import patch
+import os
 import pathlib
 import struct
 import pytest
@@ -34,7 +35,9 @@ def test_probe_all_off_when_unconfigured(app):
         from app import capabilities
         with patch('app.capabilities._http_ok', return_value=False):
             caps = capabilities.probe(force=True)
-    assert caps['engines'] == {'nanobanana': False, 'chatgpt': False, 'klein': False, 'qwen_multiangle': False}
+    assert caps['engines'] == {'nanobanana': False, 'chatgpt': False,
+                               'openrouter': False, 'klein': False, 'krea': False,
+                               'qwen_multiangle': False, 'qwen_edit': False}
     assert caps['training_visible'] is False and caps['studio_visible'] is False
 
 def test_python_ml_status_reports_version_and_range(app):
@@ -148,7 +151,7 @@ def test_klein_engine_lights_for_flat_root_layout_unet(app, monkeypatch, tmp_pat
     # Picker lists the bare root name, and the engine lights (all three resolvable).
     assert caps['comfyui']['models']['klein'] == ['flux-2-klein-9b-fp8.safetensors']
     assert caps['engines']['klein'] is True
-    assert caps['comfyui']['klein_missing'] == ['klein_lora']   # only the optional LoRA
+    assert caps['comfyui']['klein_missing'] == ['klein_lora', 'klein_enhancement_lora']
 
 
 def test_klein_engine_dark_when_unet_is_html_gate_page(app, monkeypatch, tmp_path):
@@ -185,6 +188,49 @@ def test_klein_engine_dark_when_unet_is_html_gate_page(app, monkeypatch, tmp_pat
     assert invalid['klein_model']['blocking'] is True
     assert invalid['klein_model']['verdict'] == 'html_or_text'
     assert 'HTML' in invalid['klein_model']['reason']
+
+
+def test_a_truncated_download_is_reported_as_broken_not_missing(app, monkeypatch, tmp_path):
+    """zigzag4794's install (Discord), as a payload contract.
+
+    ComfyUI up, every required file in its folder at a plausible size, Setup
+    showing "✓ Installed" — and the Generate page refusing Klein with "model
+    missing". The bytes tell the real story: a .safetensors declares its JSON
+    header length in its first 8 bytes, and an interrupted download leaves a file
+    shorter than it claims. `truncated_or_garbage`.
+
+    This pins the wire format both screens read, because that is where the two
+    used to be able to disagree: the asset is NOT in klein_missing (it is on
+    disk), it IS in klein_invalid as blocking, and engines.klein is False. A front
+    end given this payload has everything it needs to say "corrupted — delete and
+    download again" instead of guessing "missing"."""
+    monkeypatch.setenv('OPENAI_API_KEY', '')
+    with app.app_context():
+        from app import capabilities, config
+        from app.services import model_integrity
+        model_integrity.clear_cache()
+        base = tmp_path / 'Comfy'
+        (base / 'models' / 'unet' / 'klein').mkdir(parents=True)
+        # Declares a 4 GB header it does not carry — the shape of a download that
+        # stopped, or a file copied off a full disk.
+        (base / 'models' / 'unet' / 'klein' / 'flux-2-klein-9b-kv-fp8.safetensors').write_bytes(
+            struct.pack('<Q', 4 * 1024 ** 3) + b'\0' * 4096)
+        (base / 'models' / 'vae').mkdir(parents=True)
+        (base / 'models' / 'vae' / 'flux2-vae.safetensors').write_bytes(_VALID_ST)
+        (base / 'models' / 'text_encoders').mkdir(parents=True)
+        (base / 'models' / 'text_encoders' / 'qwen_3_8b_fp8mixed.safetensors').write_bytes(_VALID_ST)
+        config.save_config({'comfyui': {'base_dir': str(base)}})
+        with patch('app.capabilities._http_ok', return_value=True):
+            caps = capabilities.probe(force=True)
+    assert caps['engines']['klein'] is False
+    assert 'klein_model' not in caps['comfyui']['klein_missing']   # it is NOT missing
+    invalid = {i['asset']: i for i in caps['comfyui']['klein_invalid']}
+    assert invalid['klein_model']['verdict'] == 'truncated_or_garbage'
+    assert invalid['klein_model']['blocking'] is True
+    assert invalid['klein_model']['filename'] == 'flux-2-klein-9b-kv-fp8.safetensors'
+    # Nothing else was wrong on his machine — which is exactly why blaming the
+    # weights read as nonsense: the enum probe found no gap either.
+    assert caps['comfyui']['klein_unsupported_enums'] == []
 
 
 def test_klein_invalid_too_small_is_advisory_and_does_not_gate(app, monkeypatch, tmp_path):
@@ -260,6 +306,153 @@ def test_probe_aitoolkit_valid(app, tmp_path):
         config.save_config({'aitoolkit': {'dir': str(root)}})
         result = capabilities.probe_aitoolkit()
     assert result['ok'] is True
+
+# ── ai-toolkit without a venv (reported on Reddit by Psyko_2000) ─────────────
+# A community easy-install script sets ai-toolkit up with a `python_embeded`
+# folder and no venv at all. The wizard used to answer "set up its Python venv
+# per the README" — a remedy that install can never follow. The probe must state
+# what it FOUND, and hand back the interpreter sitting right there so the UI can
+# offer it in one click.
+
+def _portable_aitoolkit(tmp_path):
+    root = tmp_path / 'aitoolkit'
+    (root / 'python_embeded').mkdir(parents=True)
+    (root / 'python_embeded' / 'python.exe').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    return root
+
+def test_probe_aitoolkit_finds_a_portable_interpreter_in_the_folder(app, tmp_path):
+    with app.app_context():
+        from app import capabilities, config
+        root = _portable_aitoolkit(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root)}})
+        result = capabilities.probe_aitoolkit()
+    assert result['ok'] is False          # nothing is auto-applied
+    assert result['has_run'] is True      # ...but the checkout IS recognised
+    assert result['python_candidates'] == [str(root / 'python_embeded' / 'python.exe')]
+    # The detail names the observation and BOTH ways out — never "a venv is missing".
+    assert 'no Python interpreter found' in result['detail']
+    assert 'Settings' in result['detail']
+    assert 'no venv/.venv' not in result['detail']
+
+def test_probe_aitoolkit_degrades_cleanly_when_nothing_is_there(app, tmp_path):
+    with app.app_context():
+        from app import capabilities, config
+        root = tmp_path / 'aitoolkit'
+        (root / 'toolkit').mkdir(parents=True)     # a checkout, no interpreter anywhere
+        (root / 'run.py').write_text('fake')
+        config.save_config({'aitoolkit': {'dir': str(root)}})
+        result = capabilities.probe_aitoolkit()
+    assert result['ok'] is False
+    assert result['has_run'] is True
+    assert result['python_candidates'] == []      # empty, not a guess
+    assert 'no Python interpreter found' in result['detail']
+
+def test_aitoolkit_candidates_survive_an_unreadable_folder(app, tmp_path):
+    with app.app_context():
+        from app import capabilities
+        assert capabilities.aitoolkit_python_candidates(tmp_path / 'nope') == []
+
+def test_explicit_aitoolkit_python_makes_a_venv_less_install_valid(app, tmp_path):
+    """The one-click offer lands here: saving aitoolkit.python flips the step."""
+    with app.app_context():
+        from app import capabilities, config
+        root = _portable_aitoolkit(tmp_path)
+        config.save_config({'aitoolkit': {
+            'dir': str(root),
+            'python': str(root / 'python_embeded' / 'python.exe')}})
+        result = capabilities.probe_aitoolkit()
+    assert result['ok'] is True
+
+
+# --- the interpreter can be there and still be useless (GitHub #19, strouder) ---
+
+def _explicit_and_venv(tmp_path):
+    """An ai-toolkit checkout with a working `venv/` AND an explicit
+    `aitoolkit.python` pointing somewhere else — the exact #19 shape."""
+    root = tmp_path / 'ai-toolkit'
+    (root / 'venv' / 'Scripts').mkdir(parents=True)
+    (root / 'venv' / 'bin').mkdir(parents=True)
+    (root / 'venv' / 'Scripts' / 'python.exe').write_text('fake')
+    (root / 'venv' / 'bin' / 'python').write_text('fake')
+    (root / 'run.py').write_text('fake')
+    stray = tmp_path / 'stray'
+    stray.mkdir()
+    exe = stray / ('python.exe' if os.name == 'nt' else 'python')
+    exe.write_text('fake')
+    return root, exe
+
+def _probe(**by_python):
+    """Fake `_cached_import_state`: decide per interpreter path. `torch` = has
+    torch, `alive` = runs at all but has no torch, `dead` = cannot be executed."""
+    def fake(key, python, expr):
+        kind = next((v for k, v in by_python.items() if k in python), 'dead')
+        if kind == 'dead':
+            return False                    # the seam reports False for everything
+        if expr == 'pass':
+            return True
+        return kind == 'torch'
+    return fake
+
+def test_a_torchless_interpreter_is_reported_with_the_venv_that_works(app, tmp_path):
+    """The offer that turns a dead end into one click."""
+    with app.app_context():
+        from app import capabilities, config
+        root, stray = _explicit_and_venv(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root), 'python': str(stray)}})
+        with patch.object(capabilities, '_cached_import_state',
+                          side_effect=_probe(venv='torch', stray='alive')):
+            report = capabilities.aitoolkit_interpreter_report()
+    assert report['torch'] is False
+    assert 'venv' in report['alternative']
+
+def test_an_interpreter_that_cannot_run_at_all_is_UNKNOWN_not_torchless(app, tmp_path):
+    """"This file is not a working Python" is a different problem from "this
+    Python has no torch" — and a launch must never be refused on a guess."""
+    with app.app_context():
+        from app import capabilities, config
+        root, stray = _explicit_and_venv(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root), 'python': str(stray)}})
+        with patch.object(capabilities, '_cached_import_state',
+                          side_effect=_probe(venv='torch')):   # stray -> dead
+            report = capabilities.aitoolkit_interpreter_report()
+    assert report['torch'] is None
+    assert report['alternative'] == ''
+
+def test_no_alternative_is_claimed_when_the_user_never_set_one(app, tmp_path):
+    """With no explicit override there is nothing to switch AWAY from — the
+    resolved interpreter IS the venv, so offering it would be nonsense."""
+    with app.app_context():
+        from app import capabilities, config
+        root, _stray = _explicit_and_venv(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root), 'python': ''}})
+        with patch.object(capabilities, '_cached_import_state',
+                          side_effect=_probe(venv='alive')):
+            report = capabilities.aitoolkit_interpreter_report()
+    assert report['torch'] is False
+    assert report['alternative'] == ''
+
+def test_the_aitoolkit_test_button_fails_on_a_python_without_torch(app, tmp_path):
+    """RED before this wave: folder checks alone went green on the broken setup."""
+    with app.app_context():
+        from app import capabilities, config
+        root, stray = _explicit_and_venv(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root), 'python': str(stray)}})
+        assert capabilities.probe_aitoolkit()['ok'] is True     # folders: fine
+        with patch.object(capabilities, '_cached_import_state',
+                          side_effect=_probe(venv='torch', stray='alive')):
+            result = capabilities.probe_aitoolkit_test()
+    assert result['ok'] is False
+    assert 'import torch' in result['detail']
+
+def test_the_test_button_stays_green_on_an_unanswered_probe(app, tmp_path):
+    """A cold-import timeout is not a failed test."""
+    with app.app_context():
+        from app import capabilities, config
+        root, stray = _explicit_and_venv(tmp_path)
+        config.save_config({'aitoolkit': {'dir': str(root), 'python': str(stray)}})
+        with patch.object(capabilities, '_cached_import_state', return_value=None):
+            assert capabilities.probe_aitoolkit_test()['ok'] is True
 
 def test_probe_comfyui_unreachable(app):
     with app.app_context():
@@ -363,9 +556,10 @@ def test_import_probe_result_is_cached(app, monkeypatch):
 
 def test_import_probe_timeout_is_not_cached_as_failure(app, monkeypatch):
     """_import_ok → None (subprocess TIMEOUT, e.g. rembg's first cold import
-    compiling numba caches) must report not-ready NOW but not poison the 10 min
-    cache: the next probe re-tries (warm import ~1 s → ✓). A real import error
-    (False) stays cached as before."""
+    compiling numba caches) must report not-ready NOW and must not poison the
+    10 min cache — but it is remembered BRIEFLY (_UNKNOWN_TTL), because the
+    caller polls: an uncached unknown re-spawned a 90 s subprocess on every
+    single call. A real import error (False) stays cached for the long TTL."""
     with app.app_context():
         from app import capabilities
         calls = []
@@ -374,12 +568,67 @@ def test_import_probe_timeout_is_not_cached_as_failure(app, monkeypatch):
         capabilities._import_cache.clear()
         assert capabilities.probe_masks()['ok'] is False
         assert capabilities.probe_masks()['ok'] is False
-        assert len(calls) == 2                       # re-probed: nothing cached
+        assert len(calls) == 1                       # the unknown is remembered…
+        # …but only briefly: past _UNKNOWN_TTL it re-tries, against what is by
+        # then a warm import. Age the entry rather than sleep.
+        for k, (ts, ok) in list(capabilities._import_cache.items()):
+            capabilities._import_cache[k] = (ts - capabilities._UNKNOWN_TTL - 1, ok)
+        assert capabilities.probe_masks()['ok'] is False
+        assert len(calls) == 2                       # re-probed after the short TTL
+        assert capabilities._UNKNOWN_TTL < capabilities._IMPORT_TTL
         monkeypatch.setattr(capabilities, '_import_ok',
                             lambda *a, **k: calls.append(1) or False)  # real failure
+        for k, (ts, ok) in list(capabilities._import_cache.items()):
+            capabilities._import_cache[k] = (ts - capabilities._UNKNOWN_TTL - 1, ok)
         assert capabilities.probe_masks()['ok'] is False
         assert capabilities.probe_masks()['ok'] is False
         assert len(calls) == 3                       # cached after the real False
+
+
+def test_import_probe_budget_matches_the_scoring_probe(app):
+    """60 s was not enough for a cold `import torch` behind an antivirus — the
+    repo says so itself in scoring_python.PROBE_TIMEOUT (90 s), and the two
+    probes disagreeing about the SAME interpreter is exactly the bug."""
+    from app import capabilities
+    from app.services import scoring_python
+    assert capabilities._IMPORT_TIMEOUT >= scoring_python.PROBE_TIMEOUT
+
+
+def test_unanswered_cuda_probe_does_not_read_as_no_cuda(app, monkeypatch):
+    """The GPU-exclusive window is decided by bank_scoring_gpu_available(). A
+    probe that never answered must not be reported as 'this interpreter has no
+    CUDA': the scoring child picks cuda on its own, so on a machine that HAS a
+    card the window has to be taken until we know better. A card-less machine
+    still gets False — it can never use a window."""
+    with app.app_context():
+        from app import capabilities
+        monkeypatch.setattr(capabilities, '_import_ok', lambda *a, **k: None)  # timeout
+        capabilities._import_cache.clear()
+        monkeypatch.setattr(capabilities, 'gpu_vram_gb', lambda: 24.0)
+        assert capabilities.bank_scoring_gpu_available() is True
+        capabilities._import_cache.clear()
+        monkeypatch.setattr(capabilities, 'gpu_vram_gb', lambda: None)
+        assert capabilities.bank_scoring_gpu_available() is False
+        # …and a probe that DID answer still rules, card or no card
+        capabilities._import_cache.clear()
+        monkeypatch.setattr(capabilities, '_import_ok', lambda *a, **k: False)
+        monkeypatch.setattr(capabilities, 'gpu_vram_gb', lambda: 24.0)
+        assert capabilities.bank_scoring_gpu_available() is False
+
+
+def test_unanswered_cuda_probe_is_not_re_spawned_on_every_poll(app, monkeypatch):
+    """The Bank panel asks for the score device every ~2 s. Each unanswered
+    probe used to cost a fresh 90 s `import torch` subprocess."""
+    with app.app_context():
+        from app import capabilities
+        calls = []
+        monkeypatch.setattr(capabilities, '_import_ok',
+                            lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr(capabilities, 'gpu_vram_gb', lambda: None)
+        capabilities._import_cache.clear()
+        for _ in range(5):
+            capabilities.bank_scoring_gpu_available()
+        assert len(calls) == 1
 
 
 def test_import_probe_cache_key_includes_interpreter_path(app, monkeypatch):
@@ -411,7 +660,7 @@ def test_scan_models_empty_when_comfyui_unset(app):
     with app.app_context():
         from app import capabilities
         models = capabilities._scan_models()
-    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': []}
+    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': [], 'qwen_edit': []}
 
 def test_scan_models_matches_rules(app, tmp_path):
     with app.app_context():
@@ -438,7 +687,7 @@ def test_scan_models_never_raises_on_absent_dir(app, tmp_path):
         from app import capabilities, config
         config.save_config({'comfyui': {'base_dir': str(tmp_path / 'does_not_exist')}})
         models = capabilities._scan_models()
-    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': []}
+    assert models == {'zimage': [], 'sdxl': [], 'krea': [], 'klein': [], 'qwen_multiangle': [], 'qwen_edit': []}
 
 
 # --- resolve_comfyui_base: portable-wrapper nesting ----------------------
@@ -875,7 +1124,10 @@ def test_classify_comfyui_dir_random_folder(tmp_path):
 
 def test_classify_comfyui_dir_blank():
     from app.capabilities import classify_comfyui_dir
-    assert classify_comfyui_dir('') == {'status': 'empty', 'resolved': '', 'suggestion': ''}
+    assert classify_comfyui_dir('') == {'status': 'empty', 'resolved': '', 'suggestion': '',
+                                        # nothing typed -> nothing to probe (see
+                                        # test_comfy_input_folder_handoff.py)
+                                        'input_check': {'path': '', 'ok': None, 'problem': ''}}
     assert classify_comfyui_dir('   ')['status'] == 'empty'
 
 

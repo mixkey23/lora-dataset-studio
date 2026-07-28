@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from ..utils.timestamps import utc_stamp
 
 from ..extensions import db
 from ..models import SystemState, TrainingRunRecord
@@ -134,7 +134,7 @@ def run_if_needed() -> dict:
             return state                       # already done at this rule version
         edges = reconstruct_edges()
         summary = {'version': BACKFILL_VERSION, 'edges': edges,
-                   'ran_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z'}
+                   'ran_at': utc_stamp()}
         _save_state(summary)
         if edges:
             logger.info('lineage backfill: reconstructed %d edge(s)', edges)

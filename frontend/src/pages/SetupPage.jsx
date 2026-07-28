@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { apiFetch, putJson, postJson } from '../api/fetchClient'
 import { useToast } from '../components/common/Toast'
 import { useCapabilities } from '../context/CapabilitiesContext'
 import { deriveSetupSteps, deriveCapabilitySummary, SETUP_STEP_IDS, kleinMissingLabels,
-  comfyuiDirVerdict, COMFYUI_SKIP_LOST, COMFYUI_SKIP_KEPT, installAllPlan } from '../hooks/useSetupSteps'
+  comfyuiDirVerdict, COMFYUI_SKIP_LOST, COMFYUI_SKIP_KEPT, installAllPlan,
+  aitoolkitVerdict, AITOOLKIT_INSTALL_STEPS } from '../hooks/useSetupSteps'
+import SettingsLink from '../components/common/SettingsLink'
 import GuidedSteps from '../components/setup/GuidedSteps'
 import InstallRunner from '../components/setup/InstallRunner'
 import InstallEverything from '../components/setup/InstallEverything'
 import { HelpBadge } from '../help/HelpMode'
+import { comfyEnumUnavailableReason } from '../utils/comfyEnumSupport.js'
 
 const INPUT_CLASS =
   'mt-1 w-full rounded-md border border-border-strong bg-surface-raised px-3 py-2 text-sm text-content ' +
@@ -19,7 +22,14 @@ const KEY_FIELDS = [
     href: 'https://aistudio.google.com/apikey', help: 'Powers Nano Banana.' },
   { key: 'OPENAI_API_KEY', label: 'OpenAI API key', engine: 'chatgpt',
     href: 'https://platform.openai.com/api-keys', help: 'Powers ChatGPT (gpt-image-2).' },
+  { key: 'OPENROUTER_API_KEY', label: 'OpenRouter API key', engine: 'openrouter',
+    href: 'https://openrouter.ai/keys',
+    help: 'Powers the OpenRouter engine — one key and one balance for the same '
+      + 'upstream models. Pick the model in Settings \u203a Image engines.' },
 ]
+
+/** Which capability probe the "Save & test" button runs for each key field. */
+const KEY_TEST_TARGET = { nanobanana: 'gemini', chatgpt: 'openai', openrouter: 'openrouter' }
 
 // Default local vision model + rough VRAM notes surfaced in the wizard. The
 // ABLITERATED Qwen3-VL is required — vanilla qwen3-vl refuses to caption the NSFW
@@ -55,6 +65,7 @@ const STATUS_META = {
 const CAPABILITY_STEP_ID = {
   'Nano Banana (Gemini)': 'image',
   'ChatGPT (gpt-image-2)': 'image',
+  'OpenRouter': 'image',
   'Klein (local)': 'comfyui',
   'Captioning': 'ollama',
   'Auto-framing & head-crop': 'ollama',
@@ -76,7 +87,22 @@ export default function SetupPage() {
   const [detected, setDetected] = useState(null)   // autodetect result (path suggestions)
   const [detecting, setDetecting] = useState(false)
   const [scanned, setScanned] = useState(false)     // the on-load scan has completed at least once
-  const [screen, setScreen] = useState(0)           // index into SCREENS
+  // Deep link: /setup?step=<tool id> opens that wizard screen straight away.
+  // The Settings ▸ Overview capability rows link here — "✗ Person masks" must
+  // land ON the install button, not on the welcome screen with 4 Next clicks in
+  // between. Applied to the INITIAL state (not an effect) so the wizard never
+  // flashes the welcome screen first; an unknown/absent step falls back to 0.
+  const [searchParams] = useSearchParams()
+  const [screen, setScreen] = useState(() => {
+    const raw = searchParams.get('step')
+    const i = SETUP_STEP_IDS.indexOf(raw)
+    if (i >= 0) return i + 1                        // welcome=0, tools=1..N
+    // The screens that are NOT tool steps are addressable too: the install /
+    // repair menu is where the one-click engine installs live (Krea 2 Edit), and
+    // a help topic pointing at ?step=install must land there, not on welcome.
+    const j = SCREENS.indexOf(raw)
+    return j > 0 ? j : 0
+  })
   const [advancing, setAdvancing] = useState(false) // Next is mid save-&-recheck
   const [startingOllama, setStartingOllama] = useState(false) // "Start Ollama" in flight
   const [dirCheck, setDirCheck] = useState(null)    // live classify of the typed ComfyUI dir
@@ -290,7 +316,7 @@ export default function SetupPage() {
                 onChange={(e) => setSecretInputs((p) => ({ ...p, [f.key]: e.target.value }))} />
               <div className="mt-1 flex items-center gap-3">
                 <a href={f.href} target="_blank" rel="noreferrer" className="text-xs text-primary underline">Get a key</a>
-                <button type="button" onClick={() => saveSecretThenTest(f.key, f.engine === 'nanobanana' ? 'gemini' : 'openai')}
+                <button type="button" onClick={() => saveSecretThenTest(f.key, KEY_TEST_TARGET[f.engine])}
                   className="text-xs text-content-muted underline">Save &amp; test</button>
               </div>
             </div>
@@ -307,9 +333,37 @@ export default function SetupPage() {
       const kleinMissing = step.kleinMissing || []
       const missingLabels = kleinMissingLabels(kleinMissing)
       const missingSummary = missingLabels.length ? missingLabels.join(' + ') : ''
-      const installBtn = (action, label) => kleinMissing.includes(action)
-        ? <InstallRunner action={action} buttonLabel={label} onDone={() => refresh(true)} />
-        : <p className="text-xs text-emerald-400">✓ Installed</p>
+      // Null on a capable install AND on an unreachable one (the probe fails open),
+      // so this line only ever appears when we actually proved the gap.
+      const kleinEnumReason = comfyEnumUnavailableReason(step.unsupportedEnums)
+      // THE reason Klein is not usable, worded by the same helper the generation
+      // panel uses — so this screen can no longer name a different cause (or a
+      // missing file that is sitting on the disk) from the one that refuses the
+      // engine two clicks later. Null when Klein is ready.
+      const kleinReason = step.kleinReason
+      // A file that is ON DISK but unreadable must never render "✓ Installed": that
+      // badge is what sent a user with a truncated 9.5 GB UNET to look for a file he
+      // already had (zigzag4794, Discord). Three states, three actions — and the
+      // word carries the state, not just the colour.
+      const kleinBrokenBy = {}
+      ;(step.kleinBroken || []).forEach((i) => { kleinBrokenBy[i.asset] = i })
+      const installBtn = (action, label) => {
+        const bad = kleinBrokenBy[action]
+        if (bad) {
+          return (
+            <>
+              <p className="break-words text-xs text-rose-300">
+                ⚠ On disk, unreadable — {bad.filename}. Downloading again replaces it.
+              </p>
+              <InstallRunner action={action} buttonLabel={`↻ Download ${label.replace(/^⬇ Download /, '')} again`}
+                onDone={() => refresh(true)} />
+            </>
+          )
+        }
+        return kleinMissing.includes(action)
+          ? <InstallRunner action={action} buttonLabel={label} onDone={() => refresh(true)} />
+          : <p className="text-xs text-emerald-400">✓ Installed</p>
+      }
       // Live verdict on the CURRENTLY-TYPED directory (from /api/setup/comfyui-dir),
       // shown the moment the field changes — a wrong path, an empty folder, or the
       // launcher/parent folder (with a one-click "use the child" adopt). The verdict
@@ -328,6 +382,13 @@ export default function SetupPage() {
             return (
               <div className="space-y-1.5">
                 <p className={`text-xs ${cls}`}>{glyph} {v.message}</p>
+                {/* Non-blocking: the folder IS a ComfyUI install, but this process
+                    cannot hand files to it (another container, a read-only mount).
+                    Wraps freely — the message names a path and must stay readable
+                    at 400px. */}
+                {v.note && (
+                  <p className="break-words text-xs text-amber-400">⚠ {v.note}</p>
+                )}
                 {v.suggestion && (
                   <button type="button" onClick={() => setField('comfyui', 'base_dir', v.suggestion)}
                     className="rounded-md border border-border-strong px-2.5 py-1 text-xs font-medium text-primary hover:bg-surface-raised">
@@ -349,6 +410,40 @@ export default function SetupPage() {
               replaces the old "Save & re-check to validate" placeholder — the check
               runs as you type, and the folder it judged is pinned to the field value. */}
           {dirVerdictNode}
+          {/* Capability gap on the GRAPH's widget values, not on the files: this
+              ComfyUI doesn't offer a value the Klein workflow pins. That is what
+              the `beta57` scheduler did — added to ComfyUI's core list by the
+              RES4LYF node pack, so it ran on the machine the graph was captured on
+              and nowhere else (reported by IndependentProcess0 on Reddit). The
+              shipped graph no longer does this; the line stays for the next one and
+              for workflow files a user has edited. Deliberately NOT substituted
+              with a near-equivalent: a scheduler changes the render, and two users
+              with identical settings must not get different images. Rendered ahead
+              of the weights block — no download fixes this. */}
+          {/* Only when ComfyUI ANSWERED: an unreachable one makes this step's own
+              fields the answer, and "⚠ Configure ComfyUI in Settings" printed on
+              the ComfyUI configuration screen is noise. */}
+          {step.reachable && kleinReason && (
+            <p className="break-words text-xs text-rose-300">
+              {kleinReason}{' '}
+              {(step.unsupportedEnums || []).filter((i) => i && i.url).map((i) => (
+                <a key={i.url} href={i.url} target="_blank" rel="noreferrer"
+                  className="underline break-all">{i.url}</a>
+              ))}
+            </p>
+          )}
+          {/* A ✓ must mean "I checked". With ComfyUI down, the checks that need it
+              (the unsupported-value probe, the node probe) fail OPEN — they report
+              nothing rather than inventing a gap — so every file being on disk is
+              NOT a clean bill of health, and this says so rather than letting an
+              empty warning list read as one. */}
+          {!step.reachable && step.kleinFilesReady && step.dirValid && (
+            <p className="break-words text-xs text-amber-300">
+              ⚠ Not checked — every Klein file is on disk and readable, but ComfyUI isn't
+              answering, so the app could not verify that Klein actually runs here. Start
+              ComfyUI and re-check.
+            </p>
+          )}
           {step.reachable && !step.hasKlein && (
             <div className="space-y-1 text-xs text-content-muted">
               {missingSummary && (
@@ -496,11 +591,19 @@ export default function SetupPage() {
       if (step.reachable) {
         return (
           <div className="space-y-4">
-            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-content">
-              ✓ ComfyUI is already running at <span className="font-mono">{step.apiUrl || 'the configured URL'}</span>.
+            {/* The banner used to end with "Klein still needs the ${missingSummary}"
+                — and missingSummary is EMPTY whenever the gap isn't a missing file
+                (a corrupted weight, a widget value this ComfyUI doesn't offer), so
+                the sentence rendered a blank where the cause belonged. It now
+                either confirms readiness or defers to the one shared reason line
+                below, which names the real gap. */}
+            <div className={`rounded-md border px-3 py-2 text-sm text-content ${step.hasKlein
+              ? 'border-emerald-500/30 bg-emerald-500/10' : 'border-amber-500/40 bg-amber-500/10'}`}>
+              <span aria-hidden="true">{step.hasKlein ? '✓' : '⚠'}</span>{' '}
+              ComfyUI is running at <span className="font-mono">{step.apiUrl || 'the configured URL'}</span>.
               {step.hasKlein
-                ? ' Nothing to do here.'
-                : ` It works — Klein still needs the ${missingSummary} (optional, for local generation).`}
+                ? ' Klein is ready — nothing to do here.'
+                : ' Klein is not usable yet (local generation is optional) — see below.'}
             </div>
             {fields}
           </div>
@@ -600,7 +703,7 @@ export default function SetupPage() {
         { action: 'face_scoring', cap: 'face_scoring', icon: '🎭', title: 'Face-similarity scoring',
           body: 'Powers the "Analyze faces" pass: scores how closely each generated image resembles your reference photo, so you keep the ones that truly look like the person. It only ranks — it never deletes anything.' },
         { action: 'masks', cap: 'masks', icon: '🧍', title: 'Person masks',
-          body: 'Isolates the subject from the background for masked training: the décor is weighted down so the LoRA binds the identity to the person, not the room. A training without masks is still valid.' },
+          body: 'Isolates the subject from the background for masked training: the surroundings are weighted down so the LoRA binds the identity to the person, not the room. A training without masks is still valid.' },
         { action: 'watermark_inpaint', cap: 'watermark_inpaint', icon: '🧽', title: 'Watermark inpainting',
           body: 'Repaints small off-center watermarks (LaMa) during 🧽 Clean instead of only cropping border marks. It can use CUDA or CPU from Settings. Without it, off-center marks are skipped.' },
         { action: 'bank_scoring', cap: 'bank_scoring', icon: '✨', title: 'Bank scoring (aesthetic · NSFW · style)',
@@ -702,12 +805,33 @@ export default function SetupPage() {
         </div>
       )
     }
-    // Pointed at a folder that isn't usable yet (venv missing) → finish it, don't re-clone.
+    // Pointed at a folder that isn't usable yet → finish it, don't re-clone. The
+    // copy states what was OBSERVED (no interpreter in there) instead of asserting
+    // a venv is missing: portable/conda/uv/system installs have no venv and never
+    // will, and telling those users to make one is a dead end. Both routes are
+    // offered with the same weight, and when an interpreter is actually sitting in
+    // that folder it becomes one click — the same "found on disk → use it" move
+    // the directory suggestion above already makes.
     if (dir) {
+      const verdict = aitoolkitVerdict(step, dir)
       return (
         <div className="space-y-4">
-          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-content">
-            Pointed at <span className="font-mono">{dir}</span>, but it isn't usable yet — set up its Python venv per the README.
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-content space-y-2">
+            <p className="font-medium break-words">{verdict.headline}</p>
+            <p className="text-xs leading-relaxed text-content-muted">{verdict.body}</p>
+            {verdict.candidates.map((p) => (
+              <button key={p} type="button"
+                onClick={() => applyDetectedPath('aitoolkit', 'python', p)}
+                className="block w-full rounded-lg bg-gradient-primary px-3 py-2 text-left text-xs font-semibold text-white sm:w-auto">
+                Use this Python: <span className="font-mono break-all">{p}</span>
+              </button>
+            ))}
+            {verdict.action && (
+              <SettingsLink section={verdict.settingsSection} focus={verdict.settingsFocus}
+                tone="warning" className="block">
+                {verdict.action}
+              </SettingsLink>
+            )}
           </div>
           {fields}
         </div>
@@ -715,10 +839,8 @@ export default function SetupPage() {
     }
     return (
       <GuidedSteps
-        intro="ai-toolkit trains the LoRA. Install it once, then point the app at its folder."
-        steps={[
-          { text: 'Clone ai-toolkit and set up its venv per its README.', command: 'git clone https://github.com/ostris/ai-toolkit' },
-        ]}
+        intro="ai-toolkit trains the LoRA. Install it once, give it a Python, then point the app at its folder."
+        steps={AITOOLKIT_INSTALL_STEPS}
         link={{ href: 'https://github.com/ostris/ai-toolkit', label: 'ai-toolkit on GitHub →' }}>
         {fields}
       </GuidedSteps>

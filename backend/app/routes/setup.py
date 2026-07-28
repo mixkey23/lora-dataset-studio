@@ -25,6 +25,28 @@ def setup_validate_comfyui_dir():
     return jsonify(capabilities.classify_comfyui_dir(request.args.get('path', '')))
 
 
+@bp.get('/comfyui-folders')
+def setup_resolve_comfyui_folders():
+    """Resolve the four ComfyUI working folders (output/input/models/loras) for the
+    values currently TYPED in Settings, without saving anything, so each override
+    field can show the effective path it falls back to and flag one that is not on
+    disk. `?base_dir=` plus optional `?output_dir=&input_dir=&models_dir=&loras_dir=`.
+
+    `?detect=1` additionally asks the running ComfyUI which custom folders it was
+    launched with (its own argv, via /system_stats) so the UI can offer them in one
+    click. That is one short network call, hence opt-in; `detected` is {} whenever
+    ComfyUI is unreachable, too old to report its argv, or was started with no
+    custom folder flags — never a guessed path."""
+    base_dir = request.args.get('base_dir', '')
+    overrides = {k: request.args.get(k, '') for k in
+                 ('output_dir', 'input_dir', 'models_dir', 'loras_dir')}
+    payload = {'folders': capabilities.classify_comfyui_folders(base_dir, overrides),
+               'detected': {}}
+    if request.args.get('detect'):
+        payload['detected'] = capabilities.detect_comfyui_folders()
+    return jsonify(payload)
+
+
 @bp.post('/install/<action>')
 def start_install(action):
     if action not in setup_installer.INSTALL_ACTIONS:
@@ -62,6 +84,30 @@ def start_install_all():
     race. Returns the plan + each action's status for the global progress bar."""
     caps = capabilities.probe()
     return jsonify(setup_installer.start_all(caps))
+
+
+@bp.get('/install-group/<group>/plan')
+def install_group_plan(group):
+    """What the one-click install for a NAMED group (today: the Krea 2 Edit
+    engine — node pack + four weights) would queue right now. Read-only, so the
+    button can show its own count and stay honest about what is already there."""
+    if group not in setup_installer._INSTALL_GROUPS:
+        return jsonify({'error': f'unknown group: {group}'}), 404
+    # force=True: this plan is read right after the ComfyUI folder is saved, and a
+    # 30 s-stale probe would answer "nothing to install" for a machine that has
+    # nothing installed — the exact opposite of the truth.
+    return jsonify({'plan': setup_installer.install_group_plan(
+        group, capabilities.probe(force=True))})
+
+
+@bp.post('/install-group/<group>')
+def start_install_group(group):
+    """Install a whole engine in one click without dragging it into the
+    unattended 'Install everything' plan — a second local engine is ~20 GB, so it
+    downloads when it is ASKED for, not by default."""
+    if group not in setup_installer._INSTALL_GROUPS:
+        return jsonify({'error': f'unknown group: {group}'}), 404
+    return jsonify(setup_installer.start_group(group, capabilities.probe(force=True)))
 
 
 @bp.get('/install-all/status')

@@ -4,8 +4,46 @@ import { useToast } from '../components/common/Toast'
 import { HelpBadge } from '../help/HelpMode'
 import BankWorkspace from '../components/bank/BankWorkspace'
 import FolderPickerField from '../components/common/FolderPicker'
+import { hiddenCount, previewSlots } from '../components/bank/bankPreview'
+import { bankListSyncToast } from '../components/bank/bankSync'
+import { overlapNotice } from '../components/bank/bankOverlap'
+import FolderSyncNote from '../components/bank/FolderSyncNote'
+import RelocateBankDialog from '../components/bank/RelocateBankDialog'
+import BankScrapePanel from '../components/bank/BankScrapePanel'
 
 const CURRENT_KEY = 'bankCurrentId'
+
+/** The card's thumbnail strip: the bank's first few images, so a list of banks
+ * reads at a glance instead of as a wall of folder paths. Clicking a thumbnail
+ * opens the bank, like the title and the Open button. Thumbnails are served by
+ * the same route the workspace grid uses (generated on demand when the bank was
+ * never scanned) and load lazily, so an off-screen card costs nothing. */
+function BankPreviewStrip({ bank, onOpen }) {
+  if (!bank.preview_ids?.length) return null
+  const extra = hiddenCount(bank.total, bank.preview_ids)
+  return (
+    <div className="relative grid grid-cols-5 gap-1">
+      {previewSlots(bank.preview_ids).map((id, i) => (
+        <div key={id ?? `empty-${i}`}
+          className="aspect-square overflow-hidden rounded border border-border bg-surface-raised">
+          {id != null && (
+            <button type="button" onClick={onOpen} tabIndex={-1} aria-hidden="true"
+              className="block h-full w-full">
+              <img src={`/api/bank/${bank.id}/thumb/${id}`} alt="" loading="lazy"
+                onError={(e) => { e.currentTarget.style.visibility = 'hidden' }}
+                className="h-full w-full object-cover" />
+            </button>
+          )}
+        </div>
+      ))}
+      {extra > 0 && (
+        <span className="pointer-events-none absolute bottom-1 right-1 rounded bg-black/60 px-1 text-[0.625rem] font-semibold text-white">
+          +{extra}
+        </span>
+      )}
+    </div>
+  )
+}
 
 /** 🗃️ Image bank — triage a big unsorted folder BEFORE it becomes datasets.
  * List view (create/open/delete banks) + per-bank workspace. The bank
@@ -20,11 +58,16 @@ export default function BankPage() {
   const [name, setName] = useState('')
   const [folder, setFolder] = useState('')
   const [creating, setCreating] = useState(false)
+  const [relocating, setRelocating] = useState(null)   // the bank being repointed
 
   const refresh = useCallback(async () => {
     try {
       const d = await apiFetch('/api/banks')
       setBanks(d.banks || [])
+      // The server re-walked every source folder before answering: say so when
+      // it found something, so the counters never move without an explanation.
+      const note = bankListSyncToast(d.banks)
+      if (note) toast.success(note.text)
     } catch (e) {
       toast.error(e?.message || 'Could not load the banks.')
       setBanks([])
@@ -49,6 +92,10 @@ export default function BankPage() {
     try {
       const d = await postJson('/api/bank/create', { name, folder })
       toast.success(`Bank created — ${d.added} image(s) inventoried.`)
+      // Nested folders mean two banks over the same files. Harmless while
+      // triaging, destructive at 🗑 Delete rejected — said once, up front.
+      const overlap = overlapNotice(d.overlaps)
+      if (overlap) toast.warning(overlap, 12000)
       setName(''); setFolder('')
       open(d.id)
     } catch (err) {
@@ -78,7 +125,6 @@ export default function BankPage() {
     <div className="space-y-6">
       <header className="flex items-center gap-2">
         <h1 className="text-xl font-bold text-content">🗃️ Image bank</h1>
-        <span className="px-1.5 py-0.5 rounded border border-amber-400/50 bg-amber-500/10 text-amber-300 text-[0.625rem] font-semibold uppercase tracking-wide">Beta</span>
         <HelpBadge topic="page-bank" />
       </header>
       <p className="text-sm text-content-muted max-w-3xl">
@@ -107,6 +153,10 @@ export default function BankPage() {
         </button>
       </form>
 
+      {/* Second way in: the scraper's own destination. A bank no longer needs a
+          folder you prepared by hand — you can fill one straight from the web. */}
+      <BankScrapePanel banks={banks} onDone={refresh} />
+
       {banks == null ? (
         <p className="text-sm text-content-muted">Loading…</p>
       ) : banks.length === 0 ? (
@@ -114,27 +164,38 @@ export default function BankPage() {
           No bank yet — create one above to start triaging a folder.
         </p>
       ) : (
-        <ul className="grid gap-3 sm:grid-cols-2">
+        // grid-cols-1 (= minmax(0,1fr)), NOT the implicit auto column: an auto
+        // column is sized on max-content, so the unbreakable source PATH inside
+        // a card stretched it past the viewport and scrolled the whole page
+        // sideways on a phone — with `truncate` never getting a chance to fire.
+        <ul className="grid gap-3 grid-cols-1 sm:grid-cols-2">
           {banks.map((b) => (
             <li key={b.id}
-              className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-4">
-              <div className="flex items-center gap-2">
+              className="flex min-w-0 flex-col gap-2 rounded-lg border border-border bg-surface p-4">
+              <div className="flex min-w-0 items-center gap-2">
                 <button type="button" onClick={() => open(b.id)}
-                  className="text-left text-base font-semibold text-content hover:underline">
+                  className="min-w-0 truncate text-left text-base font-semibold text-content hover:underline">
                   {b.name}
                 </button>
                 {b.activity && !b.activity.finished && (
                   <span className="text-xs text-amber-300">⏳ {b.activity.kind}…</span>
                 )}
+                <button type="button" onClick={() => setRelocating(b)}
+                  aria-label={`Move the folder of bank ${b.name}`}
+                  title="Moved this folder to another disk? Point the bank at its new location."
+                  className="ml-auto px-1.5 text-content-subtle hover:text-content">📦</button>
                 <button type="button" onClick={() => remove(b)} aria-label={`Remove bank ${b.name}`}
-                  className="ml-auto px-1.5 text-content-subtle hover:text-rose-300">✕</button>
+                  className="px-1.5 text-content-subtle hover:text-rose-300">✕</button>
               </div>
               <p className="truncate font-mono text-xs text-content-subtle" title={b.source_path}>
                 {b.source_path}
               </p>
+              <BankPreviewStrip bank={b} onOpen={() => open(b.id)} />
               <p className="text-xs text-content-muted">
                 {b.total} image(s) · {b.scanned} scanned · <span className="text-emerald-300">{b.keep} kept</span> · <span className="text-rose-300">{b.reject} rejected</span>
               </p>
+              <FolderSyncNote sync={b.folder_sync}
+                onRelocate={() => setRelocating(b)} />
               <button type="button" onClick={() => open(b.id)}
                 className="self-start rounded-md border border-border bg-surface-raised px-3 py-1 text-xs font-semibold text-content hover:bg-surface">
                 Open →
@@ -142,6 +203,12 @@ export default function BankPage() {
             </li>
           ))}
         </ul>
+      )}
+
+      {relocating && (
+        <RelocateBankDialog bankId={relocating.id} bankName={relocating.name}
+          sourcePath={relocating.source_path}
+          onClose={() => setRelocating(null)} onDone={refresh} />
       )}
     </div>
   )

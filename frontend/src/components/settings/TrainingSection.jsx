@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { INPUT_CLASS, Card, SecretField } from './primitives'
+import ResetToDefault from './ResetToDefault'
+import { defaultValueAt } from './settingDefaults.js'
 
 // Keep in sync with backend TRAIN_TYPES (face_dataset_service.py) — 'flux' had
 // been forgotten here when the FLUX.1 family landed (fixed alongside flux2klein).
-const FAMILY_OPTIONS = ['zimage', 'sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image']
+const FAMILY_OPTIONS = ['zimage', 'sdxl', 'krea', 'flux', 'flux2klein', 'qwen_image', 'anima']
 
 /* First-time walkthrough for renting cloud GPUs — collapsed by default so the
    card stays compact for users who already have a key. */
@@ -76,7 +78,10 @@ function CloudOfferFilter({ id, label, help, checked, onChange }) {
 /* Cloud training limits: concurrency cap, offer price ceiling, monthly budget
    and the stall watchdog timeout. Fetches the cloud status ONCE on mount for
    the "Spent this month" info line — no poll, this page is not a dashboard. */
-function CloudTrainingCard({ config, setField }) {
+function CloudTrainingCard({ config, setField, configDefaults }) {
+  // Every shipped value below is read from the server payload (config_defaults),
+  // never retyped: these guardrails move between releases.
+  const dflt = (key) => defaultValueAt(configDefaults, 'cloud', key)
   const [spend, setSpend] = useState(null)
   const verifiedOnly = config.cloud?.verified_only ?? true
   const secureCloudOnly = config.cloud?.secure_cloud_only ?? false
@@ -103,10 +108,12 @@ function CloudTrainingCard({ config, setField }) {
             min="1"
             max="10"
             step="1"
-            value={config.cloud?.max_concurrent_runs ?? 1}
-            onChange={(e) => setField('cloud', 'max_concurrent_runs', parseInt(e.target.value) || 1)}
+            value={config.cloud?.max_concurrent_runs ?? dflt('max_concurrent_runs')}
+            onChange={(e) => setField('cloud', 'max_concurrent_runs', parseInt(e.target.value) || dflt('max_concurrent_runs'))}
             className={INPUT_CLASS}
           />
+          <ResetToDefault label="Max simultaneous cloud runs" section="cloud" field="max_concurrent_runs"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <div>
           <label htmlFor="cloud-max-price-per-hour" className="block text-sm font-medium text-content">
@@ -118,10 +125,12 @@ function CloudTrainingCard({ config, setField }) {
             min="0.1"
             max="5"
             step="0.05"
-            value={config.cloud?.max_price_per_hour ?? 0.8}
+            value={config.cloud?.max_price_per_hour ?? dflt('max_price_per_hour')}
             onChange={(e) => setField('cloud', 'max_price_per_hour', Math.max(0.1, parseFloat(e.target.value) || 0.1))}
             className={INPUT_CLASS}
           />
+          <ResetToDefault label="Max price per hour" section="cloud" field="max_price_per_hour"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <div>
           <label htmlFor="cloud-monthly-budget" className="block text-sm font-medium text-content">
@@ -132,10 +141,12 @@ function CloudTrainingCard({ config, setField }) {
             type="number"
             min="0"
             step="1"
-            value={config.cloud?.monthly_budget_usd ?? 0}
+            value={config.cloud?.monthly_budget_usd ?? dflt('monthly_budget_usd')}
             onChange={(e) => setField('cloud', 'monthly_budget_usd', parseFloat(e.target.value) || 0)}
             className={INPUT_CLASS}
           />
+          <ResetToDefault label="Monthly budget" section="cloud" field="monthly_budget_usd"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <div>
           <label htmlFor="cloud-stall-timeout" className="block text-sm font-medium text-content">
@@ -147,10 +158,32 @@ function CloudTrainingCard({ config, setField }) {
             min="5"
             max="240"
             step="1"
-            value={config.cloud?.stall_timeout_minutes ?? 30}
-            onChange={(e) => setField('cloud', 'stall_timeout_minutes', parseInt(e.target.value) || 30)}
+            value={config.cloud?.stall_timeout_minutes ?? dflt('stall_timeout_minutes')}
+            onChange={(e) => setField('cloud', 'stall_timeout_minutes', parseInt(e.target.value) || dflt('stall_timeout_minutes'))}
             className={INPUT_CLASS}
           />
+          <ResetToDefault label="Stall timeout" section="cloud" field="stall_timeout_minutes"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </div>
+        <div>
+          <label htmlFor="cloud-freeze-watchdog" className="block text-sm font-medium text-content">
+            Freeze watchdog (minutes, 0 = warn only)
+          </label>
+          <input
+            id="cloud-freeze-watchdog"
+            type="number"
+            min="0"
+            max="480"
+            step="1"
+            value={config.cloud?.freeze_watchdog_minutes ?? dflt('freeze_watchdog_minutes')}
+            onChange={(e) => setField('cloud', 'freeze_watchdog_minutes', Math.max(0, parseInt(e.target.value, 10) || 0))}
+            className={INPUT_CLASS}
+          />
+          <p className="mt-1 text-[0.6875rem] text-content-subtle">
+            Last-resort net when a training run stops reporting altogether (a restart, a connection wedged against the pod): the pod is terminated from outside the run, so it can't keep billing unnoticed. Checkpoints already downloaded are kept. Set 0 to only get the warning on the run card. Booting, uploading and downloading are never cut by this.
+          </p>
+          <ResetToDefault label="Freeze watchdog" section="cloud" field="freeze_watchdog_minutes"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <div>
           <label htmlFor="cloud-unreachable-grace" className="block text-sm font-medium text-content">
@@ -162,13 +195,15 @@ function CloudTrainingCard({ config, setField }) {
             min="1"
             max="60"
             step="1"
-            value={config.cloud?.unreachable_grace_minutes ?? 6}
-            onChange={(e) => setField('cloud', 'unreachable_grace_minutes', parseInt(e.target.value) || 6)}
+            value={config.cloud?.unreachable_grace_minutes ?? dflt('unreachable_grace_minutes')}
+            onChange={(e) => setField('cloud', 'unreachable_grace_minutes', parseInt(e.target.value) || dflt('unreachable_grace_minutes'))}
             className={INPUT_CLASS}
           />
           <p className="mt-1 text-[0.6875rem] text-content-subtle">
             How long a mid-run pod may stay unreachable (a vast.ai network blip) before the run is given up and retried on a fresh host. Raise it if healthy runs die with "pod unreachable".
           </p>
+          <ResetToDefault label="Unreachable grace" section="cloud" field="unreachable_grace_minutes"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <div>
           <label htmlFor="cloud-min-reliability" className="block text-sm font-medium text-content">
@@ -180,13 +215,15 @@ function CloudTrainingCard({ config, setField }) {
             min="0.9"
             max="0.999"
             step="0.005"
-            value={config.cloud?.min_reliability ?? 0.98}
-            onChange={(e) => setField('cloud', 'min_reliability', Math.min(0.999, Math.max(0.9, parseFloat(e.target.value) || 0.98)))}
+            value={config.cloud?.min_reliability ?? dflt('min_reliability')}
+            onChange={(e) => setField('cloud', 'min_reliability', Math.min(0.999, Math.max(0.9, parseFloat(e.target.value) || dflt('min_reliability'))))}
             className={INPUT_CLASS}
           />
           <p className="mt-1 text-[0.6875rem] text-content-subtle">
             Lower it (e.g. 0.95) to surface cheaper hosts in the GPU picker — at a higher risk of a pod that never boots (≈ a few wasted cents, auto-cleaned).
           </p>
+          <ResetToDefault label="Min host reliability" section="cloud" field="min_reliability"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
       </div>
       <div className="space-y-2">
@@ -215,8 +252,69 @@ function CloudTrainingCard({ config, setField }) {
   )
 }
 
+/* Concept face masking (issue #15, reported by shivdbz2010 on GitHub). Both knobs
+   are exposed because nobody has measured the right value — no public A/B of a
+   concept LoRA trained with vs without face masking exists — so a frozen number
+   would be a guess dressed as a default. Every shipped value is read from the
+   server payload; a literal here would drift the day the default moves. */
+function ConceptFaceMaskCard({ config, setField, configDefaults }) {
+  const dflt = (key) => defaultValueAt(configDefaults, 'face_mask', key)
+  return (
+    <Card title="Concept face masking"
+      help="Used only by Concept datasets that turned it on in Advanced training options. It weighs the faces down in the training loss so the concept learns the act, not the identities in your photos. It does not alter your images.">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+          <label htmlFor="face-mask-expand" className="block text-sm font-medium text-content">
+            Head coverage (face box ×)
+          </label>
+          <input
+            id="face-mask-expand"
+            type="number"
+            min="1"
+            max="3"
+            step="0.1"
+            value={config.face_mask?.expand ?? dflt('expand')}
+            onChange={(e) => setField('face_mask', 'expand', parseFloat(e.target.value) || dflt('expand'))}
+            className={INPUT_CLASS}
+          />
+          <p className="mt-1 text-xs text-content-muted">
+            Face detection returns a box from the eyes to the chin. This grows it into a head:
+            higher covers hair and jaw, lower stays tight on the face. Preview it on your own
+            images from the training panel — the right value depends on how your shots are framed.
+          </p>
+          <ResetToDefault label="Head coverage" section="face_mask" field="expand"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </div>
+        <div>
+          <label htmlFor="face-mask-min-weight" className="block text-sm font-medium text-content">
+            Loss weight kept on faces
+          </label>
+          <input
+            id="face-mask-min-weight"
+            type="number"
+            min="0.05"
+            max="1"
+            step="0.05"
+            value={config.face_mask?.min_weight ?? dflt('min_weight')}
+            onChange={(e) => setField('face_mask', 'min_weight', parseFloat(e.target.value) || dflt('min_weight'))}
+            className={INPUT_CLASS}
+          />
+          <p className="mt-1 text-xs text-content-muted">
+            How much the masked area still counts. Lower pushes the identity out harder.
+            It does not go to zero on purpose: an area worth nothing is not ignored, it is
+            unpenalised — the model can put anything there at no cost, and reports of
+            degraded anatomy start right below this floor.
+          </p>
+          <ResetToDefault label="Loss weight kept on faces" section="face_mask" field="min_weight"
+            config={config} configDefaults={configDefaults} setField={setField} />
+        </div>
+      </div>
+    </Card>
+  )
+}
+
 export default function TrainingSection(props) {
-  const { config, setField } = props
+  const { config, setField, configDefaults } = props
   return (
     <div className="space-y-6">
       <Card title="Defaults" help="Preselected model family for new training runs — each dataset can still override it.">
@@ -237,7 +335,9 @@ export default function TrainingSection(props) {
         <SecretField field={VAST_SECRET} {...props} />
       </Card>
 
-      <CloudTrainingCard config={config} setField={setField} />
+      <ConceptFaceMaskCard config={config} setField={setField} configDefaults={configDefaults} />
+
+      <CloudTrainingCard config={config} setField={setField} configDefaults={configDefaults} />
     </div>
   )
 }

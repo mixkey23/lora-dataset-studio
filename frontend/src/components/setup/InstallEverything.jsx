@@ -3,6 +3,7 @@ import { apiFetch, postJson } from '../../api/fetchClient'
 import { useToast } from '../common/Toast'
 import { INSTALL_ALL_ACTION_LABELS, installCatalog } from '../../hooks/useSetupSteps'
 import InstallRunner from './InstallRunner'
+import KreaInstallCard from './KreaInstallCard'
 import { HelpBadge } from '../../help/HelpMode'
 
 const POLL_MS = 1200
@@ -31,18 +32,37 @@ const ROW_META = {
 // precondition isn't met yet render their hint (a pointer back to the config step) instead of
 // a button. The tile stays even once installed, so a broken venv can be rebuilt at any time.
 function InstallItem({ item, onDone }) {
-  const { action, label: lbl, present, available, hint } = item
+  const { action, label: lbl, present, available, hint, state, stateLabel, brokenReason } = item
+  // A component can be in a THIRD state, and there are now two of them:
+  //   'restart' — on disk but not yet live (the Krea node pack, which ComfyUI only
+  //               registers at startup);
+  //   'broken'  — on disk, right name, right size, and NOT loadable (a truncated or
+  //               corrupted download, a licence page saved as .safetensors).
+  // Both are cases where "✓ Installed" would certify something that does not work
+  // and "✗ Not installed" would describe a file the user can see. Each badge is a
+  // WORD, not just a colour — the glyph and the text carry the state, so it reads
+  // the same to anyone who doesn't perceive the hue.
+  const badgeCls = state === 'broken' ? 'text-rose-300'
+    : state === 'restart' ? 'text-amber-400'
+      : present ? 'text-emerald-400' : 'text-content-subtle'
   return (
     <div className="rounded-md border border-border bg-surface-raised p-3 space-y-2">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
         <span className="text-sm font-semibold text-content">{lbl}</span>
-        <span className={`shrink-0 text-xs font-medium ${present ? 'text-emerald-400' : 'text-content-subtle'}`}>
-          {present ? '✓ Installed' : '✗ Not installed'}
+        <span className={`shrink-0 text-xs font-medium ${badgeCls}`}>
+          {stateLabel || (present ? '✓ Installed' : '✗ Not installed')}
         </span>
       </div>
+      {/* The fault and the fix, in the user's own file name. Wraps freely: it must
+          stay readable at 400px. */}
+      {brokenReason && (
+        <p className="break-words text-xs text-rose-300">{brokenReason}</p>
+      )}
       {available ? (
         <InstallRunner action={action}
-          buttonLabel={present ? '↻ Reinstall' : 'Install'} onDone={onDone} />
+          buttonLabel={state === 'broken' ? '↻ Download again'
+            : (present || state === 'restart') ? '↻ Reinstall' : 'Install'}
+          onDone={onDone} />
       ) : (
         <p className="text-xs text-content-subtle">{hint}</p>
       )}
@@ -220,7 +240,11 @@ export default function InstallEverything({ plan, caps, onDone }) {
         )}
       </section>
 
-      {/* Path 2 — the one-by-one menu, always visible (install/repair a single component). */}
+      {/* Path 2 — one click per OPTIONAL engine. Krea is ~20 GB, so it is installed
+          when it is asked for rather than by the unattended shortcut above. */}
+      <KreaInstallCard caps={caps} onDone={onDone} />
+
+      {/* Path 3 — the one-by-one menu, always visible (install/repair a single component). */}
       <section className="rounded-xl border border-border bg-surface p-5">
         <h3 className="text-base font-semibold text-content">Install or repair individually</h3>
         <p className="mt-1 text-sm text-content-muted">

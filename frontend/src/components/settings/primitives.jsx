@@ -77,7 +77,11 @@ export function Card({ title, help, children, id }) {
   )
 }
 
-export function TextField({ id, label, value, onChange, placeholder, help }) {
+/* `warn` (optional): an amber note UNDER the input, for a value that saves fine but
+   will not work — a folder that isn't on disk, say. Distinct from `help` (above the
+   input, always-on guidance) so a real problem can't read as documentation.
+   `children` renders after it, for a field that needs its own action button. */
+export function TextField({ id, label, value, onChange, placeholder, help, warn, children }) {
   return (
     <div>
       <label htmlFor={id} className="block text-sm font-medium text-content">{label}</label>
@@ -90,6 +94,12 @@ export function TextField({ id, label, value, onChange, placeholder, help }) {
         placeholder={placeholder}
         className={INPUT_CLASS}
       />
+      {warn && (
+        <p className="mt-1 break-words text-xs text-amber-400">
+          <span aria-hidden="true">⚠</span> {warn}
+        </p>
+      )}
+      {children}
     </div>
   )
 }
@@ -103,8 +113,11 @@ export function SecretField({
 }) {
   const f = field
   return (
-    <div className="flex items-end gap-3">
-      <div className="flex-1">
+    // flex-wrap + a full-width first child under `sm`: on a phone the Test and
+    // Remove buttons drop to their own line instead of squeezing the key input
+    // down to a few characters. From `sm` up it is the historical single row.
+    <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+      <div className="w-full sm:w-auto sm:flex-1">
         <div className="flex items-center justify-between">
           <label htmlFor={f.key} className="block text-sm font-medium text-content">{f.label}</label>
           <StatusBadge ok={!!secretsPresence[f.key]} />

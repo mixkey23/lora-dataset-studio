@@ -28,8 +28,8 @@ load_dotenv(ENV_PATH)
 # REDDIT_CLIENT_ID / CIVITAI_API_KEY / PEXELS_API_KEY: scraping credentials
 # (Settings > Scraping & sources). Sources read their env var at request time,
 # and set_secrets() stamps os.environ on save, so changes apply without restart.
-SECRET_KEYS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'HF_TOKEN', 'VAST_API_KEY',
-               'REDDIT_CLIENT_ID', 'CIVITAI_API_KEY', 'PEXELS_API_KEY')
+SECRET_KEYS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'HF_TOKEN',
+               'VAST_API_KEY', 'REDDIT_CLIENT_ID', 'CIVITAI_API_KEY', 'PEXELS_API_KEY')
 
 DEFAULTS = {
     # host: '127.0.0.1' = this machine only ; '0.0.0.0' = reachable from the LAN
@@ -50,8 +50,27 @@ DEFAULTS = {
                 # capability. Setting base_dir annuls it (see settings.put_settings and
                 # the DERIVED comfyui.skipped in capabilities.probe), so it can never
                 # mask a real error of a configured ComfyUI.
-                'setup_skipped': False},
-    'ollama': {'url': 'http://127.0.0.1:11434', 'vision_model': 'huihui_ai/qwen3-vl-abliterated:8b-instruct'},  # -instruct, NOT ':8b' (=thinking): see get_vision_model()
+                'setup_skipped': False,
+                # Seconds ComfyUI is allowed to spend ANSWERING the /object_info
+                # enumeration (the heaviest probe in the app). It is a READ budget
+                # only: the connection itself still has to be accepted in
+                # `utils.comfyui._OBJECT_INFO_CONNECT_TIMEOUT` seconds, so a ComfyUI
+                # that is genuinely OFF never costs this. This has to be a setting
+                # rather than a constant because the /object_info payload grows with
+                # the number of custom nodes and model files INSTALLED — the richer
+                # the install, the longer it takes, which is exactly why the old
+                # hardcoded 8 s broke the people who had invested the most in their
+                # ComfyUI (reported by j_o_e_l. on Discord, who measured ~15 s on his
+                # own install). Clamped to 5-300 by utils.comfyui.object_info_timeout().
+                'object_info_timeout_s': 45},
+    'ollama': {'url': 'http://127.0.0.1:11434', 'vision_model': 'huihui_ai/qwen3-vl-abliterated:8b-instruct',  # -instruct, NOT ':8b' (=thinking): see get_vision_model()
+               # How many vision calls a bank pass keeps in flight. 4 is the
+               # measured knee; see services/vision_pool.py for the numbers.
+               'vision_concurrency': 4,
+               # Seconds an ISOLATED vision call may keep the model resident when
+               # nothing else wants the GPU (0 = always unload, the old
+               # behaviour). See services/vision_keepalive.py.
+               'vision_keep_warm_seconds': 120},
     'aitoolkit': {'dir': '', 'datasets_dir': '', 'output_dir': '', 'hf_home': '',
                   # Explicit interpreter for installs without venv/.venv
                   # (conda, uv, system python). Empty = auto-detect.
@@ -70,12 +89,60 @@ DEFAULTS = {
                      'python': '',
                      'qwen_image_dit': '', 'qwen_image_vae': '',
                      'qwen_image_text_encoder': ''},
-    'engines': {'default': 'chatgpt', 'enabled': ['nanobanana', 'chatgpt', 'klein', 'qwen_edit'],
+    # `enabled` is the ENGINE CATALOG as well as the default selection: adding an
+    # engine here is what makes it reach existing installs (see _merge_new_engines
+    # and LEGACY_KNOWN_ENGINES below). `known` is not a setting — it is the ledger
+    # of which engines the app offered the last time the user picked, written by
+    # save_config; [] means "no ledger yet".
+    'engines': {'default': 'chatgpt',
+                'enabled': ['nanobanana', 'chatgpt', 'openrouter', 'klein', 'krea', 'qwen_edit'],
+                'known': [],
                 # chatgpt_auth: 'auto' = subscription when connected, else API key.
                 'chatgpt_auth': 'auto',            # auto|api|subscription
-                'chatgpt_subscription_model': 'gpt-5.4-mini'},   # Codex router model (image model is gpt-image-2 regardless)
+                # The Codex ROUTER model of the subscription lane — NOT the image
+                # model. The image model of the API-key lane is
+                # engines.chatgpt_image_model (below); the subscription lane
+                # renders on whatever OpenAI's image_generation tool serves that
+                # plan (gpt-image-2 today) and takes no model from us. Two
+                # different settings — never merged.
+                'chatgpt_subscription_model': 'gpt-5.4-mini',
+                # OpenRouter reaches the SAME upstream models as the two other
+                # API engines through one account, so the slug is free text: its
+                # catalogue moves fast and a renamed/retired model must never
+                # require a new release. Default = the Nano Banana weights.
+                'openrouter_model': 'google/gemini-3-pro-image',
+                # Nano Banana / ChatGPT image models. Free text for the same
+                # reason as OpenRouter's, but DEFAULTED TO BLANK, unlike it:
+                # NANOBANANA_MODEL and CHATGPT_IMAGE_MODEL environment variables
+                # already existed and some installs set them. A literal default
+                # here would be a non-blank cfg.get() that silently outranked
+                # that env var. Blank means "not chosen", so the documented
+                # order holds: setting > environment variable > built-in default
+                # (services/nanobanana.DEFAULT_MODEL and
+                # services/chatgpt_image.DEFAULT_IMAGE_MODEL).
+                'nanobanana_model': '',
+                'chatgpt_image_model': ''},
     'captioning': {'backend': 'auto'},                         # auto|joycaption|ollama|none
     'training': {'default_family': 'zimage'},
+    # Concept face masking (opt-in per dataset, Advanced training options). Both
+    # knobs are exposed because NOBODY has measured the right value: no public A/B
+    # of a concept LoRA trained with vs without face masking exists, so shipping a
+    # frozen number would be a guess dressed as a default.
+    #
+    # `expand`: how far the detected FACE box is grown to become a HEAD box.
+    # InsightFace returns eyes-to-chin; untouched it leaks jaw, hair and neck.
+    # 2.0 is the only published default for this exact chain (ai-toolkit-perceptual's
+    # face_suppression_expand, documented "1.8-2.0 = full head coverage").
+    #
+    # `min_weight`: the loss weight left INSIDE the mask (ai-toolkit maps black ->
+    # mask_min_value). NOT zero, on purpose, and the floor below is not cosmetic:
+    #   - a zero-weight region is not "ignored", it is unpenalised — the model may
+    #     put anything there at no cost (OneTrainer discussion #347: phantom limbs,
+    #     edge artefacts), and the only published sweep of this knob (SECourses, 9
+    #     runs) reports "anatomically disproportional" output below 0.1;
+    #   - ai-toolkit divides the mask by its own mean (SDTrainer), so an image
+    #     masked edge to edge at exactly 0.0 divides by zero -> NaN loss -> dead run.
+    'face_mask': {'expand': 2.0, 'min_weight': 0.1},
     # Cloud GPU training (vast.ai). Everything has a sane default: the only
     # required user input is the VAST_API_KEY secret. Values here are knobs
     # for power users / for adjusting after the real-world smoke test.
@@ -104,6 +171,11 @@ DEFAULTS = {
         'max_runtime_minutes': 480,    # safety net (stall watchdog is the first line): hard stop past this
         'stall_timeout_minutes': 30,   # no step progress past this -> rescue + kill
         'first_step_timeout_minutes': 45,  # no step 1 reached past this -> kill (base download wedged)
+        # Out-of-monitor freeze watchdog: a training run whose own monitor stopped
+        # reporting for this long is terminated by the supervisor (0 = only warn
+        # in the UI, never cut). Slow-by-design phases (boot/upload/download) are
+        # never judged on this value -- they get a fixed 2 h floor.
+        'freeze_watchdog_minutes': 45,
         'unreachable_grace_minutes': 6,  # tolerated mid-run network blackout before giving up on the pod
         'monthly_budget_usd': 0,       # 0 = unlimited; launches blocked past this
         'disk_gb': 60,                 # instance disk (base model + dataset + checkpoints)
@@ -143,12 +215,29 @@ DEFAULTS = {
     'bank': {'sharpness_min': 100.0, 'noise_max': 15.0, 'uniformity_min': 12.0,
              'dup_distance': 8, 'min_side': 768, 'face_threshold': 0.45,
              'aesthetic_min': 5.0, 'nsfw_max': 0.5, 'style_threshold': 0.6,
-             'semantic_dup_threshold': 0.96},
+             'semantic_dup_threshold': 0.96,
+             # detail_min: effective resolution (0..1 of the stored size) below
+             #   which an image is flagged 'soft_detail' — its pixels promise more
+             #   picture than they deliver. 0.72 was picked on a real 36 000-image
+             #   bank: it selects the softest ~3%, and sits below the 10th
+             #   percentile of images measured to be genuinely full-resolution, so
+             #   a sharp photo does not trip it. Raise it to be pickier.
+             'detail_min': 0.72,
+             # bars_max: fraction of the frame allowed to be flat black letterbox
+             #   before the 'bars' flag. 0.04 ~ a thin band; it caught ~4% of the
+             #   reference bank (screenshots of videos, padded stills).
+             'bars_max': 0.04},
     'masks': {'python': ''},
     # Bank ✨ Score pass interpreter (CLIP aesthetic/NSFW stack). Auto-provisioned
     # by the bank_scoring installer into its own venv — declared here so a
     # full-config Save round-trips it instead of failing "unknown config section".
-    'bank_scoring': {'python': ''},
+    # text_search_idle_minutes: how long the 🔤 text-search encoder stays warm
+    #   after its last query. Loading CLIP costs ~8 s; encoding a phrase costs
+    #   ~20 ms — so the worker is kept alive to make a refine-and-retry session
+    #   instant, and reaped afterwards because it holds ~2.4 GB of RAM. 0 means
+    #   "never stay warm": every distinct query pays the ~8 s load, which is the
+    #   right trade on a memory-tight machine.
+    'bank_scoring': {'python': '', 'text_search_idle_minutes': 10},
     # Watermark inpainting (simple-lama-inpainting, extra ML). Dedicated key so a
     # user can override it, but defaults empty -> reuse the same ML interpreter as
     # rembg/insightface (masks.python) then sys.executable. Never imported in-process.
@@ -178,9 +267,36 @@ DEFAULTS = {
               # then dropped.
               'generation_lora_presets': [],
               # Optional instruction for small scraped-image rescue only.
-              # Manual "Upscale & improve" uses its own fixed quality profile.
               # Empty is intentional: never invent a restoration prompt for the user.
-              'small_image_prompt': ''},
+              'small_image_prompt': '',
+              # Sampler steps for Klein GENERATION (variations, regenerate, small-image
+              # rescue). 5 = the value hardcoded in the shipped workflow (node 77), so an
+              # untouched install renders exactly as before. More steps = slower, usually
+              # a cleaner render; clamped to 50 (face_dataset_service._IMPROVE_MAX_STEPS).
+              # Raised on request by ashish.sinha (Discord). Separate from improve_steps,
+              # which drives the manual "Upscale & improve" pass only.
+              'generation_steps': 5,
+              # Manual "Upscale & improve" quality profile. Its INSTRUCTION was
+              # already editable (identity_prompts.klein_improve) but the knobs
+              # deciding how much the pass actually changes were hardcoded at the
+              # call site — including BOTH LoRA strengths pinned to 0, which meant
+              # the workflow's own realistic LoRA (0.8 in improve skin.json) never
+              # applied at all. These defaults reproduce that exact historical
+              # behaviour, so an untouched install renders byte-identically; raise
+              # improve_base_lora_strength to actually let that LoRA work.
+              'improve_steps': 4,
+              'improve_base_lora_strength': 0.0,
+              # Overrides klein.consistency_strength for THIS pass only. It is the
+              # dx8152 consistency LoRA (anchors composition/background), NOT an
+              # identity LoRA — clamped [0, 1.5] by enqueue_klein_edit.
+              # 1.0 where generation defaults to 0.5: dx8152 warns that 0.8-1.0 "can
+              # prevent edits from applying", which is a problem for a restaging and
+              # exactly the point here — an improve pass must add detail WITHOUT
+              # redrawing the composition. Tuned on real runs, not from the guide.
+              'improve_consistency_strength': 1.0,
+              # Total pixel budget the source is rescaled to before sampling, so it
+              # is the output resolution. 2 = the value hardcoded in the workflow.
+              'improve_megapixels': 2.0},
     # Qwen Multi-angle: rotate the camera angle of an existing render using
     # Qwen-Image-Edit-2511 + the community multi-angle LoRA. Unlike Klein's
     # consistency_lora, none of these three files are auto-downloaded by this
@@ -202,6 +318,43 @@ DEFAULTS = {
     # (Character datasets), so it isn't part of its workflow.
     'qwen_edit': {'lightning_strength': 1.0,
                  'lightning_enabled': True},
+    # Krea 2 Identity Edit — the second LOCAL generation engine (services/
+    # krea_edit_helper.py). Every value here is a RESOLUTION HINT or a sampler
+    # knob, never a hardcoded machine path: blank/absent means "find it yourself"
+    # (canonical filename first, then a narrow token match, across every
+    # extra_model_paths root), which is what makes the engine work on installs
+    # that look nothing like the developer's.
+    'krea': {
+        # Blank = auto-resolve a Krea 2 base under any 'krea'-named model folder,
+        # preferring a Turbo then a Raw build. Set it to a filename to pin one.
+        'base_model': '',
+        # The edit LoRA the whole engine hangs on. Not found under this name ->
+        # the resolver scans the loras roots for a krea2_identity_edit* file, so a
+        # renamed download still works.
+        'identity_lora': 'krea/krea2_identity_edit_v1_2.safetensors',
+        # THE consistency <-> prompt-adherence dial, in pixels: the resolution the
+        # reference is shown to the vision text-encoder at. LOW = follows the
+        # PROMPT (more variety, weaker likeness); HIGH = RESEMBLES the reference
+        # (stronger likeness, but it starts copying the pose and the outfit you
+        # asked it to change). The node's own default is 768; its author
+        # recommends 1024+ for people, and a character dataset is people.
+        'grounding_px': 1024,
+        # Pack reference workflow values, measured working. cfg is pinned at 1.0
+        # in code (guidance-distilled model) and is deliberately NOT a setting.
+        'steps': 10,
+        'identity_lora_strength': 1.0,
+        # How hard the source latent is pushed back into the model each step.
+        'ref_boost': 4.0,
+    },
+    # Z-Image pipeline — the two loader refs the shipped Test Studio workflow used
+    # to hardcode from the developer's own ComfyUI (reported by bobba84, GitHub #18).
+    # BLANK = "find it yourself": services/zimage_model_resolver scans every
+    # registered vae / text_encoders root, sub-folders included, case- and
+    # separator-insensitively (z_ae, z ae, z-ae, ae.safetensors; qwen_3_4b in any
+    # sub-folder). Set either to a filename to PIN it — a pinned value is used as-is
+    # and is never second-guessed, which is also the escape hatch when a shared
+    # ComfyUI carries several plausible files (a FLUX.1 `ae.safetensors`, say).
+    'zimage': {'vae': '', 'text_encoder': ''},
     # Editable identity / quality prompts (feature request by @bbsorry / 雨田壹).
     # The identity "locks" that ride ahead of every generated variation used to be
     # hardcoded and invisible; these overrides expose them without touching the
@@ -217,14 +370,61 @@ DEFAULTS = {
     #     wrap_variation_qwen_edit), independent override from Klein's own.
     # klein_improve_enabled (default True): when False the manual "Klein upscale &
     # improve" applies NO prompt at all (pure upscale), instead of the default/override.
+    # The four flat keys above are the HUMAN overrides and keep their historical
+    # names/meaning (never renamed — they are in user config files since the feature
+    # shipped). `by_subject` holds the non-human ones,
+    # {animal|creature|object|other: {face_single|face_multi|klein_identity: text}},
+    # each read with NO fallback to the flat key: an override written on an Animal
+    # dataset must never ride on a human generation (reported by ashish.sinha).
+    # Empty by default — a subject with no entry follows its shipped default.
+    # The five OTHER prompt parts, hardcoded until this wave and shipped in every
+    # local-edit prompt: markings_lock (the skin hold order), outfit_vary /
+    # expression_neutral (the two directives baked into every human shot),
+    # outfit_palette (the concrete garments, one per LINE), render_tail_sfw /
+    # render_tail_nsfw (the photographic tail) and framing_face|bust|body|back
+    # (the per-framing detail block). Same contract as the four above — '' means
+    # the shipped default — and the same split: the tail and the framing blocks
+    # are per subject (anime's tail asks for an illustration, not a photograph) so
+    # they live under `by_subject` for non-human types; the rest are flat.
     'identity_prompts': {'face_single': '', 'face_multi': '', 'klein_identity': '',
                          'klein_improve': '', 'klein_improve_enabled': True,
-                         'qwen_edit_identity': ''},
+                         'qwen_edit_identity': '',
+                         'markings_lock': '', 'outfit_vary': '', 'expression_neutral': '',
+                         'outfit_palette': '', 'render_tail_sfw': '', 'render_tail_nsfw': '',
+                         'framing_face': '', 'framing_bust': '', 'framing_body': '',
+                         'framing_back': '',
+                         'by_subject': {}},
+    # User shot catalogs imported from JSON, {subject_type: [{id,label,prompt,
+    # framing,nsfw?}]} — idea by ashish.sinha (Discord): have an LLM write 40 shots
+    # instead of typing them. Stored SERVER-side rather than in localStorage so a
+    # catalog survives a browser wipe, shows up on the phone as well as the desktop
+    # and rides along in the full backup. Written by the workspace's Import button
+    # (validated client-side by shotImport.js) and re-checked on read by
+    # face_variations.sanitize_custom_shots — this file is hand-editable, and a
+    # label shadowing a built-in one would hijack prompt/aspect/NSFW resolution.
+    'custom_shots': {},
     'updates': {'repo': 'perfectgf/lora-dataset-studio'},      # GitHub repo for the release feed
 }
 
 _lock = threading.Lock()
 _cache = None
+
+
+def defaults() -> dict:
+    """A deep COPY of the shipped defaults, for callers that must show the user
+    what a setting would be if they never touched it.
+
+    Exposed over the API (`config_defaults` in the settings payload) so the
+    Settings UI can offer a per-field "Reset to default" without ever holding a
+    second copy of these numbers. A literal typed into the frontend would go
+    stale the next time a default moves here, and the reset button would then
+    quietly restore a value that is no longer the default — a lie the user
+    cannot see. Derived, never duplicated: this is the SAME dict the merge in
+    load_config() uses.
+
+    A copy, not the live object: a caller mutating the returned tree (jsonify
+    does not, but a future one might) must not rewrite the app's defaults."""
+    return copy.deepcopy(DEFAULTS)
 
 def _deep_merge(base, override):
     out = copy.deepcopy(base)
@@ -234,6 +434,93 @@ def _deep_merge(base, override):
         else:
             out[k] = copy.deepcopy(v)
     return out
+
+# --- engines added by an update --------------------------------------------
+# _deep_merge REPLACES lists (it only recurses into dicts), which is right for
+# every other list we store — but engines.enabled doubles as "which engines
+# exist", so a config saved before an engine shipped pinned its owner to the old
+# catalogue forever: the more someone used the app, the fewer new engines they
+# got, with no hint one existed. New SCALAR keys never had this problem, they
+# fall back to their default; this is a list-only failure mode.
+#
+# The whole difficulty is telling "this engine didn't exist when I saved" from
+# "I unchecked this on purpose" — blindly adding back what's missing would undo
+# an explicit choice, which is worse than the bug. So a save records the
+# catalogue the choice was made from (engines.known), and only engines absent
+# from that ledger are merged in on read. Configs written before the ledger
+# existed have no such record, but we know from the shipping history exactly
+# which engines they could have been offered:
+LEGACY_KNOWN_ENGINES = ('nanobanana', 'chatgpt', 'klein')
+# ^ never extend this tuple. A new engine goes in DEFAULTS['engines']['enabled']
+# and nowhere else; adding it here would mean "everyone has already seen it",
+# i.e. exactly the bug this fixes.
+#
+# Only ONE key in DEFAULTS is a list of choices (engines.enabled) — the other
+# list, klein.generation_lora_presets, is pure user data with an empty default
+# and nothing to merge. Hence a named, tested helper rather than a framework;
+# a second list-of-choices key should reuse the same known/enabled shape.
+
+
+def _clean_engines(seq):
+    return [e for e in (seq or []) if isinstance(e, str) and e]
+
+
+def _engine_catalog(*groups):
+    """Every engine this build knows about, in DEFAULTS order, plus any extra
+    (older or hand-written) names the caller passes — nothing is ever dropped."""
+    out = list(DEFAULTS['engines']['enabled'])
+    for group in groups:
+        for e in _clean_engines(group):
+            if e not in out:
+                out.append(e)
+    return out
+
+
+def _merge_new_engines(conf: dict, user: dict) -> dict:
+    """Add engines that appeared since the user's saved selection (in place).
+
+    Read-time only — the config file is never rewritten, so the fix applies to
+    every existing install without a migration, and a downgrade still finds what
+    it wrote. `user` is the raw file: an absent engines.enabled means the user
+    never expressed a choice and already sits on the full default catalogue.
+
+    Doubles as the shape guard for this section — config.json is hand-editable
+    and a string where a list belongs would otherwise reach every consumer."""
+    eng = conf.get('engines')
+    if not isinstance(eng, dict):
+        eng = conf['engines'] = copy.deepcopy(DEFAULTS['engines'])
+    if not isinstance(eng.get('enabled'), list):
+        eng['enabled'] = list(DEFAULTS['engines']['enabled'])
+    saved = ((user or {}).get('engines') or {})
+    saved = saved.get('enabled') if isinstance(saved, dict) else None
+    if not isinstance(saved, list):
+        return conf
+    enabled = _clean_engines(eng.get('enabled'))
+    if not enabled:
+        # An empty list reads as "no restriction" downstream (face_dataset_service);
+        # filling it in would turn that into a real, restrictive selection.
+        eng['enabled'] = enabled
+        return conf
+    known = ((user or {}).get('engines') or {}).get('known')
+    known = _clean_engines(known) if isinstance(known, list) else []
+    known = known or list(LEGACY_KNOWN_ENGINES)
+    eng['enabled'] = enabled + [e for e in DEFAULTS['engines']['enabled']
+                                if e not in known and e not in enabled]
+    eng['known'] = _engine_catalog(known, eng['enabled'])
+    return conf
+
+
+def _stamp_known_engines(merged: dict, partial: dict) -> dict:
+    """Record the catalogue a selection was made from, on the saves that carry
+    one. Only then: a save of some unrelated section must not certify that its
+    author ever saw the engines they don't have enabled."""
+    incoming = (partial or {}).get('engines')
+    eng = merged.get('engines')
+    if not isinstance(incoming, dict) or 'enabled' not in incoming or not isinstance(eng, dict):
+        return merged
+    eng['known'] = _engine_catalog(eng.get('known'), eng.get('enabled'))
+    return merged
+
 
 MIGRATED_LORA_PRESET_NAME = 'My LoRAs'
 
@@ -298,7 +585,10 @@ def load_config(force=False) -> dict:
                 user = json.loads(p.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 user = {}
-        _cache = _migrate_klein_loras(_deep_merge(DEFAULTS, user))
+        if not isinstance(user, dict):
+            user = {}
+        _cache = _merge_new_engines(
+            _migrate_klein_loras(_deep_merge(DEFAULTS, user)), user)
         return copy.deepcopy(_cache)
 
 def save_config(partial: dict) -> dict:
@@ -314,9 +604,12 @@ def save_config(partial: dict) -> dict:
         # convert=False when this save explicitly carries the presets: the
         # client already speaks the preset format, so a legacy key left in the
         # file must not resurrect a preset the user just deleted — only purge.
-        merged = _migrate_klein_loras(
+        if not isinstance(current, dict):
+            current = {}
+        merged = _stamp_known_engines(_migrate_klein_loras(
             _deep_merge(current, partial or {}),
-            convert='generation_lora_presets' not in ((partial or {}).get('klein') or {}))
+            convert='generation_lora_presets' not in ((partial or {}).get('klein') or {})),
+            partial)
         tmp = p.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding='utf-8')
         tmp.replace(p)
@@ -368,13 +661,49 @@ def delete_secrets(names) -> None:
 _COMFY_DERIVED = {'output': ('output_dir', 'output'), 'input': ('input_dir', 'input'),
                   'models': ('models_dir', 'models'), 'loras': ('loras_dir', 'models/loras')}
 
-def comfyui_dir(kind: str):
-    key, sub = _COMFY_DERIVED[kind]
-    explicit = get(f'comfyui.{key}') or ''
+# Stable display order for the four override fields (Settings, docs, API payload).
+COMFY_DIR_KINDS = ('output', 'input', 'models', 'loras')
+
+
+def resolve_comfyui_dir(kind: str, base_dir: str, explicit: str = ''):
+    """Pure resolution of one ComfyUI folder: an explicit override wins, else it is
+    derived from the install directory. Kept separate from `comfyui_dir` (which reads
+    live config) so the Settings screen can PREVIEW the very same computation on
+    unsaved field values — what the user is shown is then, by construction, what the
+    app will use. Reported from Discord (vykas22): a ComfyUI launched with
+    --input-directory/--output-directory looked like it was ignored, because the four
+    override keys existed but had no field anywhere in the app.
+
+    Whitespace-only is treated as empty: a stray space used to resolve to Path(' ')
+    and silently shadow the derived folder."""
+    _, sub = _COMFY_DERIVED[kind]
+    explicit = (explicit or '').strip()
     if explicit:
         return Path(explicit)
-    base = get('comfyui.base_dir') or ''
+    base = (base_dir or '').strip()
     return Path(base) / Path(sub) if base else None
+
+
+def comfyui_dir(kind: str):
+    key, _ = _COMFY_DERIVED[kind]
+    return resolve_comfyui_dir(kind, get('comfyui.base_dir') or '',
+                               get(f'comfyui.{key}') or '')
+
+def aitoolkit_derived_python(root):
+    """The interpreter an ai-toolkit checkout carries, ignoring any explicit
+    `aitoolkit.python`. Both venv layouts exist: ai-toolkit's docs say `venv`,
+    plenty of setups use `.venv`. Pick whichever actually exists; when neither
+    does, return the historical default path so callers keep a concrete path to
+    name in their "invalid" details (never None)."""
+    root = Path(root)
+    for env_dir in ('venv', '.venv'):
+        p = (root / env_dir / 'Scripts' / 'python.exe' if os.name == 'nt'
+             else root / env_dir / 'bin' / 'python')
+        if p.exists():
+            return p
+    win = root / 'venv' / 'Scripts' / 'python.exe'
+    return win if os.name == 'nt' else root / 'venv' / 'bin' / 'python'
+
 
 def aitoolkit_path(kind: str):
     root = get('aitoolkit.dir') or ''
@@ -395,17 +724,14 @@ def aitoolkit_path(kind: str):
         explicit = (get('aitoolkit.python') or '').strip()
         if explicit:
             return Path(explicit)
-        # Both venv layouts exist: ai-toolkit's docs say `venv`, plenty of
-        # setups use `.venv`. Pick whichever actually exists.
-        for env_dir in ('venv', '.venv'):
-            p = (root / env_dir / 'Scripts' / 'python.exe' if os.name == 'nt'
-                 else root / env_dir / 'bin' / 'python')
-            if p.exists():
-                return p
-        # Nothing found: return the historical default path so callers keep a
-        # concrete path to name in their "invalid" details.
-        win = root / 'venv' / 'Scripts' / 'python.exe'
-        return win if os.name == 'nt' else root / 'venv' / 'bin' / 'python'
+        return aitoolkit_derived_python(root)
+    if kind == 'venv_python_derived':
+        # What the app WOULD run without the explicit override. Only useful when
+        # an explicit one is set and turns out to be broken: it is the working
+        # interpreter we can then offer to switch to (GitHub #19, strouder —
+        # a `aitoolkit.python` pointing at a torch-less Python silently beat a
+        # perfectly good venv sitting right next to run.py).
+        return aitoolkit_derived_python(root)
     if kind == 'jobs':
         return root / 'config' / 'generated'
     raise KeyError(kind)
@@ -445,6 +771,16 @@ def backups_dir() -> Path:
     d = _data_dir() / 'backups'
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+def bank_sources_root() -> Path:
+    """Image folders CREATED by "Import to bank" — a copy of a dataset's kept
+    images, so the new bank OWNS its files instead of pointing at the dataset's
+    live folder (curating one would otherwise mutate the other). Deliberately
+    NOT banks_root(): that one holds working data only and its contract is that
+    it never contains source images."""
+    root = _data_dir() / 'bank_sources'
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 def banks_root() -> Path:
     """Working data of the 🗃️ image banks (thumbnails + face-embedding cache),

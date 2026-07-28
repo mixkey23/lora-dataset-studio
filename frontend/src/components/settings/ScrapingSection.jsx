@@ -1,4 +1,5 @@
 import { Card, INPUT_CLASS, SecretField } from './primitives'
+import ResetToDefault from './ResetToDefault'
 
 /* Reddit rides an anonymous OAuth token minted with gallery-dl's PUBLIC shared
    client id by default. Reddit's ~1000 requests / 10 min quota is attached to
@@ -87,7 +88,11 @@ export default function ScrapingSection(props) {
 
   return (
     <div className="space-y-6">
+      {/* id: the deep-link target of the source picker's "Source credentials →"
+          link. The card, not one key — the label names this card and the three
+          keys inside it are equally the answer. */}
       <Card
+        id="scrape-credentials"
         title="Source credentials"
         help="Credentials used when scanning image sources for concept datasets. Reddit and Civitai keys are optional; Pexels requires its API key. Keys are write-only: fields stay blank even when a key is already saved."
       >
@@ -95,7 +100,7 @@ export default function ScrapingSection(props) {
       </Card>
       <Card
         title="Klein rescue — small scraped images"
-        help="Optional instruction for automatic rescue of scraped images under 768 px. Manual Upscale & improve uses its dedicated metadata-derived quality profile. Klein creates a separate 2 MP version to validate and leaves the original intact."
+        help="Optional instruction for automatic rescue of scraped images under 768 px. The manual Upscale & improve is a different flow with its own instruction and strength, under Settings ▸ Image engines. Klein creates a separate 2 MP version to validate and leaves the original intact."
       >
         <div>
           <div className="flex items-center justify-between gap-3">
@@ -114,6 +119,11 @@ export default function ScrapingSection(props) {
             onChange={(e) => props.setField('klein', 'small_image_prompt', e.target.value)}
             placeholder="Empty — reference image only"
             className={`${INPUT_CLASS} min-h-24 resize-y`} />
+          {/* Its default is genuinely EMPTY — there is no shipped rescue prompt
+              behind it — so this resets to no instruction at all, which is
+              exactly what the field means when blank. */}
+          <ResetToDefault label="Small-image rescue instruction" section="klein" field="small_image_prompt"
+            config={props.config} configDefaults={props.configDefaults} setField={props.setField} />
         </div>
       </Card>
     </div>

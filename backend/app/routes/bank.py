@@ -23,9 +23,38 @@ def _app():
     return current_app._get_current_object()
 
 
+def _busy(e):
+    """The ONE shape of a "this bank is occupied" refusal.
+
+    `error` stays what it always was (an English sentence, for anything that
+    only knows how to print a message), but `busy_kind` is the machine-readable
+    half the UI actually needs: it names the pass that holds the bank, so the
+    click can be refused in the user's vocabulary — "✨ Score pass is running —
+    137/412, press Stop above" — instead of echoing our sentence back at them.
+    It matters that this rides on the 409 itself: the refusal often arrives
+    BEFORE the first 2 s progress poll, so at that instant the response body is
+    the only thing that knows which pass is in the way."""
+    return jsonify({'error': str(e), 'busy_kind': e.kind}), 409
+
+
 @bp.get('/banks')
 def banks_list():
-    return jsonify({'banks': banks.list_banks(LOCAL_USER)})
+    """Every bank + its card previews. ?dataset_id=<id> additionally embeds each
+    bank's promotable count for that dataset, so the dataset-side bank chooser
+    opens on ONE request instead of one per bank. An unknown/junk dataset_id
+    simply omits the field (never a 400: the list itself is still valid).
+
+    Every bank's source folder is re-walked first (see refresh_bank): a bank
+    points at a LIVE folder, so images dropped in it after the bank was created
+    show up here instead of needing a rebuild. Strictly additive, ~5 ms a bank,
+    and the per-bank outcome rides back in ``folder_sync`` so the UI can say why
+    the counters moved."""
+    sync = banks.refresh_banks(LOCAL_USER, force=True)
+    rows = banks.list_banks(
+        LOCAL_USER, dataset_id=request.args.get('dataset_id') or None)
+    for row in rows:
+        row['folder_sync'] = sync.get(row['id'])
+    return jsonify({'banks': rows})
 
 
 @bp.post('/bank/create')
@@ -36,15 +65,95 @@ def bank_create():
                                         data.get('folder'))
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
-    return jsonify({'ok': True, 'id': bank.id, 'added': added})
+    # Nested folders mean two banks over the same files: harmless while triaging
+    # (statuses are per bank), but 🗑 Delete rejected in one amputates the other.
+    # Say it now, once, rather than at the destructive click only.
+    return jsonify({'ok': True, 'id': bank.id, 'added': added,
+                    'overlaps': banks.overlapping_banks(LOCAL_USER, bank.id)})
+
+
+@bp.post('/bank/from-dataset')
+def bank_from_dataset():
+    """Reverse of promote: build a NEW bank from a dataset's kept images, under a
+    name the user chooses. Copies the files so the two never share (curating one
+    would otherwise mutate the other). 202 + background job, like the other passes."""
+    data = request.get_json(silent=True) or {}
+    try:
+        bank_id = banks.start_dataset_import(_app(), LOCAL_USER,
+                                             data.get('dataset_id'), data.get('name'))
+    except bank_jobs.BankJobBusy as e:
+        return _busy(e)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 503
+    # the id rides back so the UI can jump straight to the bank being filled
+    return jsonify({'ok': True, 'id': bank_id}), 202
+
+
+@bp.post('/bank/scrape-import')
+def bank_scrape_import():
+    """🕸 Scrape → BANK — the scraper's second destination, next to the dataset one.
+
+    Body: {items:[{url,title}], bank_id?} to APPEND to an existing bank (resume),
+    or {items, name} to create one. Synchronous like the dataset outlet (the same
+    per-request cap bounds it), and it stores what it downloaded: the resolution /
+    ratio / near-duplicate verdicts belong to the bank's own passes, not to the
+    download. 409 when a pass already owns the target bank."""
+    data = request.get_json(silent=True) or {}
+    raw_bank_id = data.get('bank_id')
+    bank_id = None
+    if raw_bank_id is not None:
+        try:
+            bank_id = int(raw_bank_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'bank_id must be a number'}), 400
+    try:
+        res = banks.scrape_import_to_bank(LOCAL_USER, data.get('items'),
+                                          bank_id=bank_id, name=data.get('name'))
+    except bank_jobs.BankJobBusy as e:
+        return _busy(e)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, **res})
 
 
 @bp.get('/bank/<int:bank_id>')
 def bank_get(bank_id):
+    """The workspace payload. The source folder is re-walked first so images
+    added to it show up while the bank is open — cooldown-limited, because this
+    route is ALSO the 2 s job poll. ?refresh=1 forces the walk (the workspace
+    sends it when it opens the bank). The outcome rides in ``folder_sync``."""
+    sync = banks.refresh_bank(LOCAL_USER, bank_id,
+                              force=request.args.get('refresh') == '1')
     payload = banks.bank_payload(LOCAL_USER, bank_id)
     if payload is None:
         return jsonify({'error': 'not found'}), 404
+    payload['folder_sync'] = sync
     return jsonify(payload)
+
+
+@bp.post('/bank/<int:bank_id>/flag-preview')
+def bank_flag_preview(bank_id):
+    """How many images each flag WOULD hold at the thresholds in the body —
+    the live effect readout under the Bank's 🎚 threshold controls.
+
+    Read-only and cheap: verdicts are recomputed from persisted raw scores, so
+    this is one COUNT per flag, the same queries the workspace payload already
+    runs. Nothing is saved — the user still has to press Save.
+
+    POST (not GET) because it carries the UNSAVED candidate thresholds, exactly
+    like /settings/prompt-preview carries unsaved prompt text. A junk body
+    degrades to "the saved thresholds" instead of 400: a preview that answers
+    'error' while you are mid-keystroke is worth less than one that answers with
+    what is currently in effect."""
+    body = request.get_json(silent=True) or {}
+    overrides = body.get('thresholds')
+    out = banks.flag_preview(LOCAL_USER, bank_id,
+                             overrides if isinstance(overrides, dict) else None)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(out)
 
 
 @bp.delete('/bank/<int:bank_id>')
@@ -52,6 +161,27 @@ def bank_delete(bank_id):
     if not banks.delete_bank(LOCAL_USER, bank_id):
         return jsonify({'error': 'not found'}), 404
     return jsonify({'ok': True})
+
+
+@bp.post('/bank/<int:bank_id>/relocate')
+def bank_relocate(bank_id):
+    """Point a bank at a new folder after the user moved it (another disk, a
+    rename). Two-step ON PURPOSE: {folder} alone only REPORTS how many of the
+    bank's files are in there, {folder, confirm: true} applies it. 400 when the
+    folder holds none of them (that is a different folder, not a moved one),
+    409 while a pass is running. Nothing is ever deleted — a partial match keeps
+    every row and its analysis."""
+    data = request.get_json(silent=True) or {}
+    try:
+        out = banks.relocate_bank(LOCAL_USER, bank_id, data.get('folder'),
+                                  confirm=bool(data.get('confirm')))
+    except bank_jobs.BankJobBusy as e:
+        return _busy(e)
+    except banks.BankRelocateMismatch as e:
+        return jsonify({'error': str(e), **e.preview}), 400
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, **out})
 
 
 @bp.get('/bank/<int:bank_id>/images')
@@ -92,6 +222,7 @@ def bank_images(bank_id):
         sort=args.get('sort') or None,
         res_bucket=args.get('res_bucket') or None,
         framing=args.get('framing') or None,
+        origin=args.get('origin') or None,
         ids=ids,
         offset=_int('offset') or 0, limit=_int('limit') or 200)
     if payload is None:
@@ -113,7 +244,7 @@ def _start(fn, *args, **kwargs):
     try:
         fn(*args, **kwargs)
     except bank_jobs.BankJobBusy as e:
-        return jsonify({'error': str(e)}), 409
+        return _busy(e)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except RuntimeError as e:
@@ -161,6 +292,58 @@ def bank_watermark(bank_id):
     data = request.get_json(silent=True) or {}
     return _start(banks.start_watermark, _app(), LOCAL_USER, bank_id,
                   rescan=bool(data.get('rescan')))
+
+
+@bp.get('/bank/<int:bank_id>/watermark/levels')
+def bank_watermark_levels(bank_id):
+    """Where each cleaning level stands: flagged / croppable / left to inpaint /
+    already cropped / already inpainted / dismissed / needing a re-scan."""
+    payload = banks.watermark_levels(LOCAL_USER, bank_id)
+    if payload is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(payload)
+
+
+@bp.post('/bank/<int:bank_id>/watermark/crop')
+def bank_watermark_crop(bank_id):
+    """Level 1 — crop away the border-band watermarks (CPU/PIL, invents no pixel).
+    The source folder is never written to: the crop lands in the bank's own
+    working copy. 202/409/400."""
+    return _start(banks.start_watermark_crop, _app(), LOCAL_USER, bank_id)
+
+
+@bp.post('/bank/<int:bank_id>/watermark/inpaint')
+def bank_watermark_inpaint(bank_id):
+    """Level 2 — repaint what is still flagged. {method:'auto'|'lama'|'klein'}.
+    202/409/400/503 (503 carries the actionable reason: engine missing, GPU busy)."""
+    data = request.get_json(silent=True) or {}
+    return _start(banks.start_watermark_inpaint, _app(), LOCAL_USER, bank_id,
+                  method=data.get('method') or 'auto')
+
+
+@bp.post('/bank/<int:bank_id>/watermark/undo')
+def bank_watermark_undo(bank_id):
+    """Drop the cleaned versions of {image_ids} (empty = all) and re-flag them.
+    Synchronous — it only deletes blobs we made."""
+    data = request.get_json(silent=True) or {}
+    try:
+        n = banks.undo_watermark_clean(LOCAL_USER, bank_id,
+                                       data.get('image_ids') or None)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, 'restored': n})
+
+
+@bp.post('/bank/<int:bank_id>/watermark/dismiss')
+def bank_watermark_dismiss(bank_id):
+    """Rule {image_ids} NOT watermarked — they leave both cleaning levels and are
+    never re-flagged by a later scan."""
+    data = request.get_json(silent=True) or {}
+    try:
+        n = banks.dismiss_watermarks(LOCAL_USER, bank_id, data.get('image_ids'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, 'dismissed': n})
 
 
 @bp.post('/bank/<int:bank_id>/framing')
@@ -218,6 +401,44 @@ def bank_promote(bank_id):
         return jsonify({'error': 'dataset_id is required'}), 400
     return _start(banks.start_promote, _app(), LOCAL_USER, bank_id,
                   data.get('image_ids') or [], dataset_id)
+
+
+@bp.post('/bank/<int:bank_id>/promote-to-bank')
+def bank_promote_to_bank(bank_id):
+    """⬆ Promote's SECOND destination: copy the selection into a brand-new bank
+    instead of a dataset — isolating candidates out of a big dump without
+    committing them to a training container. Same shape as /bank/from-dataset:
+    202 + background job, and the new bank's id back so the UI can jump to the
+    bank being filled. Empty image_ids = every kept image.
+
+    The files are COPIED: banks never share theirs, and the app rewrites images
+    in place, so anything cheaper would make the two banks one at the first
+    re-crop. 409 while another pass runs on the SOURCE bank."""
+    data = request.get_json(silent=True) or {}
+    try:
+        new_id = banks.start_bank_promote(_app(), LOCAL_USER, bank_id,
+                                          data.get('image_ids') or [],
+                                          data.get('name'))
+    except bank_jobs.BankJobBusy as e:
+        return _busy(e)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, 'id': new_id}), 202
+
+
+@bp.get('/bank/<int:bank_id>/selection-size')
+def bank_selection_size(bank_id):
+    """How many images a promotion would copy and what they WEIGH — the number
+    the confirmation shows before the click. ?ids=1,2,3 for a selection, absent
+    for every kept image. Images are ~300 KB apiece so this is usually a
+    footnote; video is three orders of magnitude above, which is exactly why the
+    dialog states the measured figure instead of assuming one."""
+    raw = request.args.get('ids')
+    ids = [int(p) for p in raw.split(',') if p.strip().isdigit()] if raw else []
+    out = banks.selection_size(LOCAL_USER, bank_id, ids)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(out)
 
 
 @bp.get('/bank/<int:bank_id>/promotable')
@@ -311,6 +532,50 @@ def bank_images_status(bank_id):
     return jsonify({'ok': True, 'changed': n})
 
 
+@bp.post('/bank/<int:bank_id>/undo')
+def bank_undo_last(bank_id):
+    """↩ Put the last BULK decision back — the net under the bank's biggest
+    gesture. Synchronous: it rewrites two columns on ids we already hold.
+
+    The reply is deliberately an honest ledger, not an "ok": {restored, missing,
+    conflicts, conflict_names} so a partial restore can SAY it restored 340 of
+    400 and name what it left alone. 400 = there is nothing to undo (no offer,
+    or it expired); 409 = a pass is running on this bank.
+
+    Only the status-flipping bulk actions are ever offered here. 🗑 Delete
+    rejected and ⬆ Promote are not undoable cleanly, so they publish no offer —
+    see ``services.bank_undo``."""
+    try:
+        out = banks.undo_last(LOCAL_USER, bank_id)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except RuntimeError as e:
+        # Same occupied-bank refusal as everywhere else, so the UI rephrases it
+        # through the same path instead of echoing our sentence. Raised as a
+        # RuntimeError rather than BankJobBusy, so the kind comes from the
+        # registry — same shape as delete-rejected below.
+        snap = bank_jobs.get(bank_id)
+        return jsonify({'error': str(e),
+                        'busy_kind': (snap or {}).get('kind')}), 409
+    return jsonify({'ok': True, **out})
+
+
+@bp.post('/bank/<int:bank_id>/rotate')
+def bank_rotate(bank_id):
+    """Turn {ids} by {degrees} CLOCKWISE (90/180/270, negative = left).
+
+    Idea by 1Tomber (GitHub #17). Synchronous and cheap: it writes ONE integer
+    per row — the user's own files are never touched, the turned copy is built
+    lazily by the resolver on the next read."""
+    data = request.get_json(silent=True) or {}
+    try:
+        result = banks.rotate_images(LOCAL_USER, bank_id, data.get('ids'),
+                                     data.get('degrees'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, **result})
+
+
 @bp.post('/bank/<int:bank_id>/apply-flags')
 def bank_apply_flags(bank_id):
     data = request.get_json(silent=True) or {}
@@ -348,15 +613,53 @@ def _curation_filters(data):
 def bank_select_diverse(bank_id):
     """Farthest-point selection of the N most VARIED images in the current filter,
     reusing the ✨ Score embeddings (no GPU). Returns the chosen ids for the UI to
-    check — never mutates. 400 with a "run Score first" hint when unscored."""
+    check — never mutates. 400 with a "run Score first" hint when unscored.
+
+    {typicality} (0–1) tempers the sampling so isolated aberrations stop winning
+    on isolation alone; omitted ⇒ the service default, an explicit 0 ⇒ the
+    historical pure farthest-point behaviour."""
     data = request.get_json(silent=True) or {}
     try:
         n = int(data.get('n') or 60)
     except (TypeError, ValueError):
         n = 60
+    typ = data.get('typicality')
     try:
-        out = banks.select_diverse(LOCAL_USER, bank_id, n=n,
+        typ = banks._TYPICALITY_DEFAULT if typ in (None, '') else float(typ)
+    except (TypeError, ValueError):
+        typ = banks._TYPICALITY_DEFAULT
+    try:
+        out = banks.select_diverse(LOCAL_USER, bank_id, n=n, typicality=typ,
                                    filters=_curation_filters(data))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, **out})
+
+
+@bp.post('/bank/<int:bank_id>/select-balanced')
+def bank_select_balanced(bank_id):
+    """Select N images SPREAD OVER the framing labels (optionally × person)
+    instead of the top of one ranking — the answer to "does my set cover what I
+    want to generate?". Same embeddings and same typicality guard as
+    select-diverse, applied inside each bucket. Never mutates.
+
+    {axis} 'framing' (default) | 'framing+person'. 400 with the exact missing
+    pass when Score hasn't run or nothing in the filter carries the label."""
+    data = request.get_json(silent=True) or {}
+    try:
+        n = int(data.get('n') or 60)
+    except (TypeError, ValueError):
+        n = 60
+    typ = data.get('typicality')
+    try:
+        typ = banks._TYPICALITY_DEFAULT if typ in (None, '') else float(typ)
+    except (TypeError, ValueError):
+        typ = banks._TYPICALITY_DEFAULT
+    try:
+        out = banks.select_balanced(LOCAL_USER, bank_id, n=n,
+                                    axis=data.get('axis') or 'framing',
+                                    typicality=typ,
+                                    filters=_curation_filters(data))
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     return jsonify({'ok': True, **out})
@@ -390,18 +693,82 @@ def bank_select_similar(bank_id):
     return jsonify({'ok': True, **out})
 
 
+@bp.post('/bank/<int:bank_id>/search-text')
+def bank_search_text(bank_id):
+    """Rank the current filter by CLIP similarity to a written QUERY. Reuses the
+    ✨ Score embeddings; only the phrase is encoded, in the ML interpreter.
+
+    Top-N only, and deliberately NO min_score — unlike select-similar. On a real
+    bank the correct-hit and unrelated-pair score distributions overlap (correct
+    0.177-0.233, unrelated up to 0.197), so no threshold separates them and a
+    knob here would be a control over a boundary that does not exist. See
+    ``banks.search_by_text``.
+
+    400 = the request cannot be answered (no query, bank never scored).
+    503 = the FEATURE is unavailable here (no torch/open_clip, encoder failed) —
+    a different thing, and the UI says so differently: one is "do this first",
+    the other is "this install cannot do this at all"."""
+    from ..services.clip_text_encoder import TextEncodeError
+    data = request.get_json(silent=True) or {}
+    try:
+        n = int(data.get('n') or 60)
+    except (TypeError, ValueError):
+        n = 60
+    try:
+        out = banks.search_by_text(LOCAL_USER, bank_id, data.get('query'), n=n,
+                                   filters=_curation_filters(data))
+    except TextEncodeError as e:
+        return jsonify({'error': str(e), 'reason': 'encoder_unavailable'}), 503
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({'ok': True, **out})
+
+
+@bp.get('/bank/text-search/status')
+def bank_text_search_status():
+    """Is text search available, is the model already warm, how many phrases are
+    cached, would a download be needed — everything the UI needs to set
+    expectations BEFORE the click rather than after an unexplained wait."""
+    from ..services import clip_text_encoder
+    return jsonify({'ok': True, **clip_text_encoder.status()})
+
+
+@bp.post('/bank/text-search/release')
+def bank_text_search_release():
+    """Reap the warm text encoder now (~2.4 GB back). Called when the search
+    panel closes; the idle timer is the backstop for a tab that just went away."""
+    from ..services import clip_text_encoder
+    return jsonify({'ok': True, 'released': clip_text_encoder.release()})
+
+
+@bp.get('/bank/<int:bank_id>/delete-rejected/preview')
+def bank_delete_rejected_preview(bank_id):
+    """What 🗑 Delete rejected would really do, for the confirmation dialog: how
+    many files, where they would go, and which OTHER banks share them (nested
+    source folders make one bank's cleanup another bank's amputation)."""
+    out = banks.rejected_delete_preview(LOCAL_USER, bank_id)
+    if out is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(out)
+
+
 @bp.post('/bank/<int:bank_id>/delete-rejected')
 def bank_delete_rejected(bank_id):
     """Destructive: delete the SOURCE files of every rejected image from disk
-    (OS trash when send2trash is present, hard delete otherwise) and drop their
+    (OS trash, else the app's own trash, else a permanent delete) and drop their
     rows. The ONLY bank action that writes to the source folder — the front-end
-    gates it behind a type-DELETE confirmation."""
+    gates it behind a type-DELETE confirmation fed by the preview above."""
     try:
         out = banks.delete_rejected(LOCAL_USER, bank_id)
     except ValueError:
         return jsonify({'error': 'not found'}), 404
     except RuntimeError as e:
-        return jsonify({'error': str(e)}), 409
+        # Same refusal as every other occupied-bank 409, so the UI rephrases it
+        # through the same path. This one is raised as a RuntimeError rather than
+        # BankJobBusy, so the kind is read back from the registry here.
+        snap = bank_jobs.get(bank_id)
+        return jsonify({'error': str(e),
+                        'busy_kind': (snap or {}).get('kind')}), 409
     return jsonify({'ok': True, **out})
 
 
@@ -426,10 +793,15 @@ def bank_thumb(bank_id, image_id):
 
 @bp.get('/bank/<int:bank_id>/file/<int:image_id>')
 def bank_file(bank_id, image_id):
+    """The full-size image. Serves the watermark-cleaned version when one exists;
+    ?original=1 serves the untouched source instead — that pair IS the before/after
+    comparison (no third lightbox needed)."""
     bank, row = _row_or_404(bank_id, image_id)
     if not bank or not row:
         return jsonify({'error': 'not found'}), 404
-    path = banks.abs_image_path(bank, row)
+    path = (banks.abs_image_path(bank, row)
+            if request.args.get('original') in ('1', 'true')
+            else banks.resolved_image_path(bank, row))
     if not path or not os.path.isfile(path):
         return jsonify({'error': 'file missing'}), 404
     return send_file(path, max_age=0)

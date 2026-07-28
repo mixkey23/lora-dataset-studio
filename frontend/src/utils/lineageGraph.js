@@ -99,10 +99,34 @@ function indexTree(tree) {
 
 /** Cubic-bezier path from a point on the parent (card edge OR a checkpoint pill)
  *  to a child card's left edge, with horizontal tangents so the curve leaves and
- *  arrives flat — the smooth "flowing" connector, not a kinked polyline. */
-function edgePath(x1, y1, x2, y2) {
+ *  arrives flat — the smooth "flowing" connector, not a kinked polyline.
+ *
+ *  Exported because the ◉ Canvas re-draws these curves after a card is dragged:
+ *  the endpoints move with their node, and re-deriving them from the finished
+ *  `d` string (or keeping a second copy of this formula) is how two renderings
+ *  of the same edge start to drift. */
+/* ⚠️ A PERFECTLY horizontal edge is not drawn at all.
+   Every lineage edge is painted with a `linearGradient`, and a gradient's default
+   `gradientUnits` is objectBoundingBox — which SVG leaves undefined (and Chrome
+   renders as nothing) when the referencing geometry's bounding box has zero width
+   or height. A straight parent→child hop has bbox height EXACTLY 0.
+
+   That is the whole "the edge is missing" report, and it is why the bug looked
+   selective: a fork slopes, so its edges have height and paint fine; the most
+   common shape of all — a plain chain, where a parent is centred on its single
+   child and therefore sits at the same y — is the one that vanishes.
+
+   So a flat edge ends half a unit below where it started. Half a unit is under a
+   third of a pixel at the scales this graph draws at (invisible, and the edge
+   still arrives on the child's left edge), while the bbox stops being degenerate
+   and the gradient resolves. Fixing it HERE fixes every surface that draws these
+   edges, and keeps each edge's own parent→child ramp (which is exactly what
+   switching the gradients to userSpaceOnUse would have thrown away). */
+const FLAT_EDGE_NUDGE = 0.5;
+export function edgePath(x1, y1, x2, y2) {
   const mx = x1 + (x2 - x1) / 2;
-  return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+  const ey = y1 === y2 ? y2 + FLAT_EDGE_NUDGE : y2;
+  return `M${x1},${y1} C${mx},${y1} ${mx},${ey} ${x2},${ey}`;
 }
 
 /**
@@ -196,7 +220,18 @@ export function buildLineageGraph(tree, { bigPreviews = false } = {}) {
         // Lab inline generation: whether this checkpoint has a deployed LoRA the
         // engine can preview, and its generated preview (url + async status).
         testable: c.testable === true,
+        // …and, when it IS deployed, the ComfyUI copy's own name. Without it the
+        // popover can address that copy at all: ⏏ Undeploy (and the 🗑 it grew
+        // out of) resolve their target from this field, so dropping it here made
+        // every deployed pill a dead end no matter what the server sent.
+        deployed_filename: c.deployed_filename || null,
         preview_url: c.preview_url || null, preview_status: c.preview_status || null,
+        // How many images this checkpoint has produced IN TOTAL — the × N badge
+        // that opens its gallery. This layer builds the pill objects the renderers
+        // actually read, so a field it does not copy simply does not exist on
+        // screen no matter what the server sends (which is how this one first
+        // shipped invisible).
+        preview_count: c.preview_count || 0,
         x: x + dx, y: y + dy, w: m.pillW, h: m.pillH, isResumeSource: false };
     });
     pillsByNode.set(node.record_id, cks);
@@ -246,6 +281,11 @@ export function buildLineageGraph(tree, { bigPreviews = false } = {}) {
       superseded: !!e.superseded,
       onSpine: spine.has(e.parent) && spine.has(e.child),
       anchoredStep,
+      // The RAW endpoints alongside the path: (x1,y1) belongs to the parent's
+      // cell, (x2,y2) to the child's. The canvas moves a card and needs to
+      // rebuild the curve from the two points that moved with it — parsing them
+      // back out of `d` would be a second, silently divergent source of truth.
+      x1, y1, x2, y2,
       d: edgePath(x1, y1, x2, y2),
     });
   }

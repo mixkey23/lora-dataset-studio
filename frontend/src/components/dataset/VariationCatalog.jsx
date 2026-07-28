@@ -4,10 +4,9 @@ import Flux2KleinModelPicker from '../shared/Flux2KleinModelPicker';
 import QwenEditModelPicker from '../shared/QwenEditModelPicker';
 import { useToast } from '../common/Toast';
 import { useCapabilities } from '../../context/CapabilitiesContext';
-import { apiFetch } from '../../api/fetchClient';
+import { apiFetch, putJson } from '../../api/fetchClient';
 import ShotIllustration, { contextEmoji } from './ShotIllustration';
 import { displayLabel } from '../../utils/labels';
-import { kleinMissingLabels } from '../../hooks/useSetupSteps';
 import { generationLoraPresetPayload, sanitizeGenerationLoraPresets } from '../../utils/generationLoras';
 import { requestHelpTip } from '../../help/helpTips';
 import { HelpBadge } from '../../help/HelpMode';
@@ -19,6 +18,25 @@ import {
   renameShotPreset,
   saveShotPreset,
 } from '../../utils/shotPresets';
+import {
+  applyShotImport, buildShotExport, parseShotImport, promoteCustomShot, MAX_IMPORT_BYTES,
+} from '../../utils/shotImport';
+import {
+  ENGINE_ACCENTS, ENGINE_LABELS, billingEngines, canonicalEngines, engineBatches,
+  estimateCost, generateBlockedReason, localQueuesBehindApi, localOnly, readEngines,
+  readMode, totalImages, writeEngines, writeMode,
+} from './engineSelection.js';
+import { kreaUnavailableReason, groundingDescription, kreaFramingAdvisory } from '../../utils/kreaEngine.js';
+import { kleinUnavailableReason } from '../../utils/localEngineReason.js';
+import { kleinMissingLabels } from '../../utils/kleinAssets.js';
+import {
+  SUBJECT_TYPES, SUBJECT_TYPE_LABELS, SUBJECT_TYPE_HINTS,
+  normalizeSubjectType, framingLabel, defaultPresetKey,
+} from './subjectTypes.js';
+
+/** localStorage, or null when it can't be touched (private mode / SSR) — the
+ *  engine helpers degrade to their defaults instead of throwing. */
+const storage = () => (typeof localStorage === 'undefined' ? null : localStorage);
 
 const FRAMING_LABEL = { face: 'Face', bust: 'Bust', body: 'Body', back: 'Back' };
 // The framings a prompt suffix can target (same buckets the backend wraps by).
@@ -70,6 +88,24 @@ function ChatGptIcon({ className }) {
   );
 }
 
+/** Routing pictogram for the OpenRouter card: one input fanning out to several
+ *  providers — which is exactly what the engine does (one key, many models). */
+function RouterIcon({ className }) {
+  return (
+    <svg viewBox="0 0 32 32" className={className} aria-hidden="true" focusable="false">
+      <g stroke="currentColor" strokeWidth="1.8" fill="none" strokeLinecap="round">
+        <line x1="9" y1="16" x2="17" y2="16" />
+        <path d="M17 16 C 21 16, 21 8, 25 8" />
+        <path d="M17 16 C 21 16, 21 24, 25 24" />
+      </g>
+      <circle cx="7" cy="16" r="3" fill="currentColor" />
+      <circle cx="25" cy="8" r="2.4" fill="currentColor" opacity="0.85" />
+      <circle cx="25" cy="16" r="2.4" fill="currentColor" opacity="0.85" />
+      <circle cx="25" cy="24" r="2.4" fill="currentColor" opacity="0.85" />
+    </svg>
+  );
+}
+
 /** Small inline GPU-chip pictogram for the local Klein engine card. */
 function GpuIcon({ className }) {
   return (
@@ -88,12 +124,79 @@ function GpuIcon({ className }) {
   );
 }
 
-export default function VariationCatalog({ onGenerate, busy, generating = null, hasRef, composition, images = [], bodyFidelity = false, promptSuffix = '', promptSuffixes = null, onSaveSuffixes = null, renderStyle = 'photoreal' }) {
+/** Krea 2 Identity Edit: a portrait frame with an identity anchor — it re-stages
+ *  the SAME subject rather than generating a new one. Distinct silhouette from
+ *  the GPU chip so the two local cards never read as the same engine. */
+function IdentityFrameIcon({ className }) {
+  return (
+    <svg viewBox="0 0 32 32" className={className} aria-hidden="true" focusable="false">
+      <rect x="4" y="4" width="24" height="24" rx="4" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="16" cy="13" r="4" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M9 24c1.6-3.6 4.1-5.4 7-5.4s5.4 1.8 7 5.4" fill="none"
+        stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <circle cx="16" cy="13" r="1.2" fill="currentColor" />
+    </svg>
+  );
+}
+
+const MODE_CHOICES = [
+  { id: 'split', name: 'Split across engines',
+    desc: 'Each shot goes to ONE engine — same image count and cost as a single engine, but a more varied dataset.' },
+  { id: 'all', name: 'All engines',
+    desc: 'Every engine renders every shot — compare the results side by side, then keep the ones you like. Multiplies the cost.' },
+];
+
+/** One engine CHECKBOX card. A checkbox, not a radio: engines combine. Each
+ *  carries its own accent (see ENGINE_ACCENTS) so a mixed run is readable —
+ *  green is deliberately not one of them, it already means "kept / free". */
+function EngineCard({ id, checked, available, generating, onToggle, icon, title, tags, hint }) {
+  const accent = ENGINE_ACCENTS[id];
+  return (
+    <button type="button" role="checkbox" aria-checked={checked}
+      aria-label={ENGINE_LABELS[id]}
+      onClick={() => onToggle(id)}
+      disabled={!available || !!generating}
+      title={generating ? 'A generation batch is running — wait for it to finish before changing engines' : undefined}
+      className={`relative flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${checked
+        ? accent.card
+        : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
+      <span aria-hidden="true"
+        className={`absolute top-2 right-2 w-4 h-4 rounded border grid place-items-center text-[0.625rem] font-bold ${checked
+          ? `${accent.pill} border-transparent` : 'border-border text-transparent'}`}>✓</span>
+      {icon}
+      <span className="flex flex-col gap-1 min-w-0">
+        <span className={`text-[0.8125rem] font-semibold ${checked ? accent.title : 'text-content-muted'}`}>
+          {title}
+        </span>
+        <span className="flex flex-wrap gap-1">{tags}</span>
+        {hint}
+      </span>
+    </button>
+  );
+}
+
+export default function VariationCatalog({ onGenerate, busy, generating = null, hasRef, composition, images = [], bodyFidelity = false, promptSuffix = '', promptSuffixes = null, onSaveSuffixes = null, renderStyle = 'photoreal', subjectType = 'human', onSaveSubjectType = null, refWidth = null, refHeight = null, onCropRefTo = null }) {
   const toast = useToast();
   const { caps } = useCapabilities();
   const [catalog, setCatalog] = useState([]);
   const [nsfwCatalog, setNsfwCatalog] = useState([]);
   const [presets, setPresets] = useState({});
+  // Preset display metadata: the backend sends it for NON-human types (their
+  // preset keys aren't known here); human returns none -> the hardcoded
+  // PRESET_META is used, so the human panel is unchanged.
+  const [presetMeta, setPresetMeta] = useState(null);
+  // WHAT the subject is — steers which catalog/presets are fetched and the
+  // identity lock the backend applies. Synced from the dataset; a change persists
+  // to the dataset and refetches the catalog.
+  const [subject, setSubject] = useState(() => normalizeSubjectType(subjectType));
+  useEffect(() => { setSubject(normalizeSubjectType(subjectType)); }, [subjectType]);
+  const changeSubject = (st) => {
+    const n = normalizeSubjectType(st);
+    if (n === subject) return;
+    setSubject(n);
+    if (onSaveSubjectType) onSaveSubjectType(n);
+  };
+  const frLabel = (fr) => framingLabel(subject, fr);
   const [selected, setSelected] = useState(new Set());
   const [multiplier, setMultiplier] = useState(1);
   const [klein, setKlein] = useState(null);
@@ -128,7 +231,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const addCustomShot = () => {
     const p = customPrompt.trim();
     if (!p) return;
-    const hot = nsfwMode && isLocal;
+    const hot = nsfwMode && localOnlyRun;
     const shot = { id: `custom_${Date.now()}`, label: `${hot ? '🔞' : '✨'} ${p.slice(0, 40)}`,
                    prompt: p, framing: customFraming, nsfw: hot };
     setCustomShots((s) => [...s, shot]);
@@ -139,6 +242,180 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const removeCustomShot = (id) => {
     setCustomShots((s) => s.filter((c) => c.id !== id));
     setSelected((s) => { const n = new Set(s); n.delete(id); return n; });
+  };
+
+  // 📥 Imported shots (idea by ashish.sinha — Discord): a JSON catalog the user
+  // had an LLM write, rather than typing 40 shots by hand. These live SERVER-side
+  // (config `custom_shots`, per subject type), so they survive a browser wipe,
+  // show up on a phone as well as the desktop and ride along in the full backup —
+  // the ✨ cards above stay in localStorage, unchanged.
+  const [importedShots, setImportedShots] = useState([]);
+  // Every label the by-label resolvers already answer for (all catalogs + legacy
+  // aliases). An imported label that shadows one of these resolves to the WRONG
+  // entry on regenerate, so the importer refuses them — see shotImport.js.
+  const [reservedLabels, setReservedLabels] = useState([]);
+  const [importReview, setImportReview] = useState(null);   // {result, name} — nothing written yet
+  const [importBusy, setImportBusy] = useState(false);
+  const importFileRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/dataset/shot-catalog?subject_type=${encodeURIComponent(subject)}`)
+      .then((d) => {
+        if (cancelled) return;
+        setImportedShots(d.shots || []);
+        setReservedLabels(d.reserved_labels || []);
+      })
+      .catch(() => { /* no imported shots is a valid state — never block the panel */ });
+    return () => { cancelled = true; };
+  }, [subject]);
+
+  /** Persist the WHOLE list for this subject (a removal is just a shorter list).
+   *  The server re-validates and answers with what actually landed. */
+  const persistImported = async (shots) => {
+    const d = await putJson('/api/dataset/shot-catalog', { subject_type: subject, shots });
+    setImportedShots(d.shots || []);
+    return d;
+  };
+
+  const readImportFile = async (file) => {
+    if (!file) return;
+    setImportReview(null);
+    let text = '';
+    try { text = await file.text(); }
+    catch { toast.error('Could not read that file.'); return; }
+    const result = parseShotImport(text, {
+      subjectType: subject,
+      reservedLabels,
+      // A new label may not collide with the built-ins NOR with a shot the user
+      // already has — imported or hand-written.
+      existingLabels: [...importedShots, ...customShots].map((s) => s.label),
+      byteLength: file.size,
+    });
+    if (result.blocked) { toast.error(result.blocked.message); return; }
+    setImportReview({ result, name: file.name });
+  };
+
+  /** Second stage: the user has SEEN the summary and says go. Until this runs,
+   *  nothing has been written — a 40-shot file with a bad 37th entry can never
+   *  leave 36 shots half-imported. */
+  const confirmImport = async () => {
+    const { result } = importReview || {};
+    if (!result?.accepted.length) return;
+    setImportBusy(true);
+    try {
+      const d = await persistImported(applyShotImport(importedShots, result.accepted));
+      setImportReview(null);
+      toast.success(d.dropped
+        ? `${result.accepted.length - d.dropped} shots imported (${d.dropped} refused by the server)`
+        : `${result.accepted.length} shot${result.accepted.length === 1 ? '' : 's'} imported`);
+    } catch {
+      toast.error('Could not save the imported shots.');
+    } finally { setImportBusy(false); }
+  };
+
+  const removeImportedShot = async (shot) => {
+    setSelected((s) => { const n = new Set(s); n.delete(shot.id); return n; });
+    try { await persistImported(importedShots.filter((s) => s.id !== shot.id)); }
+    catch { toast.error('Could not remove that shot.'); }
+  };
+
+  /** ⇪ Keep — promote a hand-written ✨ card into the durable catalog. Those cards
+   *  live in localStorage and die with the browser cache; exporting and
+   *  re-importing them can't rescue them (they collide with themselves), so this
+   *  is the only path — one click, and the card visibly moves to the 📥 group.
+   *  Saved first, removed from localStorage only once the server confirms it
+   *  landed: a failure must never make the card disappear. */
+  const keepCustomShot = async (shot) => {
+    const res = promoteCustomShot({ shot, customShots, importedShots, reservedLabels });
+    if (!res.ok) { toast.error(res.message); return; }
+    try {
+      const d = await persistImported(res.importedShots);
+      if (!(d.shots || []).some((s) => s.id === res.promoted.id)) {
+        toast.error(`“${shot.label}” was refused by the app — the card is still here.`);
+        return;
+      }
+      setCustomShots(res.customShots);
+      toast.success(`Kept “${shot.label}” — it now lives with the app, not in this browser`);
+    } catch {
+      toast.error('Could not keep that shot — the card is still here.');
+    }
+  };
+
+  const removeAllImported = async () => {
+    if (!window.confirm(`Remove all ${importedShots.length} imported shots for this subject type? The built-in shots are not affected.`)) return;
+    const ids = new Set(importedShots.map((s) => s.id));
+    setSelected((s) => new Set([...s].filter((id) => !ids.has(id))));
+    try { await persistImported([]); }
+    catch { toast.error('Could not clear the imported shots.'); }
+  };
+
+  /** The file the user hands to an LLM — and the backup of their own shots. */
+  const exportShotCatalog = () => {
+    const blob = new Blob([buildShotExport({
+      subjectType: subject, shots: [...importedShots, ...customShots], catalog,
+    })], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `lds-shots-${subject}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Shots the user owns, in ONE list: everything below (selection, the 🔞 purge,
+  // the Generate payload, the preset composition bars) treats them alike.
+  const userShots = useMemo(() => [...customShots, ...importedShots],
+    [customShots, importedShots]);
+
+  /** One user-shot card — selectable like a catalog card, plus the ✕ that only
+   *  user shots have. Shared by the ✨ Custom and 📥 Imported groups so they can
+   *  never drift apart. */
+  const renderUserShot = (c, onRemove, removeTitle, onKeep = null) => {
+    const on = selected.has(c.id);
+    const done = doneByLabel.get(c.label) || 0;
+    const blocked = c.nsfw && !localOnlyRun;   // 🔞 card while an API engine is in the run
+    const cls = on
+      ? 'bg-primary/20 border-primary/50 text-white ring-1 ring-primary/30'
+      : done > 0
+        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100/90 hover:bg-emerald-500/15'
+        : 'border-border bg-app/40 text-content-muted hover:bg-surface-raised';
+    return (
+      <div key={c.id} className={`relative flex items-center gap-1.5 px-1.5 py-1 rounded-lg text-[0.625rem] border transition-colors ${cls} ${blocked ? 'opacity-40' : ''}`}>
+        <button type="button" onClick={() => !blocked && toggle(c.id)} aria-pressed={on}
+          disabled={blocked}
+          title={blocked ? '🔞 shot — check Klein alone to generate it' : c.prompt}
+          className="flex items-center gap-1.5 flex-1 min-w-0 text-left disabled:cursor-not-allowed">
+          <ShotIllustration framing={c.framing} label={c.label} className="w-7 h-7 shrink-0" />
+          {/* Wraps like a catalog card instead of truncating: an imported label is
+              a real name the user chose, and "Shiba, zo…" identifies nothing. */}
+          <span className="min-w-0 leading-tight break-words">{c.label}</span>
+          <span className="ml-auto shrink-0 flex items-center gap-1">
+            {done > 0 && <span className="text-emerald-300 font-semibold">✓×{done}</span>}
+            {on && <span className="text-indigo-300" aria-hidden="true">✓</span>}
+          </span>
+        </button>
+        <span className="shrink-0 flex flex-col items-stretch gap-0.5">
+          {/* "Keep" in words, not a glyph: the point of this button is that the
+              card stops living in the browser, and no icon says that. */}
+          {onKeep && (
+            <button type="button" onClick={onKeep}
+              aria-label={`Keep the shot ${c.label}`}
+              title="Keep this shot for good — it moves to Imported and is saved with the app, so it survives clearing your browser and shows up on your other devices"
+              className="px-1 py-px rounded bg-black/40 text-content-subtle hover:text-emerald-300 text-[0.5625rem] leading-none">
+              Keep
+            </button>
+          )}
+          <button type="button" onClick={onRemove}
+            aria-label={`${removeTitle} ${c.label}`} title={removeTitle}
+            className="self-end w-4 h-4 grid place-items-center rounded bg-black/40 text-content-subtle hover:text-white text-[0.625rem] leading-none">
+            ✕
+          </button>
+        </span>
+      </div>
+    );
   };
   // Identity LoRA strength (F1): higher = closer to the reference face,
   // lower = more variety in the generated variations.
@@ -164,22 +441,51 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const [loraPresets, setLoraPresets] = useState([]);   // [{name, loras:[{file, strength}]}]
   const [loraPresetName, setLoraPresetName] = useState('');   // '' = None
   const activeLoraPreset = loraPresets.find((p) => p.name === loraPresetName) || null;
-  // Generator backend: Nano Banana Pro (Gemini API, ~0,15 $/image, zero GPU,
-  // best face fidelity — user-validated default) or local Klein (GPU, free).
-  const [generator, setGenerator] = useState(() => {
-    try { return localStorage.getItem('datasetGenerator') || 'nanobanana'; } catch { return 'nanobanana'; }
-  });
-  useEffect(() => {
-    try { localStorage.setItem('datasetGenerator', generator); } catch { /* ignore */ }
-  }, [generator]);
-  const isNB = generator === 'nanobanana';
-  const isGPT = generator === 'chatgpt';
-  const isQwenEdit = generator === 'qwen_edit';
-  const isKlein = !isNB && !isGPT && !isQwenEdit;
-  // Generic "runs locally on ComfyUI" checks (NSFW eligibility, the consistency-
-  // LoRA auto-skip, the cost estimate) apply to EITHER local engine; Klein-
-  // specific UI (its model picker, its own tuning panel) stays `isKlein`-only.
-  const isLocal = isKlein || isQwenEdit;
+  // Generator backends — a SET, not one card: Nano Banana Pro (Gemini API,
+  // ~$0.15/image, zero GPU, best face fidelity — the historic default), ChatGPT
+  // (API or subscription) and the local engines (Klein, Krea, Qwen Edit — GPU,
+  // free). Several at once either SPLIT the shots between them (varied dataset,
+  // same cost) or run ALL of them on every shot (compare the engines, then
+  // triage). engineSelection.js owns the storage compatibility: the legacy
+  // single-string `datasetGenerator` key is still written, so regenerate and
+  // the ✎ modal keep working untouched.
+  const [engines, setEngines] = useState(() => readEngines(storage()));
+  useEffect(() => { writeEngines(storage(), engines); }, [engines]);
+  const [engineMode, setEngineMode] = useState(() => readMode(storage()));
+  useEffect(() => { writeMode(storage(), engineMode); }, [engineMode]);
+  const toggleEngine = (id) => setEngines((list) => (list.includes(id)
+    ? list.filter((e) => e !== id) : canonicalEngines([...list, id])));
+
+  const isNB = engines.includes('nanobanana');
+  const isGPT = engines.includes('chatgpt');
+  const isOR = engines.includes('openrouter');
+  // Per-engine affordances (the Klein tuning panel, the Krea one, the Qwen Edit
+  // one) light up as soon as that engine is part of the run — its shots really
+  // are rendered locally.
+  const isKlein = engines.includes('klein');
+  const isKrea = engines.includes('krea');
+  const isQwenEdit = engines.includes('qwen_edit');
+  const multiEngine = engines.length > 1;
+  // 🔞 shots stay exactly as strict as before, only the wording of "local"
+  // widened: they exist when EVERY selected engine is local. A local engine
+  // alongside an API one would either send them to that API (which the backend
+  // refuses, failing the whole run) or need a per-shot routing rule the
+  // cost/count display could not honestly show — so the uncensored catalog
+  // stays locked until the run is local-only. Several local engines together
+  // are fine: they all accept 🔞.
+  const localOnlyRun = localOnly(engines);
+
+  /** Images THIS engine renders in the current run. For an engine that isn't
+   *  checked, what it would render if it were picked alone — so the card's price
+   *  answers "what would this cost me?" before the click, as it always did.
+   *  Reuses the batch split so the card, the mode selector and the payload can
+   *  never disagree on the share. */
+  const engineShare = (id) => {
+    const shots = Array.from({ length: selected.size }, (_, i) => i);
+    if (!engines.includes(id)) return shots.length * multiplier;
+    const batch = engineBatches(shots, engines, engineMode).find((b) => b.generator === id);
+    return (batch ? batch.variations.length : 0) * multiplier;
+  };
 
   // Which engines the user actually enabled in Settings (config.engines.enabled),
   // on top of the live reachability probe in `caps.engines`.
@@ -187,6 +493,15 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   // ChatGPT auth lane (auto|api|subscription) — decides whether the card shows a
   // per-image API price or "uses your ChatGPT subscription quota".
   const [chatgptAuth, setChatgptAuth] = useState('auto');
+  // Which OpenRouter model the run will actually bill: free text in Settings, so
+  // the card names it rather than implying a fixed one.
+  const [openrouterModel, setOpenrouterModel] = useState('');
+  // Same for the ChatGPT API lane, whose model is free text in Settings too:
+  // this card used to state "gpt-image-2" flatly, which became a lie the moment
+  // someone changed it. Blank = the engine's own default, named here.
+  const [chatgptImageModel, setChatgptImageModel] = useState('');
+  // Krea's consistency <-> prompt-adherence dial, mirrored from Settings.
+  const [kreaGrounding, setKreaGrounding] = useState(1024);
   useEffect(() => {
     let cancelled = false;
     apiFetch('/api/settings')
@@ -194,27 +509,41 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         if (cancelled) return;
         setEnabledEngines(d.config?.engines?.enabled || []);
         setChatgptAuth(d.config?.engines?.chatgpt_auth || 'auto');
+        setOpenrouterModel((d.config?.engines?.openrouter_model || '').trim());
+        setChatgptImageModel((d.config?.engines?.chatgpt_image_model || '').trim());
         // Optional generation-LoRA presets: names + chains for the picker.
         setLoraPresets(sanitizeGenerationLoraPresets(d.config?.klein?.generation_lora_presets));
+        // Krea's one dial. It lives in Settings (it changes the meaning of every
+        // shot in the batch identically, so it is not a per-run argument), and is
+        // MIRRORED here so the workspace can say what the run will actually do.
+        setKreaGrounding(Number(d.config?.krea?.grounding_px) || 1024);
       })
       .catch(() => { /* keep the permissive default on a transient failure */ });
     return () => { cancelled = true; };
   }, []);
   const nbAvailable = enabledEngines.includes('nanobanana') && caps.engines.nanobanana;
   const gptAvailable = enabledEngines.includes('chatgpt') && caps.engines.chatgpt;
+  const orAvailable = enabledEngines.includes('openrouter') && caps.engines.openrouter;
   const klAvailable = enabledEngines.includes('klein') && caps.engines.klein;
+  const krAvailable = enabledEngines.includes('krea') && caps.engines.krea;
   const qeAvailable = enabledEngines.includes('qwen_edit') && caps.engines.qwen_edit;
-  const currentAvailable = isKlein ? klAvailable : isQwenEdit ? qeAvailable : isNB ? nbAvailable : gptAvailable;
+  const available = { klein: klAvailable, krea: krAvailable, qwen_edit: qeAvailable,
+    nanobanana: nbAvailable, chatgpt: gptAvailable, openrouter: orAvailable };
 
-  // The persisted generator can point at an engine that has since been
-  // disabled in Settings (or lost its key/backend): auto-switch to the first
-  // usable card instead of staying stuck on a dead one. This also feeds
-  // regenerate, which follows the persisted selection.
+  // The persisted selection can name engines that have since been disabled in
+  // Settings (or lost their key/backend): drop those instead of trying to
+  // generate on a dead one, and fall back to the first usable card when that
+  // empties the selection. This also feeds regenerate, which follows the
+  // persisted primary engine.
   useEffect(() => {
-    if (currentAvailable) return;
-    const first = nbAvailable ? 'nanobanana' : gptAvailable ? 'chatgpt' : klAvailable ? 'klein' : qeAvailable ? 'qwen_edit' : null;
-    if (first && first !== generator) setGenerator(first);
-  }, [currentAvailable, nbAvailable, gptAvailable, klAvailable, qeAvailable, generator]);
+    const usable = engines.filter((e) => available[e]);
+    if (usable.length === engines.length) return;
+    const first = nbAvailable ? 'nanobanana' : gptAvailable ? 'chatgpt'
+      : orAvailable ? 'openrouter' : klAvailable ? 'klein'
+      : krAvailable ? 'krea' : qeAvailable ? 'qwen_edit' : null;
+    setEngines(usable.length ? usable : (first ? [first] : []));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engines, nbAvailable, gptAvailable, orAvailable, klAvailable, krAvailable, qeAvailable]);
   // Effective ChatGPT lane: the subscription (ChatGPT Plus/Pro image quota) vs the
   // pay-per-use API key. Mirrors the backend "auto = subscription when connected".
   const gptSub = caps.chatgpt_subscription || {};
@@ -223,20 +552,45 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   const gptPlanLabel = gptSub.plan && gptSub.plan !== 'free'
     ? gptSub.plan.charAt(0).toUpperCase() + gptSub.plan.slice(1)
     : 'Plus/Pro';
-  // Klein unavailable has THREE distinct causes — the hint must name the right
-  // one (a reachable ComfyUI with no Klein model used to show "Configure
-  // ComfyUI", sending the user to re-check a step that was already green). When
-  // ComfyUI IS reachable, name the exact missing weight(s) (model / text encoder /
-  // VAE) instead of always blaming the UNET — the old text sent users to
-  // models/unet/klein/ even when the real gap was the TE or VAE.
-  const kleinMissingWords = kleinMissingLabels(caps.comfyui?.klein_missing);
-  const kleinAssetHint = kleinMissingWords.length
-    ? `⚠ Klein ${kleinMissingWords.join(' + ')} missing — download it in the Setup step`
-    : '⚠ Klein model missing — download it in the Setup step (models/unet/klein/)';
+  // What this run costs and, when it can't run, why. `caps.max_fanout` is the
+  // SERVER's per-batch cap, published by /api/capabilities — mirrored so the
+  // limit is explained before the click, never hardcoded here. A server that
+  // doesn't publish it (older build) simply keeps the check off.
+  const runCost = estimateCost(selected.size, engines, engineMode, { multiplier, gptViaSub });
+  const blockedReason = generateBlockedReason({
+    engines, shotCount: selected.size, mode: engineMode, multiplier,
+    maxFanout: Number(caps.max_fanout) || 0,
+  });
+  // Klein unavailable has FOUR distinct causes and the hint must name the right
+  // one — a reachable ComfyUI with no Klein model used to show "Configure
+  // ComfyUI", sending the user to re-check a step that was already green; and the
+  // `beta57` scheduler (a RES4LYF node-pack value the shipped graph pinned,
+  // reported by IndependentProcess0 on Reddit) took Klein out for everyone while
+  // every other check went green. All four now live in
+  // utils/localEngineReason.js, WITH their tests: the ✦ Edit-reference modal
+  // offers Klein too, and one gap explained two different ways in two dialogs is
+  // the same bug as no explanation at all.
   const kleinHint = klAvailable ? null
-    : !enabledEngines.includes('klein') ? '⚠ Klein is disabled in Settings (engines)'
-    : !caps.comfyui?.reachable ? '⚠ Configure ComfyUI in Settings'
-    : kleinAssetHint;
+    : kleinUnavailableReason({
+      enabledInSettings: enabledEngines.includes('klein'),
+      comfyuiReachable: !!caps.comfyui?.reachable,
+      comfyui: caps.comfyui,
+      missingAssets: caps.comfyui?.klein_missing,
+      unsupportedEnums: caps.comfyui?.klein_unsupported_enums,
+    });
+  // Krea has one more failure mode than Klein — a missing CUSTOM-NODE PACK — and
+  // "install a node pack" is a different action from "place a weight file", so
+  // the reason is computed (and unit-tested) rather than collapsed into one
+  // "not available". See utils/kreaEngine.js.
+  const kreaHint = krAvailable ? null : kreaUnavailableReason({
+    enabledInSettings: enabledEngines.includes('krea'),
+    comfyuiReachable: !!caps.comfyui?.reachable,
+    comfyui: caps.comfyui,
+    missingAssets: caps.comfyui?.krea_missing,
+    missingNodes: caps.comfyui?.krea_nodes_missing,
+    invalidAssets: caps.comfyui?.krea_invalid,
+    nodePackInstalled: caps.comfyui?.krea_nodes_installed,
+  });
   // Same three-cause pattern for the Qwen Edit card.
   const qwenEditMissingWords = kleinMissingLabels(caps.comfyui?.qwen_edit_missing);
   const qwenEditAssetHint = qwenEditMissingWords.length
@@ -249,18 +603,20 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
 
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/dataset/variations', { credentials: 'include' })
+    fetch(`/api/dataset/variations?subject_type=${encodeURIComponent(subject)}`,
+      { credentials: 'include' })
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then((d) => {
         if (cancelled) return;
+        const p = d.presets || {};
         setCatalog(d.catalog || []);
         setNsfwCatalog(d.nsfw_catalog || []);
-        setPresets(d.presets || {});
-        // Body-fidelity datasets start on the body-emphasis preset (figure-visible
-        // outfits); everyone else keeps the balanced default.
-        const def = bodyFidelity ? (d.presets?.body_emphasis || d.presets?.balanced_25)
-          : d.presets?.balanced_25;
-        setSelected(new Set(def || []));
+        setPresets(p);
+        setPresetMeta(d.preset_meta || null);
+        // Auto-select the type's default preset (human: balanced / body-emphasis;
+        // non-human: its single balanced spread). Re-runs on a subject switch.
+        const key = defaultPresetKey(p, subject, { bodyFidelity });
+        setSelected(new Set((key && p[key]) || []));
       })
       .catch(() => {
         // Loud failure (M6): an empty catalog otherwise looks like a UI bug.
@@ -268,7 +624,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toast]);
+  }, [toast, subject]);
 
   const byFraming = useMemo(() => {
     const g = { face: [], bust: [], body: [], back: [] };
@@ -279,13 +635,13 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
   // Switching to an API engine drops any selected NSFW shots (Klein-only) —
   // catalog nsfw_ entries AND 🔞 custom cards alike.
   useEffect(() => {
-    if (isLocal) return;
-    const hotCustom = new Set(customShots.filter((c) => c.nsfw).map((c) => c.id));
+    if (localOnlyRun) return;
+    const hotCustom = new Set(userShots.filter((c) => c.nsfw).map((c) => c.id));
     setSelected((s) => {
       const n = new Set([...s].filter((id) => !id.startsWith('nsfw_') && !hotCustom.has(id)));
       return n.size === s.size ? s : n;
     });
-  }, [isLocal, customShots]);
+  }, [localOnlyRun, userShots]);
 
   // "Already in the dataset" per variation label: live images (kept, pending or
   // still generating — not failed/rejected) → the green ✓×N state on the cards.
@@ -324,7 +680,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
 
   const customPresetStats = useMemo(() => {
     const framingById = new Map([
-      ...catalog, ...nsfwCatalog, ...customShots,
+      ...catalog, ...nsfwCatalog, ...userShots,
       ...customPresets.flatMap((preset) => preset.customShots || []),
     ].map((shot) => [shot.id, shot.framing]));
     return Object.fromEntries(customPresets.map((preset) => {
@@ -333,6 +689,20 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       return [preset.id, { counts, total: preset.selectedIds.length }];
     }));
   }, [catalog, nsfwCatalog, customShots, customPresets]);
+
+  // MEASURED: Krea reproduces the REFERENCE's aspect ratio (the edit LoRA was
+  // trained on same-size pairs — krea_edit_helper.fit_output_size), so a square
+  // or landscape reference makes every body/back shot land tighter than asked.
+  // Computed here, from the shots actually ticked, so it appears the moment the
+  // user picks Krea or ticks a wide shot — not after twenty generations. Klein
+  // and the API engines are untouched, so the notice is Krea-only.
+  const kreaAdvisory = useMemo(() => {
+    if (!engines.includes('krea') || !krAvailable) return null;
+    const framingById = new Map([...catalog, ...nsfwCatalog, ...userShots]
+      .map((shot) => [shot.id, shot.framing]));
+    const framings = [...selected].map((id) => framingById.get(id)).filter(Boolean);
+    return kreaFramingAdvisory({ width: refWidth, height: refHeight, framings });
+  }, [engines, krAvailable, catalog, nsfwCatalog, userShots, selected, refWidth, refHeight]);
 
   const toggle = (id) => setSelected((s) => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n;
@@ -351,7 +721,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
     const name = window.prompt('Name this shot preset:');
     if (name == null) return;
     try {
-      const next = saveShotPreset(customPresets, name, selected, customShots);
+      const next = saveShotPreset(customPresets, name, selected, userShots);
       setCustomPresets(next);
       toast.success(`Preset saved: ${next.at(-1).name}`);
     } catch (error) { toast.error(error.message || 'Could not save preset'); }
@@ -362,8 +732,12 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       setSelected(new Set());
       return;
     }
-    const restored = applyShotPreset(preset, customShots);
-    setCustomShots(restored.customShots);
+    // A saved preset carries a COPY of the user shots it selected. Restore the
+    // missing ones as ✨ cards, minus those the subject already has imported —
+    // otherwise an imported shot would be duplicated into localStorage.
+    const restored = applyShotPreset(preset, userShots);
+    const importedIds = new Set(importedShots.map((s) => s.id));
+    setCustomShots(restored.customShots.filter((s) => !importedIds.has(s.id)));
     setSelected(new Set(restored.selectedIds));
   };
 
@@ -420,14 +794,14 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       .map((e) => ({ label: e.label, prompt: e.prompt, framing: e.framing }));
     // NSFW shots: local engines only (the toggle is gated on a local engine,
     // and the backend refuses them on API engines).
-    if (nsfwMode && isLocal) {
+    if (nsfwMode && localOnlyRun) {
       variations.push(...nsfwCatalog.filter((e) => selected.has(e.id))
         .map((e) => ({ label: e.label, prompt: e.prompt, framing: e.framing, nsfw: true })));
     }
     // Custom cards: selectable like catalog shots; 🔞 ones only ride with a local
     // engine (the label prefix is what regenerate uses to re-pick the uncensored wrapper).
-    variations.push(...customShots
-      .filter((c) => selected.has(c.id) && (isLocal || !c.nsfw))
+    variations.push(...userShots
+      .filter((c) => selected.has(c.id) && (localOnlyRun || !c.nsfw))
       .map((c) => ({ label: c.label, prompt: c.prompt, framing: c.framing,
                      ...(c.nsfw ? { nsfw: true } : {}) })));
     if (!variations.length) return;
@@ -452,12 +826,14 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
     if (!toGen.length) return;
     // Guard-rail: pay-per-use API engines bill per image — above $5 estimated,
     // confirm with the amount (silent for the free local Klein AND for the
-    // ChatGPT subscription lane, which spends plan quota, not dollars).
-    const rate = isNB ? 0.15 : (isGPT && !gptViaSub) ? 0.17 : 0;
-    const cost = toGen.length * multiplier * rate;
+    // ChatGPT subscription lane, which spends plan quota, not dollars). On a
+    // multi-engine run the amount is the WHOLE run's, and only the lanes that
+    // really charge are named.
+    const cost = estimateCost(toGen.length, engines, engineMode, { multiplier, gptViaSub });
+    const billing = billingEngines(engines, { gptViaSub });
     if (cost > 5 && !window.confirm(
-      `This will launch ${toGen.length * multiplier} API generation(s) `
-      + `≈ $${cost.toFixed(2)} (${isNB ? 'Nano Banana' : 'ChatGPT'}).\n\nProceed?`)) return;
+      `This will launch ${totalImages(toGen.length, engines, engineMode, multiplier)} generation(s) `
+      + `≈ $${cost.toFixed(2)} (${billing.map((e) => ENGINE_LABELS[e]).join(' + ')}).\n\nProceed?`)) return;
     // Persist any per-batch suffix edit BEFORE enqueueing: the backend applies
     // the dataset's CURRENT suffix at wrap time, so the save must land first or
     // the batch would generate with the old creative direction (Idea by waltm).
@@ -466,10 +842,15 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
       if (!res?.ok) return;   // save failed → don't generate with a stale suffix
     }
     // Optional generation-LoRA preset (Klein only): only the NAME rides — the
-    // backend resolves the chain from its own config (fail-closed). The model
-    // override rides on the same wire field for either local engine — only
-    // ONE can be active at a time, so picking by isQwenEdit is unambiguous.
-    onGenerate(toGen, multiplier, isQwenEdit ? qwenModel : klein, loraStrength, generator,
+    // backend resolves the chain from its own config (fail-closed).
+    // The shots are already shared between the engines here (API batches first,
+    // the GPU-bound local ones last); the server re-checks every batch. The
+    // model override rides on the same wire field for either local single-
+    // engine run — only one of Klein/Qwen Edit can be the sole engine at a
+    // time when a model override matters, so picking by isQwenEdit is
+    // unambiguous.
+    onGenerate(engineBatches(toGen, engines, engineMode), multiplier,
+      isQwenEdit ? qwenModel : klein, loraStrength,
       generationLoraPresetPayload({ isKlein, presetName: loraPresetName, presets: loraPresets }));
   };
 
@@ -483,123 +864,373 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         </span>
       </div>
 
-      {/* Engine cards — Klein (local GPU) vs Nano Banana Pro vs ChatGPT (APIs).
+      {/* Subject type — WHAT the reference is. Anything but Human switches the
+          shot catalog AND the identity lock so the prompts stop assuming a person
+          (a dog keeps its breed/markings, a product its shape/logo). Persisted per
+          dataset; changing it reloads the shot list and its default preset. */}
+      <div className="flex flex-col gap-1 rounded-lg border border-border bg-app/30 px-2.5 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-content-muted text-[0.6875rem] uppercase">Subject type</span>
+          <div role="radiogroup" aria-label="Subject type" className="flex flex-wrap gap-1">
+            {SUBJECT_TYPES.map((st) => (
+              <button key={st} type="button" role="radio" aria-checked={subject === st}
+                onClick={() => changeSubject(st)} disabled={!!generating}
+                title={SUBJECT_TYPE_HINTS[st]}
+                className={`px-2 py-0.5 rounded-full text-[0.6875rem] border transition-colors disabled:opacity-50 ${subject === st
+                  ? 'border-primary/60 bg-primary/15 text-white ring-1 ring-primary/30'
+                  : 'border-border bg-app/40 text-content-muted hover:bg-surface-raised'}`}>
+                {SUBJECT_TYPE_LABELS[st]}
+              </button>
+            ))}
+          </div>
+          <HelpBadge topic="subject-type" />
+        </div>
+        <span className="text-content-subtle text-[0.625rem]">{SUBJECT_TYPE_HINTS[subject]}</span>
+      </div>
+
+      {/* Engine cards — Klein and Krea 2 Edit (local GPU), Nano Banana Pro,
+          ChatGPT and OpenRouter (APIs).
+          CHECKBOXES, not a radio group: several engines can run in one batch.
           Each card disables itself with an actionable hint when its engine
-          isn't configured/reachable or was turned off in Settings. */}
+          isn't configured/reachable or was turned off in Settings, and carries
+          its own accent colour so a mixed run stays readable at a glance. */}
       <div className="flex items-center gap-2">
-        <span className="text-content-muted text-[0.6875rem] uppercase">Engine</span>
+        <span className="text-content-muted text-[0.6875rem] uppercase">Engines</span>
         <span className="text-content-subtle text-[0.625rem]">
-          where the images are made — Klein runs free on your GPU · APIs bill per image (or use your ChatGPT subscription)
+          where the images are made — pick one or several · Klein and Krea 2 Edit run free on your GPU · APIs bill per image (or use your ChatGPT subscription)
         </span>
+        <HelpBadge topic="dataset-engine-mode" />
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
-        <button type="button" onClick={() => setGenerator('klein')} aria-pressed={isKlein}
-          disabled={!klAvailable || !!generating}
-          title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
-          className={`flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isKlein
-            ? 'border-primary/60 bg-primary/15 ring-1 ring-primary/40'
-            : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
-          <GpuIcon className={`w-9 h-9 shrink-0 ${isKlein ? 'text-indigo-300' : 'text-content-subtle'}`} />
-          <span className="flex flex-col gap-1 min-w-0">
-            <span className={`text-[0.8125rem] font-semibold ${isKlein ? 'text-white' : 'text-content-muted'}`}>
-              Klein <span className="font-normal text-content-subtle">· local</span>
+      {/* Discoverability: the generation prompt (identity/style directives) is
+          editable, but users don't know where. Point them at it right where the
+          "why is this coming out realistic?" question arises. */}
+      <p className="text-content-subtle text-[0.625rem] -mt-1">
+        Not the look you wanted (a stylized reference coming out realistic)? Edit the generation prompt in{' '}
+        <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">Settings › Image engines →</a>
+      </p>
+      {/* Six cards now, and the column stops at THREE. Tailwind breakpoints read
+          the VIEWPORT, but these cards live in the workspace column next to the
+          sidebar — a `2xl:grid-cols-5` measured on a 1600 px window put five cards
+          in ~700 px (≈130 px each) and wrapped every hint to one word per line.
+          Three-across is wider per card than the four-across this grid shipped
+          with. One column on a phone (nothing is clipped at 400 px), two from sm. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+        <EngineCard id="klein" checked={isKlein} available={klAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('klein')}
+          icon={<GpuIcon className={`w-9 h-9 shrink-0 ${isKlein ? ENGINE_ACCENTS.klein.icon : 'text-content-subtle'}`} />}
+          title={<>Klein <span className="font-normal text-content-subtle">· local</span></>}
+          tags={[
+            // Green stays a statement about the PRICE, never a selection state.
+            <span key="free" className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>,
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>,
+            <span key="nsfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>,
+          ]}
+          hint={klAvailable ? (
+            <span className="text-content-subtle text-[0.625rem]">
+              Runs on this machine — slower, tunable face fidelity.
+              {localQueuesBehindApi(engines) && (
+                <> <span className={ENGINE_ACCENTS.klein.text}>
+                  Its {engineShare('klein')} shot(s) queue on your GPU, one at a time, after the API ones.
+                </span></>
+              )}
             </span>
-            <span className="flex flex-wrap gap-1">
-              <span className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>
+          ) : (
+            <a href="#/setup" onClick={(e) => e.stopPropagation()}
+              className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
+              {kleinHint}
+            </a>
+          )} />
+        {/* Krea 2 Identity Edit — the second LOCAL engine. It keeps the identity
+            from the reference photo ALONE (no character LoRA needed), which is
+            exactly the bootstrap case: a character that has no LoRA yet. */}
+        <EngineCard id="krea" checked={isKrea} available={krAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('krea')}
+          icon={<IdentityFrameIcon className={`w-9 h-9 shrink-0 ${isKrea ? ENGINE_ACCENTS.krea.icon : 'text-content-subtle'}`} />}
+          title={<>Krea 2 Edit <span className="font-normal text-content-subtle">· local</span></>}
+          tags={[
+            <span key="free" className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>,
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>,
+            <span key="nsfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>,
+          ]}
+          hint={krAvailable ? (
+            <span className="text-content-subtle text-[0.625rem]">
+              Identity-preserving edit — strongest likeness from a single reference photo.
+              Keeps the source aspect ratio (shot aspect overrides don&rsquo;t apply).
+              {localQueuesBehindApi(engines) && (
+                <> <span className={ENGINE_ACCENTS.krea.text}>
+                  Its {engineShare('krea')} shot(s) queue on your GPU, one at a time, after the API ones.
+                </span></>
+              )}
             </span>
-            {klAvailable ? (
-              <span className="text-content-subtle text-[0.625rem]">Runs on this machine — slower, tunable face fidelity.</span>
-            ) : (
-              <a href="#/setup" onClick={(e) => e.stopPropagation()}
-                className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
-                {kleinHint}
-              </a>
-            )}
-          </span>
-        </button>
-        <button type="button" onClick={() => setGenerator('qwen_edit')} aria-pressed={isQwenEdit}
-          disabled={!qeAvailable || !!generating}
-          title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
-          className={`flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isQwenEdit
-            ? 'border-fuchsia-400/60 bg-fuchsia-500/15 ring-1 ring-fuchsia-400/40'
-            : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
-          <span className="w-9 h-9 shrink-0 grid place-items-center text-2xl" aria-hidden="true">🎨</span>
-          <span className="flex flex-col gap-1 min-w-0">
-            <span className={`text-[0.8125rem] font-semibold ${isQwenEdit ? 'text-white' : 'text-content-muted'}`}>
-              Qwen Edit <span className="font-normal text-content-subtle">· local</span>
+          ) : (
+            <a href="#/setup" onClick={(e) => e.stopPropagation()}
+              className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
+              {kreaHint}
+            </a>
+          )} />
+        {/* Qwen Edit — the third LOCAL engine, on Qwen-Image-Edit-2511 instead of
+            Klein's FLUX.2-Kontext lineage. Useful when a dataset's render style
+            fights Klein's own photoreal-biased fine-tune. */}
+        <EngineCard id="qwen_edit" checked={isQwenEdit} available={qeAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('qwen_edit')}
+          icon={<span className={`w-9 h-9 shrink-0 grid place-items-center text-2xl ${isQwenEdit ? '' : 'opacity-60'}`} aria-hidden="true">🎨</span>}
+          title={<>Qwen Edit <span className="font-normal text-content-subtle">· local</span></>}
+          tags={[
+            <span key="free" className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>,
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>,
+            <span key="nsfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>,
+          ]}
+          hint={qeAvailable ? (
+            <span className="text-content-subtle text-[0.625rem]">
+              Qwen-Image-Edit-2511 — a different base model than Klein, useful for non-photoreal render styles.
+              {localQueuesBehindApi(engines) && (
+                <> <span className={ENGINE_ACCENTS.qwen_edit.text}>
+                  Its {engineShare('qwen_edit')} shot(s) queue on your GPU, one at a time, after the API ones.
+                </span></>
+              )}
             </span>
-            <span className="flex flex-wrap gap-1">
-              <span className="px-1.5 py-px rounded-full bg-emerald-500/15 border border-emerald-400/40 text-emerald-300 text-[0.625rem]">Free</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your GPU</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">NSFW OK</span>
+          ) : (
+            <a href="#/setup" onClick={(e) => e.stopPropagation()}
+              className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
+              {qwenEditHint}
+            </a>
+          )} />
+        <EngineCard id="nanobanana" checked={isNB} available={nbAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('nanobanana')}
+          icon={<span className="w-9 h-9 shrink-0 grid place-items-center text-2xl" aria-hidden="true">🍌</span>}
+          title={<>Nano Banana Pro <span className="font-normal text-content-subtle">· API</span></>}
+          tags={[
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">No GPU</span>,
+            <span key="price" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">~$0.15/image</span>,
+            <span key="sfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">SFW</span>,
+          ]}
+          hint={nbAvailable ? (
+            <span className={`text-[0.625rem] ${isNB ? ENGINE_ACCENTS.nanobanana.text : 'text-content-subtle'}`}>
+              Best face fidelity · {engineShare('nanobanana')} image(s) ≈ ${(engineShare('nanobanana') * 0.15).toFixed(2)}
             </span>
-            {qeAvailable ? (
-              <span className="text-content-subtle text-[0.625rem]">
-                Qwen-Image-Edit-2511 — a different base model than Klein, useful for non-photoreal render styles.
-              </span>
-            ) : (
-              <a href="#/setup" onClick={(e) => e.stopPropagation()}
-                className="text-amber-300 text-[0.625rem] underline decoration-amber-300/50">
-                {qwenEditHint}
-              </a>
-            )}
-          </span>
-        </button>
-        <button type="button" onClick={() => setGenerator('nanobanana')} aria-pressed={isNB}
-          disabled={!nbAvailable || !!generating}
-          title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
-          className={`flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isNB
-            ? 'border-amber-400/60 bg-amber-500/15 ring-1 ring-amber-400/40'
-            : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
-          <span className="w-9 h-9 shrink-0 grid place-items-center text-2xl" aria-hidden="true">🍌</span>
-          <span className="flex flex-col gap-1 min-w-0">
-            <span className={`text-[0.8125rem] font-semibold ${isNB ? 'text-amber-200' : 'text-content-muted'}`}>
-              Nano Banana Pro <span className="font-normal text-content-subtle">· API</span>
+          ) : (
+            <span className="text-amber-300 text-[0.625rem]">⚠ Add GEMINI_API_KEY in Settings</span>
+          )} />
+        <EngineCard id="chatgpt" checked={isGPT} available={gptAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('chatgpt')}
+          icon={<ChatGptIcon className={`w-9 h-9 shrink-0 ${isGPT ? ENGINE_ACCENTS.chatgpt.icon : 'text-content-subtle'}`} />}
+          title={<>ChatGPT <span className="font-normal text-content-subtle">{gptViaSub ? '· subscription' : '· API'}</span></>}
+          tags={[
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">No GPU</span>,
+            <span key="price" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">{gptViaSub ? 'Plan quota' : '~$0.17/image'}</span>,
+            <span key="sfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">SFW</span>,
+          ]}
+          hint={gptAvailable ? (
+            <span className={`text-[0.625rem] ${isGPT ? ENGINE_ACCENTS.chatgpt.text : 'text-content-subtle'}`}>
+              {/* The subscription lane renders on the plan's own image model and
+                  ignores the Settings field, so only the API lane names it. */}
+              {gptViaSub
+                ? `gpt-image-2 · uses your ChatGPT ${gptPlanLabel} quota`
+                : <><span className="break-all">{chatgptImageModel || 'gpt-image-2'}</span>
+                    {` · ${engineShare('chatgpt')} image(s) ≈ $${(engineShare('chatgpt') * 0.17).toFixed(2)}`}</>}
             </span>
-            <span className="flex flex-wrap gap-1">
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">No GPU</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">~$0.15/image</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">SFW</span>
+          ) : (
+            <span className="text-amber-300 text-[0.625rem]">⚠ Add an API key or connect a subscription in Settings</span>
+          )} />
+        <EngineCard id="openrouter" checked={isOR} available={orAvailable} generating={generating}
+          onToggle={toggleEngine} share={engineShare('openrouter')}
+          icon={<RouterIcon className={`w-9 h-9 shrink-0 ${isOR ? ENGINE_ACCENTS.openrouter.icon : 'text-content-subtle'}`} />}
+          title={<>OpenRouter <span className="font-normal text-content-subtle">· API</span></>}
+          tags={[
+            <span key="gpu" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">No GPU</span>,
+            <span key="price" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">Your credits</span>,
+            <span key="sfw" className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">SFW</span>,
+          ]}
+          hint={orAvailable ? (
+            <span className={`text-[0.625rem] ${isOR ? ENGINE_ACCENTS.openrouter.text : 'text-content-subtle'}`}>
+              {/* The model is free text in Settings, so the price here is an
+                  estimate for the DEFAULT one — say so rather than quote a
+                  number the user may have changed under it. */}
+              <span className="break-all">{openrouterModel || 'default model'}</span>
+              {' · '}{engineShare('openrouter')} image(s), billed by OpenRouter at that model&rsquo;s rate
             </span>
-            {nbAvailable ? (
-              <span className={`text-[0.625rem] ${isNB ? 'text-amber-300' : 'text-content-subtle'}`}>
-                Best face fidelity · estimated cost ≈ ${(selected.size * multiplier * 0.15).toFixed(2)}
-              </span>
-            ) : (
-              <span className="text-amber-300 text-[0.625rem]">⚠ Add GEMINI_API_KEY in Settings</span>
-            )}
-          </span>
-        </button>
-        <button type="button" onClick={() => setGenerator('chatgpt')} aria-pressed={isGPT}
-          disabled={!gptAvailable || !!generating}
-          title={generating ? 'A generation batch is running — wait for it to finish before switching engine' : undefined}
-          className={`flex items-start gap-3 rounded-xl border p-3 text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${isGPT
-            ? 'border-emerald-400/60 bg-emerald-500/15 ring-1 ring-emerald-400/40'
-            : 'border-border bg-app/40 hover:enabled:bg-surface-raised'}`}>
-          <ChatGptIcon className={`w-9 h-9 shrink-0 ${isGPT ? 'text-emerald-300' : 'text-content-subtle'}`} />
-          <span className="flex flex-col gap-1 min-w-0">
-            <span className={`text-[0.8125rem] font-semibold ${isGPT ? 'text-emerald-200' : 'text-content-muted'}`}>
-              ChatGPT <span className="font-normal text-content-subtle">{gptViaSub ? '· subscription' : '· API'}</span>
-            </span>
-            <span className="flex flex-wrap gap-1">
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">No GPU</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">{gptViaSub ? 'Plan quota' : '~$0.17/image'}</span>
-              <span className="px-1.5 py-px rounded-full bg-app/60 border border-border text-content-muted text-[0.625rem]">SFW</span>
-            </span>
-            {gptAvailable ? (
-              <span className={`text-[0.625rem] ${isGPT ? 'text-emerald-300' : 'text-content-subtle'}`}>
-                {gptViaSub
-                  ? `gpt-image-2 · uses your ChatGPT ${gptPlanLabel} quota`
-                  : `gpt-image-2 · estimated cost ≈ $${(selected.size * multiplier * 0.17).toFixed(2)}`}
-              </span>
-            ) : (
-              <span className="text-amber-300 text-[0.625rem]">⚠ Add an API key or connect a subscription in Settings</span>
-            )}
-          </span>
-        </button>
+          ) : (
+            <span className="text-amber-300 text-[0.625rem]">⚠ Add OPENROUTER_API_KEY in Settings</span>
+          )} />
       </div>
+
+      {/* Krea + a square/landscape reference = squeezed body & back shots
+          (MEASURED — see utils/kreaEngine.js). Advisory, never a blocker: those
+          shots DO generate, they just land closer in. Shown only when Krea is
+          ticked, the reference is measurable and non-portrait, AND wide shots are
+          actually selected — a face-only run hears nothing. Wraps at 400 px: the
+          count, the sentence, then the action on its own line. */}
+      {kreaAdvisory && (
+        <div role="status"
+          className="rounded-lg border border-amber-400/40 bg-amber-400/10 px-3 py-2 flex flex-col gap-1.5">
+          <span className="text-amber-200 text-xs font-semibold">
+            ⚠ {kreaAdvisory.headline}
+          </span>
+          <span className="text-amber-200/85 text-[0.6875rem] leading-snug">
+            {kreaAdvisory.detail}
+          </span>
+          <div className="flex items-center gap-2 flex-wrap">
+            {onCropRefTo && (
+              <button type="button" onClick={() => onCropRefTo(kreaAdvisory.suggestAspect)}
+                title={`Open the reference crop editor pre-set to ${kreaAdvisory.suggestLabel} — you can still reshape the box`}
+                className="px-2.5 py-1 rounded-lg bg-surface-raised border border-border text-content text-[0.6875rem] font-semibold">
+                ✂ Crop reference to {kreaAdvisory.suggestLabel}
+              </button>
+            )}
+            <HelpBadge topic="krea-reference-shape" />
+          </div>
+        </div>
+      )}
+
+      {/* How several engines share the run. Only shown when it can change
+          anything (2+ engines): with a single one both modes are identical, and
+          an inert radio pair would just be noise. */}
+      {multiEngine && (
+        <fieldset className="rounded-lg border border-border bg-app/30 px-2.5 py-2 flex flex-col gap-1.5">
+          <legend className="px-1 text-content-muted text-[0.6875rem] uppercase">
+            {engines.length} engines selected
+          </legend>
+          {MODE_CHOICES.map(({ id, name, desc }) => {
+            const count = totalImages(selected.size, engines, id, multiplier);
+            const price = estimateCost(selected.size, engines, id, { multiplier, gptViaSub });
+            return (
+              <label key={id} className={`flex items-start gap-2 rounded-md px-2 py-1 cursor-pointer ${engineMode === id ? 'bg-surface-raised' : ''}`}>
+                <input type="radio" name="engine-mode" value={id} checked={engineMode === id}
+                  onChange={() => setEngineMode(id)} disabled={!!generating}
+                  className="mt-0.5 accent-indigo-500" />
+                <span className="flex flex-col min-w-0">
+                  <span className="text-content text-[0.75rem] font-semibold">
+                    {name}
+                    <span className="ml-2 font-normal text-content-muted">
+                      {count} image{count === 1 ? '' : 's'}
+                      {price > 0 ? ` · ≈ $${price.toFixed(2)}` : ' · free'}
+                    </span>
+                  </span>
+                  <span className="text-content-subtle text-[0.625rem]">{desc}</span>
+                </span>
+              </label>
+            );
+          })}
+        </fieldset>
+      )}
+
+      {/* Klein-only tuning, grouped: model file + consistency-LoRA strength.
+          A <details> so the defaults stay out of a newcomer's way — children
+          remain mounted, so the model picker still reports its choice. */}
+      {isKlein && klAvailable && (
+        <details className="rounded-lg border border-border bg-app/30 open:pb-2"
+          onToggle={(e) => { if (e.currentTarget.open) requestHelpTip('klein-tuning-open'); }}>
+          <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
+            🖥️ Klein tuning
+            <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
+              model file · consistency LoRA {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
+              {activeLoraPreset && activeLoraPreset.loras.length > 0
+                ? ` · LoRA preset: ${activeLoraPreset.name}` : ''}
+            </span>
+          </summary>
+          <div className="px-2.5 pt-1 flex flex-col gap-2">
+            <div className="max-w-sm"><Flux2KleinModelPicker onChange={setKlein} /></div>
+            <div className="flex flex-col gap-0.5">
+              <label className="flex items-center gap-2 text-content-muted text-[0.6875rem]">
+                <span className="whitespace-nowrap">
+                  Consistency LoRA: {loraStrength <= 0 ? 'off' : loraStrength.toFixed(2)}
+                </span>
+                <input type="range" min={0} max={1.2} step={0.05} value={loraStrength}
+                  onChange={(e) => setLoraStrength(Number(e.target.value))}
+                  aria-label="Consistency LoRA strength"
+                  className="flex-1 min-w-[120px] accent-indigo-500" />
+              </label>
+              <p className="text-content-subtle text-[0.625rem]">
+                Anchors the COMPOSITION, not the face — high values suppress pose/framing changes.
+                ~0.5 balanced · 0.2–0.4 for big restagings · 0 = off. Face identity comes from the
+                reference photo(s); add extra references for a stronger identity lock.
+              </p>
+            </div>
+            {/* Optional generation-LoRA preset (Idea by @waltm) — pick one of
+                the named combinations from Settings; its chain (read-only
+                here) applies to every variation of the run. "None" on each
+                visit by default. */}
+            <div className="flex flex-col gap-1">
+              <label className="flex items-center gap-2 text-content-muted text-[0.6875rem]">
+                <span className="whitespace-nowrap">LoRA preset</span>
+                <select value={loraPresetName} aria-label="Generation LoRA preset"
+                  onChange={(e) => setLoraPresetName(e.target.value)}
+                  className="bg-app/60 border border-border rounded px-1 py-0.5 text-content text-[0.6875rem]">
+                  <option value="">None</option>
+                  {loraPresets.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name} ({p.loras.length})</option>
+                  ))}
+                </select>
+                <span className="text-content-subtle text-[0.625rem]">
+                  your own LoRA combos — applies to every shot of this run
+                </span>
+              </label>
+              {loraPresets.length === 0 && (
+                <p className="text-content-subtle text-[0.625rem]">
+                  No presets yet — build combinations of your own LoRA files (texture, anatomy, style…) in{' '}
+                  <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
+                    Settings › Image engines
+                  </a>.
+                </p>
+              )}
+              {activeLoraPreset && (
+                activeLoraPreset.loras.length === 0 ? (
+                  <p className="text-content-subtle text-[0.625rem]">
+                    This preset is empty — add LoRA files to it in Settings.
+                  </p>
+                ) : (
+                  <ol className="flex flex-col gap-0.5 text-[0.625rem] text-content-subtle">
+                    {activeLoraPreset.loras.map((row, i) => (
+                      <li key={`${row.file}-${i}`} className="flex items-center gap-1.5" title={row.file}>
+                        <span className="text-content-muted">{i + 1}.</span>
+                        <span className="font-mono truncate max-w-[18rem]">{row.file.split(/[\\/]/).pop()}</span>
+                        <span>@ {row.strength.toFixed(2)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )
+              )}
+            </div>
+          </div>
+        </details>
+      )}
+
+      {/* Krea tuning — deliberately a READ-OUT, not a second set of sliders.
+          Krea has exactly one dial and it is a SETTING: `grounding_px` changes
+          the meaning of every shot in the batch identically, so a per-run copy
+          would be a second truth to keep in sync (and a value silently different
+          from the one the Settings page shows). What belongs here is knowing
+          what the run is about to do, and one click to change it. */}
+      {isKrea && krAvailable && (
+        <details className="rounded-lg border border-border bg-app/30 open:pb-2">
+          <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
+            🧬 Krea 2 Edit tuning
+            <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
+              reference grounding {groundingDescription(kreaGrounding)}
+            </span>
+          </summary>
+          <div className="px-2.5 pt-1 flex flex-col gap-1.5">
+            <p className="text-content-subtle text-[0.625rem]">
+              <b className="text-content-muted font-semibold">Reference grounding</b> is the
+              consistency ↔ prompt dial: LOW follows the shot description (more variety in pose,
+              outfit and scene, looser likeness), HIGH resembles the reference more closely — and
+              starts copying the very pose and outfit you asked it to change. 1024 px is the
+              recommended balance for people.
+            </p>
+            <p className="text-content-subtle text-[0.625rem]">
+              Identity comes from the reference photo alone — no character LoRA needed. Extra
+              reference images are not used by this engine, and the output keeps the reference&rsquo;s
+              aspect ratio (capped at 2 MP), which is what the model was trained on.
+            </p>
+            <p className="text-content-subtle text-[0.625rem]">
+              Change it in{' '}
+              <a href="#/settings/engines" className="text-amber-300 underline decoration-amber-300/50">
+                Settings › Image engines
+              </a>{' '}— it applies to every Krea run.
+            </p>
+          </div>
+        </details>
+      )}
 
       {/* Preset cards with their framing-mix bar. */}
       <div>
@@ -613,13 +1244,13 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
           <span className="ml-auto flex items-center gap-2 flex-wrap text-[0.625rem] text-content-subtle" aria-hidden="true">
             {['face', 'bust', 'body', 'back'].map((fr) => (
               <span key={fr} className="flex items-center gap-1">
-                <span className={`w-2 h-2 rounded-full ${FRAMING_COLOR[fr]}`} />{FRAMING_LABEL[fr]}
+                <span className={`w-2 h-2 rounded-full ${FRAMING_COLOR[fr]}`} />{frLabel(fr)}
               </span>
             ))}
           </span>
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-1.5">
-          {PRESET_META.map(({ key, name, hint }) => {
+          {(presetMeta && presetMeta.length ? presetMeta : PRESET_META).map(({ key, name, hint }) => {
             const st = presetStats[key];
             const active = activePreset === key;
             return (
@@ -709,11 +1340,11 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
           return (
             <div key={fr}>
               <div className="flex items-center gap-2 mb-1"
-                title={`Your dataset contains ${have} "${FRAMING_LABEL[fr]}" image(s). Target for balanced training: ${TARGET[fr]} (this quota does NOT affect the generation selection).`}>
+                title={`Your dataset contains ${have} "${frLabel(fr)}" image(s). Target for balanced training: ${TARGET[fr]} (this quota does NOT affect the generation selection).`}>
                 <ShotIllustration framing={fr} label=""
                   className={`w-5 h-5 ${missing ? 'text-amber-300' : 'text-content-subtle'}`} />
                 <span className={`text-[0.6875rem] uppercase font-semibold ${missing ? 'text-amber-300' : 'text-content-muted'}`}>
-                  {FRAMING_LABEL[fr]}
+                  {frLabel(fr)}
                 </span>
                 <span className="w-24 h-1.5 rounded-full bg-app/60 overflow-hidden" aria-hidden="true">
                   <span className={`block h-full rounded-full ${missing ? 'bg-amber-400' : 'bg-emerald-400'}`}
@@ -783,39 +1414,36 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
             <div className="flex items-center gap-2 mb-1">
               <span aria-hidden="true">✨</span>
               <span className="text-[0.6875rem] uppercase font-semibold text-content-muted">Custom</span>
-              <span className="text-content-subtle text-[0.625rem]">your own shots — remove with ✕</span>
+              <span className="text-content-subtle text-[0.625rem]">
+                your own shots, stored in this browser — Keep saves one for good, ✕ removes it
+              </span>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-1.5">
-              {customShots.map((c) => {
-                const on = selected.has(c.id);
-                const done = doneByLabel.get(c.label) || 0;
-                const blocked = c.nsfw && !isLocal;   // 🔞 card while an API engine is active
-                const cls = on
-                  ? 'bg-primary/20 border-primary/50 text-white ring-1 ring-primary/30'
-                  : done > 0
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100/90 hover:bg-emerald-500/15'
-                    : 'border-border bg-app/40 text-content-muted hover:bg-surface-raised';
-                return (
-                  <div key={c.id} className={`relative flex items-center gap-1.5 px-1.5 py-1 rounded-lg text-[0.625rem] border transition-colors ${cls} ${blocked ? 'opacity-40' : ''}`}>
-                    <button type="button" onClick={() => !blocked && toggle(c.id)} aria-pressed={on}
-                      disabled={blocked}
-                      title={blocked ? '🔞 shot — switch the generator to a local engine' : c.prompt}
-                      className="flex items-center gap-1.5 flex-1 min-w-0 text-left disabled:cursor-not-allowed">
-                      <ShotIllustration framing={c.framing} label={c.label} className="w-7 h-7 shrink-0" />
-                      <span className="min-w-0 leading-tight truncate">{c.label}</span>
-                      <span className="ml-auto shrink-0 flex items-center gap-1">
-                        {done > 0 && <span className="text-emerald-300 font-semibold">✓×{done}</span>}
-                        {on && <span className="text-indigo-300" aria-hidden="true">✓</span>}
-                      </span>
-                    </button>
-                    <button type="button" onClick={() => removeCustomShot(c.id)}
-                      aria-label={`Remove custom shot ${c.label}`} title="Remove this custom shot"
-                      className="shrink-0 w-4 h-4 grid place-items-center rounded bg-black/40 text-content-subtle hover:text-white text-[0.625rem] leading-none">
-                      ✕
-                    </button>
-                  </div>
-                );
-              })}
+              {customShots.map((c) => renderUserShot(c, () => removeCustomShot(c.id),
+                'Remove this custom shot', () => keepCustomShot(c)))}
+            </div>
+          </div>
+        )}
+
+        {/* Imported group — a JSON catalog (idea by ashish.sinha, Discord). Always
+            AFTER the built-ins and never in their place: an import can be undone
+            shot by shot, or all at once, and the shipped catalog is untouched. */}
+        {importedShots.length > 0 && (
+          <div>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-1">
+              <span aria-hidden="true">📥</span>
+              <span className="text-[0.6875rem] uppercase font-semibold text-content-muted">Imported</span>
+              <span className="text-content-subtle text-[0.625rem]">
+                {importedShots.length} shot{importedShots.length === 1 ? '' : 's'} from your JSON catalog — saved on this machine, not in the browser
+              </span>
+              <button type="button" onClick={removeAllImported}
+                className="ml-auto px-1.5 py-px rounded border border-border text-content-subtle hover:text-white text-[0.625rem]">
+                Remove all
+              </button>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-1.5">
+              {importedShots.map((c) => renderUserShot(c, () => removeImportedShot(c),
+                'Remove this imported shot'))}
             </div>
           </div>
         )}
@@ -823,7 +1451,11 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
 
       {/* 🔞 NSFW — local engines only. Uncensored body catalog + free prompt.
           Never offered on the API engines (and the backend refuses them there). */}
-      {isLocal && currentAvailable && (
+      {/* `localOnlyRun` already means every selected engine is local, and the
+          effect above prunes engines that aren't available — so no second
+          availability test here (the old `&& klAvailable` would have hidden the
+          🔞 catalog on a Krea-only run). */}
+      {localOnlyRun && nsfwCatalog.length > 0 && (
         <div className={`rounded-lg border p-2 flex flex-col gap-2 ${nsfwMode
           ? 'border-rose-500/40 bg-rose-500/5' : 'border-border bg-app/30'}`}>
           <button type="button" onClick={() => setNsfwMode((v) => !v)} aria-pressed={nsfwMode}
@@ -883,7 +1515,7 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
           ✨ Custom shot
           <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
-            write your own prompt — it becomes a reusable card in the Custom group above{nsfwMode && isLocal ? ' — 🔞 register active' : ''}
+            write your own prompt — it becomes a reusable card in the Custom group above{nsfwMode && localOnlyRun ? ' — 🔞 register active' : ''}
           </span>
         </summary>
         <div className="px-2.5 pt-1 flex flex-col gap-1">
@@ -907,6 +1539,87 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
               ＋ Add
             </button>
           </div>
+        </div>
+      </details>
+
+      {/* 📥 Shot catalog JSON — idea by ashish.sinha (Discord): export the catalog,
+          have an LLM write 40 more shots in the same shape, import the result.
+          Export FIRST on purpose: nobody (and no LLM) can produce the right JSON
+          without an example of it. Collapsed by default. */}
+      <details className="rounded-lg border border-border bg-app/30 open:pb-2">
+        <summary className="cursor-pointer select-none px-2.5 py-1.5 text-[0.75rem] text-content font-semibold">
+          📥 Shot catalog (JSON)
+          <span className="ml-2 font-normal text-content-subtle text-[0.625rem]">
+            import your own shots — export first to get the format
+          </span>
+          <HelpBadge topic="shot-catalog-json" />
+        </summary>
+        <div className="px-2.5 pt-1 flex flex-col gap-1.5">
+          <p className="text-content-muted text-[0.6875rem]">
+            Export the {SUBJECT_TYPE_LABELS[subject]?.toLowerCase() || 'current'} catalog, ask an LLM
+            for more shots in the same shape, then import the file. Imported shots are saved on this
+            machine (not in the browser), so they follow you from one device to the next.
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            <button type="button" onClick={() => importFileRef.current?.click()}
+              title={`Import a JSON shot catalog (max ${Math.round(MAX_IMPORT_BYTES / 1024)} KB — nothing is added until you confirm the summary)`}
+              className="px-2.5 py-1 rounded-lg border border-border text-content text-[0.6875rem] font-semibold hover:bg-surface-raised">
+              ⬆ Import
+            </button>
+            <button type="button" onClick={exportShotCatalog}
+              title="Download this subject's catalog as JSON — your own shots, plus a few built-in examples to show the format"
+              className="px-2.5 py-1 rounded-lg border border-border text-content text-[0.6875rem] font-semibold hover:bg-surface-raised">
+              ⬇ Export
+            </button>
+            <input ref={importFileRef} type="file" accept="application/json,.json" className="hidden"
+              onChange={(e) => { readImportFile(e.target.files?.[0]); e.target.value = ''; }} />
+          </div>
+          {/* The review step. Nothing has been written yet — this is what makes a
+              partly-bad file safe: the user sees exactly what would land and what
+              was refused, and decides. */}
+          {importReview && (
+            <div className="rounded-lg border border-border bg-app/60 p-2 flex flex-col gap-1.5">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="text-[0.6875rem] font-semibold text-content truncate max-w-full">
+                  {importReview.name}
+                </span>
+                <span className="text-[0.625rem] text-emerald-300">
+                  {importReview.result.accepted.length} ready
+                </span>
+                {importReview.result.rejected.length > 0 && (
+                  <span className="text-[0.625rem] text-amber-300">
+                    {importReview.result.rejected.length} rejected
+                  </span>
+                )}
+              </div>
+              {importReview.result.rejected.length > 0 && (
+                <ul className="max-h-32 overflow-y-auto flex flex-col gap-0.5 text-[0.625rem] text-amber-200/90">
+                  {importReview.result.rejected.map((r) => (
+                    <li key={`${r.index}-${r.code}`}>• {r.message}</li>
+                  ))}
+                </ul>
+              )}
+              {(importReview.result.skippedExamples > 0 || importReview.result.ignoredFields.length > 0) && (
+                <p className="text-[0.625rem] text-content-subtle">
+                  {importReview.result.skippedExamples > 0
+                    && `${importReview.result.skippedExamples} built-in example${importReview.result.skippedExamples === 1 ? '' : 's'} ignored. `}
+                  {importReview.result.ignoredFields.length > 0
+                    && `Ignored fields: ${importReview.result.ignoredFields.join(', ')} — an imported shot uses its framing's default aspect ratio.`}
+                </p>
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                <button type="button" onClick={confirmImport}
+                  disabled={importBusy || !importReview.result.accepted.length}
+                  className="px-2.5 py-1 rounded-lg bg-gradient-primary text-white text-[0.6875rem] font-semibold disabled:opacity-40">
+                  {importBusy ? 'Importing…' : `Import ${importReview.result.accepted.length} shot${importReview.result.accepted.length === 1 ? '' : 's'}`}
+                </button>
+                <button type="button" onClick={() => setImportReview(null)}
+                  className="px-2.5 py-1 rounded-lg border border-border text-content-muted text-[0.6875rem] hover:bg-surface-raised">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </details>
 
@@ -1087,18 +1800,34 @@ export default function VariationCatalog({ onGenerate, busy, generating = null, 
         {!hasRef && (
           <span className="text-amber-300 text-[0.6875rem]">Set a reference photo first</span>
         )}
+        {/* The run's real price, next to the button that spends it — switching to
+            "All engines" multiplies the bill, and that must be visible where the
+            decision is made, not only inside the mode selector. */}
+        {engines.length > 0 && selected.size > 0 && (
+          <span className="text-content-muted text-[0.6875rem]">
+            {engines.map((e) => ENGINE_LABELS[e]).join(' + ')}
+            {' · '}
+            {runCost > 0 ? `≈ $${runCost.toFixed(2)}` : 'free'}
+          </span>
+        )}
+        {/* Never a silently empty batch: an unchecked engine grid, an empty shot
+            selection or a run over the server's per-batch cap all SAY why the
+            button is dead instead of just greying it out. */}
+        {blockedReason && hasRef && (
+          <span className="text-amber-300 text-[0.6875rem]">{blockedReason}</span>
+        )}
         {/* Disabled for the WHOLE batch, not just the launch request: `busy` is the
             hook's busyLive (local flag OR any server-side activity, restored on
             reload), so a generation already in flight — Nano Banana / ChatGPT /
             Klein alike — keeps this locked with a visible reason. */}
-        <button type="button" onClick={go} disabled={busy || !selected.size || !hasRef || !currentAvailable}
-          title={generating ? 'A generation batch is already running' : undefined}
+        <button type="button" onClick={go} disabled={busy || !hasRef || !!blockedReason}
+          title={generating ? 'A generation batch is already running' : (blockedReason || undefined)}
           className="ml-auto px-4 py-1.5 rounded-lg bg-gradient-primary text-white text-sm font-semibold disabled:opacity-40">
           {busy
             ? (generating
                 ? `Generating…${generating.total ? ` ${generating.done}/${generating.total}` : ''}`
                 : '…')
-            : `⚡ Generate (${selected.size * multiplier})`}
+            : `⚡ Generate (${totalImages(selected.size, engines, engineMode, multiplier)})`}
         </button>
       </div>
     </div>

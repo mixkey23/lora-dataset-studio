@@ -12,6 +12,8 @@ import { serializeWatermarkRegions } from '../utils/watermarkRegions';
 import { summarizeScrapeImport } from '../utils/smallImageRescue';
 import { trainingRunSelection } from '../utils/checkpointBrowser';
 import { refreshDatasetIfActive } from '../utils/datasetRefresh';
+import { ENGINE_LABELS } from '../components/dataset/engineSelection.js';
+import { classifyResultMessage } from '../components/dataset/classifyFramingGate.js';
 
 function post(url, body, isForm) {
   // Routes through the shared fetchWithCsrfRetry: a token that aged out mid-session
@@ -282,8 +284,11 @@ export function useDataset() {
     return d;
   }, [currentId, fetchList, refresh]);
 
-  // Edit name / trigger / (concept) description / KIND after creation. Trigger change
-  // is safe (prepended at export); a concept-desc change resets the avoid-list → the
+  // Edit name / trigger / (concept) description / KIND after creation. A trigger change
+  // needs no re-caption (prepended at export) but DOES rename what the dataset already
+  // produced on disk, since the trigger is the naming key — the reply's trigger_rename
+  // says how many files moved, or that a name clash blocked it. The dataset NAME is
+  // display-only and never touches disk. A concept-desc change resets the avoid-list → the
   // toast nudges a re-caption (same contract as fidelity). A kind change flips the
   // caption strategy and the visible panels (server refuses with 409 while work is
   // in progress → the !ok branch surfaces the message) and nudges a re-caption.
@@ -291,15 +296,27 @@ export function useDataset() {
   // along: applied at generation time only, '' / {} clears, absent leaves untouched.
   const updateSettings = useCallback(async ({
     name, trigger_word, concept_desc, kind, prompt_suffix, prompt_suffixes, render_style,
+    subject_type,
   }, opts = {}) => {
     if (!currentId) return { ok: false };
     const d = await postJson(`/api/dataset/${currentId}/settings`,
-      { name, trigger_word, concept_desc, kind, prompt_suffix, prompt_suffixes, render_style });
+      { name, trigger_word, concept_desc, kind, prompt_suffix, prompt_suffixes, render_style,
+        subject_type });
     if (!d.ok) { toast.error(d.error || 'Could not save settings'); return d; }
     // quiet: the generation panel persists suffix edits silently right before a
     // batch (the "Generating…" state is the feedback); the modal stays verbose.
     if (!opts.quiet) {
-      if (d.kind_changed) {
+      const renamed = d.trigger_rename;
+      if (renamed && !renamed.ok) {
+        // The new trigger already owns files on disk, so nothing was moved rather
+        // than half of it — say so, because the old artefacts keep the old name.
+        toast.warning('Trigger word saved, but the artefacts it already produced could '
+          + 'not be renamed: another dataset already uses that name on disk. They keep '
+          + 'the old name.');
+      } else if (renamed && renamed.files > 0) {
+        toast.success(`Settings saved — ${renamed.files} file${renamed.files > 1 ? 's' : ''} `
+          + 'renamed to follow the new trigger word (LoRAs, run folder, export)');
+      } else if (d.kind_changed) {
         toast.success(`Kind changed to ${d.kind} — re-caption to apply the new caption style to existing captions`);
       } else {
         toast.success(d.concept_desc_changed
@@ -361,15 +378,24 @@ export function useDataset() {
     await refresh();
   }, [currentId, refresh, toast]);
 
+  // `batches`: [{generator, variations}] — one entry per selected engine, the
+  // shots already shared between them by engineSelection.js (API engines first,
+  // the GPU-bound Klein one last). The server re-validates every entry and
+  // refuses the whole run rather than dispatching it half-way.
   // `extraLoras`: optional generation-LoRA preset for this run (Idea by
   // @waltm) — an already-gated `{ generation_lora_preset? }` fragment from
   // generationLoraPresetPayload(); an absent key means "no preset".
-  const generate = useCallback((variations, multiplier, kleinModel, loraStrength, generator, extraLoras) => wrap(async () => {
+  const generate = useCallback((batches, multiplier, kleinModel, loraStrength, extraLoras) => wrap(async () => {
     const d = await postJson(`/api/dataset/${currentId}/generate`,
-      { variations, multiplier, klein_model: kleinModel, lora_strength: loraStrength,
-        generator: generator || 'klein', ...(extraLoras || {}) });
+      { engine_batches: batches, multiplier, klein_model: kleinModel,
+        lora_strength: loraStrength, ...(extraLoras || {}) });
     if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
-    toast.success(`${d.created} variation(s) queued`);
+    // Name the engines on a multi-engine run: "36 queued" alone doesn't say
+    // which engine got what, and that is the whole point of running several.
+    const per = d.per_engine || {};
+    const detail = Object.keys(per).length > 1
+      ? ` · ${Object.entries(per).map(([e, n]) => `${ENGINE_LABELS[e] || e} ${n}`).join(' · ')}` : '';
+    toast.success(`${d.created} variation(s) queued${detail}`);
     await refresh();
   }), [wrap, currentId, refresh, toast]);
 
@@ -482,11 +508,58 @@ export function useDataset() {
     return d;
   }, [refresh, toast]);
 
-  const classify = useCallback(() => wrap(async () => {
-    const d = await postJson(`/api/dataset/${currentId}/classify`);
-    if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
-    toast.success(`${d.classified} classified`);
+  // Re-run the ✨ Upscale & improve pass on a tile that IS an improvement. The
+  // generic regenerate is closed to those rows (it would restart from the dataset
+  // reference and make an unrelated variation); this replaces the result in place,
+  // from the same parent image, with the improve settings as they are NOW — which
+  // is the point: those knobs are editable in Settings.
+  const reimproveImage = useCallback(async (imageId) => {
+    const d = await postJson(`/api/dataset/image/${imageId}/reimprove`, {});
+    if (!d.ok) {
+      toast.error(d.error || 'Could not re-run the improvement');
+      return d;
+    }
+    toast.success('Re-improving from the source image with your current improve settings');
     await refresh();
+    return d;
+  }, [refresh, toast]);
+
+  // Bulk ✨ Klein upscale & improve: ONE call that starts a SERVER job. The batch
+  // used to be a browser loop, so a selection bigger than the backend's fan-out cap
+  // was mostly refused, ⏹ Stop could not reach it, and closing the tab killed it.
+  // Progress now rides on `activity` (kind 'improve') and survives a reload.
+  const improveBatch = useCallback(async (imageIds) => {
+    const ids = (imageIds || []).map((v) => Number(v)).filter(Number.isInteger);
+    if (!ids.length) return { ok: false, error: 'nothing selected' };
+    const d = await postJson(`/api/dataset/${currentId}/improve/batch`, { image_ids: ids });
+    if (!d.ok) toast.error(d.error || 'Could not start the improvement batch');
+    await refresh();
+    return d;
+  }, [currentId, refresh, toast]);
+
+  // `expected` = how many images the caller counted as classifiable. It turns the
+  // silent outcome into a diagnosis: the server answers ok/classified=0 when the
+  // vision backend never replied (Ollama down), and 0 on its own reads as success.
+  // Errors carry their `detail` too — "GPU busy" alone doesn't say training is running.
+  const classify = useCallback((expected = 0) => wrap(async () => {
+    const want = Number.isFinite(Number(expected)) ? Number(expected) : 0;
+    // The route answers only when the whole pass is done, so nothing would refetch
+    // the payload while it runs and its server-side `activity` (done/total) would
+    // surface only on a manual reload. One seeded refresh flips `hasActivity`, and
+    // the generic 3.5 s activity poll then drives the live progress from there.
+    const seed = setTimeout(() => { refresh(currentId); }, 1200);
+    try {
+      const d = await postJson(`/api/dataset/${currentId}/classify`);
+      if (!d.ok) {
+        toast.error([d.error, d.detail].filter(Boolean).join(' — ') || 'Unexpected error');
+        return;
+      }
+      const msg = classifyResultMessage(d.classified, want);
+      (toast[msg.tone] || toast.success)(msg.text);
+      await refresh();
+    } finally {
+      clearTimeout(seed);
+    }
   }), [wrap, currentId, refresh, toast]);
 
   const caption = useCallback((mode) => wrap(async () => {
@@ -581,6 +654,11 @@ export function useDataset() {
         const { kind, detail } = d.scoring_error;
         toast.error(kind === 'unavailable'
           ? 'Face scoring is not installed — run the Quality tools step in Setup.'
+          // The scorer can't read this KIND of image (a drawn face): the server's
+          // sentence already explains it and names the way out — pass it through
+          // verbatim rather than paraphrasing it into "failed".
+          : kind === 'subject_not_photographic'
+            ? detail
           : kind === 'ref_unusable'
             ? `The reference photo is not usable for scoring: ${detail}`
             : `Face scoring failed: ${detail}`);
@@ -746,6 +824,36 @@ export function useDataset() {
     }
   }, [refresh, toast]);
 
+  // 🔄 Quarter turns (idea by 1Tomber, GitHub #17). Same busy set as the mirror
+  // on purpose: both rewrite the SAME file, so one running edit must grey out
+  // the other rather than letting two of them race on one image.
+  const rotateImage = useCallback(async (imageId, degrees) => {
+    if (mirroringRef.current.has(imageId)) return false;
+    mirroringRef.current.add(imageId);
+    setMirroringIds((previous) => new Set(previous).add(imageId));
+    try {
+      const d = await postJson(`/api/dataset/image/${imageId}/rotate`, { degrees });
+      if (!d.ok) {
+        toast.error(d.error || 'Could not rotate the image');
+        return false;
+      }
+      await refresh();
+      // The filename does not change, so force only this tile/lightbox/crop
+      // editor to request the rewritten pixels instead of its cached response.
+      setNonces((m) => ({ ...m, [imageId]: (m[imageId] || 0) + 1 }));
+      toast.success(degrees === 180 ? 'Image turned upside down'
+        : `Image rotated 90° ${degrees === 90 ? 'right' : 'left'}`);
+      return true;
+    } finally {
+      mirroringRef.current.delete(imageId);
+      setMirroringIds((previous) => {
+        const next = new Set(previous);
+        next.delete(imageId);
+        return next;
+      });
+    }
+  }, [refresh, toast]);
+
   const crop = useCallback(async (imageId, box) => {
     const d = await postJson(`/api/dataset/image/${imageId}/crop`, box);
     if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
@@ -761,6 +869,14 @@ export function useDataset() {
     setRefNonce((n) => n + 1);
   }, [currentId, refresh, toast]);
 
+  // Crop ONE extra reference (identified by filename — extras have no numeric id).
+  const cropExtraRef = useCallback(async (filename, box) => {
+    const d = await postJson(`/api/dataset/${currentId}/ref/extra/crop`, { filename, ...box });
+    if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
+    await refresh();
+    setRefNonce((n) => n + 1);
+  }, [currentId, refresh, toast]);
+
   // Reset to the automatic head-crop (re-run on the kept original, no re-upload).
   const recropRefAuto = useCallback(async () => {
     const d = await postJson(`/api/dataset/${currentId}/ref/recrop-auto`, {});
@@ -768,6 +884,42 @@ export function useDataset() {
     if (d.warning) toast.warning(d.warning); else toast.success('Reset to auto crop');
     await refresh();
     setRefNonce((n) => n + 1);
+  }, [currentId, refresh, toast]);
+
+  // ✦ Edit the reference. STARTS a server-side background job and returns at once
+  // (202) — the edit is slow AND paid, so it must NOT ride the client's fetch (a
+  // backgrounded mobile tab would kill it and lose the paid result). The candidate
+  // is rediscovered through the payload's `reference_edit`; refresh() here starts
+  // the activity poll that tracks it. Returns false (with a toast) on a start
+  // error; true once the job is queued.
+  const editReference = useCallback(async (prompt, engine, files = []) => {
+    const fd = new FormData();
+    fd.append('prompt', prompt);
+    fd.append('engine', engine);
+    files.forEach((f) => fd.append('ref', f));
+    const d = await postJson(`/api/dataset/${currentId}/ref/edit`, fd, true);
+    if (!d.ok) { toast.error(d.error || 'Unexpected error'); return false; }
+    await refresh();
+    return true;
+  }, [currentId, refresh, toast]);
+
+  // Keep the ready candidate: the server atomically swaps the reference (old files
+  // removed only after the new ones are on disk) and deletes the candidate.
+  const keepEditedReference = useCallback(async () => {
+    const d = await postJson(`/api/dataset/${currentId}/ref/edit/keep`, {});
+    if (!d.ok) { toast.error(d.error || 'Unexpected error'); return false; }
+    toast.success('Reference updated');
+    await refresh();
+    setRefNonce((n) => n + 1);
+    return true;
+  }, [currentId, refresh, toast]);
+
+  // Discard a pending edit (running=abandon or ready) — deletes the candidate.
+  const discardEditedReference = useCallback(async () => {
+    const d = await postJson(`/api/dataset/${currentId}/ref/edit/discard`, {});
+    if (!d.ok) { toast.error(d.error || 'Unexpected error'); return false; }
+    await refresh();
+    return true;
   }, [currentId, refresh, toast]);
 
   const deleteImage = useCallback(async (imageId) => {
@@ -920,7 +1072,10 @@ export function useDataset() {
 
   const stopTraining = useCallback(async () => {
     const d = await postJson('/api/dataset/train/stop');
-    if (d.ok) toast.success('ComfyUI re-enabled'); else toast.error(d.error || 'Unexpected error');
+    // Say what happened (the run stopped) and what survived, not just the side
+    // effect — mirrors the Runs hub toast for the same endpoint.
+    if (d.ok) toast.success('Training stopped — checkpoints already saved are kept; ComfyUI is re-enabled.');
+    else toast.error(d.error || 'Unexpected error');
   }, [toast]);
 
   // baseModel/variant ciblent le run de la base SÉLECTIONNÉE (undefined → base
@@ -945,6 +1100,36 @@ export function useDataset() {
     if (d.ok) toast.success(`Resumed from step ${d.resumed_from} → ${d.target_steps} — ComfyUI paused`);
     // CUSTOM_WEIGHTS_UNVERIFIED is an interactive refusal: TrainingPanel owns
     // the explicit confirm + retry, so do not emit a premature error toast.
+    else if (!String(d.error || '').includes('CUSTOM_WEIGHTS_UNVERIFIED: ')
+             && !String(d.error || '').includes('CAPTION_QUALITY: ')
+             && !String(d.error || '').includes('MISMATCH_CAPTION: ')
+             && !String(d.error || '').includes('UNCAPTIONED: ')) {
+      toast.error(d.error || 'Unexpected error');
+    }
+    return d;
+  }, [currentId, toast]);
+
+  // ☁ The CLOUD lane of the same ▶ Continue gesture: the chosen LOCAL checkpoint is
+  // seeded onto a FRESH pod (the backend's resume_ckpt_path seam) instead of resuming
+  // on this machine. Same payload as continueTraining — one dialog, two lanes — and
+  // the same interactive-refusal contract, so TrainingPanel's confirm+retry helper
+  // drives either lane without a second code path.
+  const continueTrainingInCloud = useCallback(async (extraSteps = 1000, baseModel, variant, trainType, opts = {}) => {
+    const body = {
+      extra_steps: extraSteps,
+      ...trainingRunSelection(baseModel, trainType, variant),
+      masked: opts.masked !== false,
+      allow_caption_mismatch: !!opts.allowCaptionMismatch,
+      allow_uncaptioned: !!opts.allowUncaptioned,
+      allow_unverified_weights: !!opts.allowUnverifiedWeights,
+      allow_caption_quality: !!opts.allowCaptionQuality,
+      allow_not_ready: !!opts.allowNotReady,
+      ...(opts.fromStep != null ? { from_step: opts.fromStep } : {}),
+      ...(opts.overrides ? { overrides: opts.overrides } : {}),
+      ...(opts.gpuName ? { gpu_name: opts.gpuName } : {}),
+    };
+    const d = await postJson(`/api/dataset/${currentId}/train/cloud/continue-local`, body);
+    if (d.ok) toast.success(`Cloud run started from step ${d.resumed_from} → ${d.target_steps}`);
     else if (!String(d.error || '').includes('CUSTOM_WEIGHTS_UNVERIFIED: ')
              && !String(d.error || '').includes('CAPTION_QUALITY: ')
              && !String(d.error || '').includes('MISMATCH_CAPTION: ')
@@ -1067,7 +1252,7 @@ export function useDataset() {
     const d = await postJson('/api/backup/full/restore', fd, true);
     if (!d.ok) { toast.error(d.error || 'Unexpected error'); return; }
     if (d.kind === 'single') {
-      toast.success(`Dataset « ${d.name} » restored`);
+      toast.success(`Dataset “${d.name}” restored`);
       await fetchList();
       await open(d.id);
       return;
@@ -1129,12 +1314,12 @@ export function useDataset() {
            analyzing: analyzingLive, watermarking: watermarkingLive, activity,
            nonces, mirroringIds, refNonce, recaptioningIds, create, open,
            deleteDataset, updateSettings, setCurrentId, setRef, addExtraRef, removeExtraRef,
-           generate, importFiles, scrapeImport, resolveSmallImageRescue, improveImage, multiangleImage, classify, caption, recaption, recaptionImages,
-           setStatus, setCaption, mirrorImage, crop, cropRef, recropRefAuto, setDatasetTrainType, setDatasetFidelity, deleteImage, batchImages, replaceCaptions, writeCaptionFiles, openDatasetFolder, cancelPending, cancelCaption, regenerate, analyzeFaces,
+           generate, importFiles, scrapeImport, resolveSmallImageRescue, improveImage, multiangleImage, reimproveImage, improveBatch, classify, caption, recaption, recaptionImages,
+           setStatus, setCaption, mirrorImage, rotateImage, crop, cropRef, cropExtraRef, recropRefAuto, editReference, keepEditedReference, discardEditedReference, setDatasetTrainType, setDatasetFidelity, deleteImage, batchImages, replaceCaptions, writeCaptionFiles, openDatasetFolder, cancelPending, cancelCaption, regenerate, analyzeFaces,
            findWatermarks, cleanWatermarks, cleanWatermarkImages, restoreWatermarkImage, dismissWatermarks, saveWatermarkRegions,
            purgeUnused, exportZip, exportBackup, exportZipFor, exportBackupFor, importBackup, importDatasetZip, importDatasetFolder,
            backupEverything, backupJob, downloadBackup, openBackupsFolder, dismissBackup, restoreJob, dismissRestore,
-           refresh, train, stopTraining, continueTraining,
+           refresh, train, stopTraining, continueTraining, continueTrainingInCloud,
            listCheckpoints, importCheckpoint, deleteCheckpoint,
            trainBaseInfo, setTrainSettings, prepareBase };
 }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import ShotIllustration from './ShotIllustration';
 import TileSizeControl from '../shared/TileSizeControl';
 import FullBackupControls from './FullBackupControls';
@@ -104,6 +104,7 @@ const FAMILY_BADGE = {
   flux2klein: ['FLUX.2 Klein', 'border-rose-400/40 bg-rose-500/10 text-rose-300'],
   // indigo: also free (not used by the kind badges above the thumbnail either).
   qwen_image: ['Qwen-Image', 'border-indigo-400/40 bg-indigo-500/10 text-indigo-300'],
+  anima: ['Anima', 'border-teal-400/40 bg-teal-500/10 text-teal-300'],
 };
 
 // Display preferences — persisted globally (display settings, not dataset
@@ -402,6 +403,7 @@ function NewDatasetForm({ onCreate, onClose }) {
           <option value="flux">FLUX.1 (prose captions)</option>
           <option value="flux2klein">FLUX.2 Klein (prose captions)</option>
           <option value="qwen_image">Qwen-Image (prose captions)</option>
+          <option value="anima">Anima (prose captions)</option>
         </select>
       </label>
       {/* Render style (Wave 3): the target aesthetic for GENERATED variations —
@@ -506,7 +508,6 @@ export default function DatasetListPanel({
     else next[family] = 1;
     return next;
   });
-  const restoreRef = useRef(null);
   const empty = datasets.length === 0;
   const formOpen = creating || empty;
   // One-time tip: once the library is sizeable, point out tile sizing / folding /
@@ -524,7 +525,9 @@ export default function DatasetListPanel({
           row 2 (below, non-empty library only) = search + filters + size. */}
       <div>
         <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-content-subtle">library</p>
-        <div className="mt-1 flex flex-wrap items-center gap-2">
+        {/* relative z-30 : sans stacking-context propre, le z-20 du panneau du
+            menu « 💾 Backup » resterait piégé sous les tuiles plus bas. */}
+        <div className="relative z-30 mt-1 flex flex-wrap items-center gap-2">
           <h1 className="text-xl font-semibold text-content flex items-center gap-2">Datasets<HelpBadge topic="page-datasets" /></h1>
           {!empty && <span className="text-sm text-content-subtle">{datasets.length}</span>}
           <div className="ml-auto flex items-center gap-2">
@@ -538,23 +541,10 @@ export default function DatasetListPanel({
               className="rounded-lg bg-gradient-primary px-3.5 py-1.5 text-sm font-semibold text-white transition-transform hover:-translate-y-px">
               {!empty && creating ? '✕ Close' : '+ New dataset'}
             </button>
-            {backup && <FullBackupControls backup={backup} />}
-            {onRestore && (
-              <>
-                <button type="button" onClick={() => restoreRef.current?.click()}
-                  title="Import a portable dataset backup — a new dataset will be created"
-                  className="rounded-lg border border-border bg-surface px-3 py-1.5 text-sm font-semibold text-content transition-colors hover:border-primary/40 hover:bg-surface-raised">
-                  📦<span className="hidden sm:inline"> Import backup</span>
-                </button>
-                <input ref={restoreRef} type="file" accept=".zip,application/zip" className="hidden"
-                  aria-label="Choose a dataset backup ZIP"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) onRestore(file);
-                    e.target.value = '';
-                  }} />
-              </>
-            )}
+            {/* Back up everything, its "include LoRAs" option and Import backup
+                all live in ONE 💾 Backup menu — only "+ New dataset" stays out,
+                it is the page's primary action. */}
+            <FullBackupControls backup={backup} onRestore={onRestore} />
           </div>
         </div>
         {!empty && (

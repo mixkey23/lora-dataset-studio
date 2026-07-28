@@ -1,4 +1,6 @@
 import { INPUT_CLASS, Card } from './primitives'
+import ResetToDefault from './ResetToDefault'
+import { defaultValueAt } from './settingDefaults.js'
 
 const CAPTIONING_OPTIONS = [
   { id: 'auto', label: 'Auto (best available)' },
@@ -7,7 +9,11 @@ const CAPTIONING_OPTIONS = [
   { id: 'none', label: 'None' },
 ]
 
-export default function CaptioningSection({ config, setField }) {
+export default function CaptioningSection({ config, setField, configDefaults }) {
+  // The bank thresholds below were tuned on a real 36 000-image bank and are
+  // re-tuned between releases: the numbers shown when a key is missing, like the
+  // ones "Reset to default" writes, come from the server (config_defaults).
+  const bankDefault = (key) => defaultValueAt(configDefaults, 'bank', key)
   return (
     <div className="space-y-6">
       <Card
@@ -24,6 +30,8 @@ export default function CaptioningSection({ config, setField }) {
           >
             {CAPTIONING_OPTIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
           </select>
+          <ResetToDefault label="Captioning backend" section="captioning" field="backend"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
       </Card>
 
@@ -33,12 +41,14 @@ export default function CaptioningSection({ config, setField }) {
       >
         <div>
           <label htmlFor="watermark-device" className="block text-sm font-medium text-content">Processing device</label>
-          <select id="watermark-device" value={config.watermark?.device || 'auto'}
+          <select id="watermark-device" value={config.watermark?.device || defaultValueAt(configDefaults, 'watermark', 'device')}
             onChange={(e) => setField('watermark', 'device', e.target.value)} className={INPUT_CLASS}>
             <option value="auto">Auto (GPU when available, otherwise CPU)</option>
             <option value="cuda">GPU (CUDA required; pauses ComfyUI while cleaning)</option>
             <option value="cpu">CPU (keeps the GPU free)</option>
           </select>
+          <ResetToDefault label="Processing device" section="watermark" field="device"
+            config={config} configDefaults={configDefaults} setField={setField} />
         </div>
         <label className="mt-3 flex items-start gap-2 text-sm text-content">
           <input id="watermark-allow-crop" type="checkbox"
@@ -75,6 +85,8 @@ export default function CaptioningSection({ config, setField }) {
               onChange={(e) => setField('face_scoring', 'green', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS}
             />
+            <ResetToDefault label="Face score — green threshold" section="face_scoring" field="green"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="face-threshold-orange" className="block text-sm font-medium text-content">
@@ -90,6 +102,8 @@ export default function CaptioningSection({ config, setField }) {
               onChange={(e) => setField('face_scoring', 'orange', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS}
             />
+            <ResetToDefault label="Face score — orange threshold" section="face_scoring" field="orange"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
         </div>
         <p className="text-xs text-content-muted">
@@ -108,100 +122,146 @@ export default function CaptioningSection({ config, setField }) {
               Sharpness minimum
             </label>
             <input id="bank-sharpness-min" type="number" min="0" step="10"
-              value={config.bank?.sharpness_min ?? 100}
+              value={config.bank?.sharpness_min ?? bankDefault('sharpness_min')}
               onChange={(e) => setField('bank', 'sharpness_min', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Laplacian variance under this = 🌫 blurry.</p>
+            <ResetToDefault label="Sharpness minimum" section="bank" field="sharpness_min"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-noise-max" className="block text-sm font-medium text-content">
               Noise maximum
             </label>
             <input id="bank-noise-max" type="number" min="0" step="1"
-              value={config.bank?.noise_max ?? 15}
+              value={config.bank?.noise_max ?? bankDefault('noise_max')}
               onChange={(e) => setField('bank', 'noise_max', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Residual grain over this = 📺 noisy.</p>
+            <ResetToDefault label="Noise maximum" section="bank" field="noise_max"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-uniformity-min" className="block text-sm font-medium text-content">
               Uniformity minimum
             </label>
             <input id="bank-uniformity-min" type="number" min="0" step="1"
-              value={config.bank?.uniformity_min ?? 12}
+              value={config.bank?.uniformity_min ?? bankDefault('uniformity_min')}
               onChange={(e) => setField('bank', 'uniformity_min', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Grayscale spread under this = ⬜ flat frame.</p>
+            <ResetToDefault label="Uniformity minimum" section="bank" field="uniformity_min"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-min-side" className="block text-sm font-medium text-content">
               Minimum side (px)
             </label>
             <input id="bank-min-side" type="number" min="0" step="64"
-              value={config.bank?.min_side ?? 768}
+              value={config.bank?.min_side ?? bankDefault('min_side')}
               onChange={(e) => setField('bank', 'min_side', parseInt(e.target.value, 10) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Smaller side under this = 📐 small (trainers only downscale).</p>
+            <ResetToDefault label="Minimum side" section="bank" field="min_side"
+              config={config} configDefaults={configDefaults} setField={setField} />
+          </div>
+          <div>
+            <label htmlFor="bank-detail-min" className="block text-sm font-medium text-content">
+              Real-detail minimum
+            </label>
+            <input id="bank-detail-min" type="number" min="0" max="1" step="0.02"
+              value={config.bank?.detail_min ?? bankDefault('detail_min')}
+              onChange={(e) => setField('bank', 'detail_min', parseFloat(e.target.value) || 0)}
+              className={INPUT_CLASS} />
+            <p className="mt-0.5 text-xs text-content-muted">
+              Share of the stored size that still carries real picture, under which an image is flagged 🫧 soft detail — the usual cause is an enlargement. 0.72 picks the softest few percent. A soft or out-of-focus photo reads the same way, so treat it as a score, not proof.
+            </p>
+            <ResetToDefault label="Real-detail minimum" section="bank" field="detail_min"
+              config={config} configDefaults={configDefaults} setField={setField} />
+          </div>
+          <div>
+            <label htmlFor="bank-bars-max" className="block text-sm font-medium text-content">
+              Black-bar maximum
+            </label>
+            <input id="bank-bars-max" type="number" min="0" max="1" step="0.01"
+              value={config.bank?.bars_max ?? bankDefault('bars_max')}
+              onChange={(e) => setField('bank', 'bars_max', parseFloat(e.target.value) || 0)}
+              className={INPUT_CLASS} />
+            <p className="mt-0.5 text-xs text-content-muted">Share of the frame that may be flat black letterbox before an image is flagged 🎞 black bars (video screenshots, padded stills).</p>
+            <ResetToDefault label="Black-bar maximum" section="bank" field="bars_max"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-dup-distance" className="block text-sm font-medium text-content">
               Duplicate distance
             </label>
             <input id="bank-dup-distance" type="number" min="0" max="16" step="1"
-              value={config.bank?.dup_distance ?? 8}
+              value={config.bank?.dup_distance ?? bankDefault('dup_distance')}
               onChange={(e) => setField('bank', 'dup_distance', parseInt(e.target.value, 10) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">dHash bits (of 64) two images may differ by and still group as ≈ duplicates. Applies at the next scan.</p>
+            <ResetToDefault label="Duplicate distance" section="bank" field="dup_distance"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-face-threshold" className="block text-sm font-medium text-content">
               Same-person similarity
             </label>
             <input id="bank-face-threshold" type="number" min="0" max="1" step="0.01"
-              value={config.bank?.face_threshold ?? 0.45}
+              value={config.bank?.face_threshold ?? bankDefault('face_threshold')}
               onChange={(e) => setField('bank', 'face_threshold', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Cosine similarity for the 👥 person clustering. Applies at the next face pass.</p>
+            <ResetToDefault label="Same-person similarity" section="bank" field="face_threshold"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-aesthetic-min" className="block text-sm font-medium text-content">
               Aesthetic minimum
             </label>
             <input id="bank-aesthetic-min" type="number" min="0" max="10" step="0.5"
-              value={config.bank?.aesthetic_min ?? 5}
+              value={config.bank?.aesthetic_min ?? bankDefault('aesthetic_min')}
               onChange={(e) => setField('bank', 'aesthetic_min', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">LAION score (~1–10) under which an image is flagged 💔 low aesthetic. Set by the ✨ Score pass.</p>
+            <ResetToDefault label="Aesthetic minimum" section="bank" field="aesthetic_min"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-nsfw-max" className="block text-sm font-medium text-content">
               NSFW maximum
             </label>
             <input id="bank-nsfw-max" type="number" min="0" max="1" step="0.05"
-              value={config.bank?.nsfw_max ?? 0.5}
+              value={config.bank?.nsfw_max ?? bankDefault('nsfw_max')}
               onChange={(e) => setField('bank', 'nsfw_max', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">NSFW probability (0–1) over which an image is flagged 🔞 NSFW. Set by the ✨ Score pass.</p>
+            <ResetToDefault label="NSFW maximum" section="bank" field="nsfw_max"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-style-threshold" className="block text-sm font-medium text-content">
               Same-style similarity
             </label>
             <input id="bank-style-threshold" type="number" min="0" max="1" step="0.01"
-              value={config.bank?.style_threshold ?? 0.6}
+              value={config.bank?.style_threshold ?? bankDefault('style_threshold')}
               onChange={(e) => setField('bank', 'style_threshold', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Cosine similarity for the 🎨 style clustering. Applies at the next scoring pass.</p>
+            <ResetToDefault label="Same-style similarity" section="bank" field="style_threshold"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
           <div>
             <label htmlFor="bank-semantic-dup-threshold" className="block text-sm font-medium text-content">
               Semantic duplicate similarity
             </label>
             <input id="bank-semantic-dup-threshold" type="number" min="0" max="1" step="0.01"
-              value={config.bank?.semantic_dup_threshold ?? 0.96}
+              value={config.bank?.semantic_dup_threshold ?? bankDefault('semantic_dup_threshold')}
               onChange={(e) => setField('bank', 'semantic_dup_threshold', parseFloat(e.target.value) || 0)}
               className={INPUT_CLASS} />
             <p className="mt-0.5 text-xs text-content-muted">Cosine similarity at or above which two scored images are a ✂ semantic near-duplicate (crop/variant of the same shot). Re-runs instantly from cached embeddings — no re-scan.</p>
+            <ResetToDefault label="Semantic duplicate similarity" section="bank" field="semantic_dup_threshold"
+              config={config} configDefaults={configDefaults} setField={setField} />
           </div>
         </div>
       </Card>

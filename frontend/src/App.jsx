@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { HashRouter, Routes, Route, Navigate, Outlet, NavLink, useNavigate } from 'react-router-dom'
+import { HashRouter, Routes, Route, Navigate, Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { apiFetch, postJson } from './api/fetchClient'
 import { JobsProvider } from './context/JobsContext'
 import { ToastProvider, useToast } from './components/common/Toast'
@@ -7,6 +7,7 @@ import { CapabilitiesProvider, useCapabilities } from './context/CapabilitiesCon
 import { setToastRef } from './api/fetchClient'
 import ErrorBoundary from './components/common/ErrorBoundary'
 import { WhatsNewButton, WhatsNewModal } from './components/common/WhatsNew'
+import ConnectionBanner from './components/common/ConnectionBanner'
 import DatasetPage from './pages/DatasetPage'
 import BankPage from './pages/BankPage'
 import StudioPage from './pages/StudioPage'
@@ -14,13 +15,31 @@ import SettingsPage from './pages/SettingsPage'
 import SetupPage from './pages/SetupPage'
 import GuidePage from './pages/GuidePage'
 import CloudRunsPage from './pages/CloudRunsPage'
+import CanvasPage from './pages/CanvasPage'
 import { recommendedMet } from './hooks/useSetupSteps'
 import { HelpModeProvider, useHelpMode, TipHost } from './help/HelpMode'
+import HeaderMenu from './components/common/HeaderMenu'
+import { versionLabel } from './utils/versionLabel'
+import { useTrainingActivity } from './hooks/useTrainingActivity'
+import { activityLabel } from './utils/trainingActivity'
 
+// px-2 up to `lg`: the desktop bar starts at `md` (768 px) and now carries five
+// workspaces (Datasets · Bank · Runs · Canvas · Test Studio) plus the utility
+// icons. At the old px-3 that row overflowed the viewport at exactly 768 and
+// clipped the What's-new button off the right edge. Nothing is hidden — the
+// items simply breathe less until there is room for it.
 const NAV_ITEM_BASE =
-  'px-3 py-1.5 rounded-md text-sm font-medium no-underline transition-colors'
+  'px-2 lg:px-3 py-1.5 rounded-md text-sm font-medium whitespace-nowrap no-underline transition-colors'
 const navItemClass = ({ isActive }) =>
   `${NAV_ITEM_BASE} ${
+    isActive ? 'bg-surface-raised text-content' : 'text-content-muted hover:text-content hover:bg-surface-raised'
+  }`
+
+// Full-width variant for links that live inside a HeaderMenu dropdown.
+const MENU_ITEM_BASE =
+  'block w-full text-left px-3 py-1.5 rounded-md text-sm font-medium no-underline transition-colors'
+const menuItemClass = ({ isActive }) =>
+  `${MENU_ITEM_BASE} ${
     isActive ? 'bg-surface-raised text-content' : 'text-content-muted hover:text-content hover:bg-surface-raised'
   }`
 
@@ -39,7 +58,7 @@ function CheckUpdatesButton() {
     let alive = true
     const autoCheck = async () => {
       try {
-        const d = await apiFetch('/api/update/check?auto=1')
+        const d = await apiFetch('/api/update/check?auto=1', { background: true })
         if (!alive) return
         setAvailable(!!d?.update_available)
         // The dot always lights up; the banner only surfaces if the user
@@ -67,7 +86,8 @@ function CheckUpdatesButton() {
         window.dispatchEvent(new CustomEvent('lds:update-available', { detail: d }))
         toast.success(`Update available — v${d.latest || d.remote_sha || 'new'}`)
       } else if (d?.ok) {
-        toast.info(`You're up to date — v${d.current}`)
+        // On a git checkout the release number alone is misleading — see versionLabel.
+        toast.info(`You're up to date — ${versionLabel(d)}`)
       } else {
         toast.error(d?.reason || 'Could not check for updates.')
       }
@@ -114,6 +134,10 @@ function HelpModeToggle({ onToggle }) {
 
 function NavBar() {
   const { caps } = useCapabilities()
+  // 🏋️ Live indicator on Runs: a training can hold the GPU for hours (local) or
+  // bill by the minute (cloud), and from any other page nothing said so.
+  const activity = useTrainingActivity()
+  const activityTitle = activityLabel(activity)
   // Below `md` the horizontal link row has nowhere to go (it used to just wrap
   // mid-word, brand included) -- collapse it into a hamburger-triggered panel
   // instead. navLinks is shared markup: `hidden md:flex` on desktop, only
@@ -127,31 +151,75 @@ function NavBar() {
     window.dispatchEvent(new CustomEvent('lds:home'))
     setOpen(false)
   }
-  const navLinks = (
+  // Which grouped menu owns the current route — so the ? / ⚙ triggers can
+  // reflect the active-nav style when you're on one of their screens.
+  const path = useLocation().pathname
+  const helpMenuActive = path === '/guide' || path === '/help'
+  const settingsMenuActive = path === '/setup' || path.startsWith('/settings')
+  const setupNeedsAttention = !recommendedMet(caps)
+
+  // The four workspaces, left-aligned on desktop AND reused (flat) in the
+  // mobile panel. Same caps gates in both places.
+  const workspaceLinks = (
     <>
       <NavLink to="/datasets" className={navItemClass} onClick={() => setOpen(false)}>Datasets</NavLink>
       {/* Bank sits right after Datasets: it FEEDS them (triage a big unsorted
           folder, then promote the keepers into a dataset). */}
       <NavLink to="/bank" className={navItemClass} onClick={() => setOpen(false)}>
-        <span className="inline-flex items-center gap-1"><span aria-hidden>🗃️</span> Bank
-          <span className="px-1 py-0.5 rounded border border-amber-400/50 bg-amber-500/10 text-amber-300 text-[0.5625rem] font-semibold uppercase tracking-wide leading-none">Beta</span>
-        </span>
+        <span className="inline-flex items-center gap-1"><span aria-hidden>🗃️</span> Bank</span>
       </NavLink>
       {/* Unified runs hub (cloud + local history) — useful as soon as ANY
           training path exists, not just the cloud one. */}
       {(caps.cloud_training || caps.training_visible) && (
         <NavLink to="/cloud" className={navItemClass} onClick={() => setOpen(false)}>
-          <span className="inline-flex items-center gap-1"><span aria-hidden>🏋️</span> Runs</span>
+          <span className="inline-flex items-center gap-1"><span aria-hidden>🏋️</span> Runs
+            {activity.running && (
+              /* Presence IS the message, so it must not be colour-only: the
+                 label is read out and shown on hover/long-press. */
+              <span title={activityTitle} aria-label={activityTitle} role="status"
+                className="relative inline-flex h-2 w-2 shrink-0">
+                <span aria-hidden className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/70" />
+                <span aria-hidden className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+              </span>
+            )}
+          </span>
+        </NavLink>
+      )}
+      {/* ◉ Canvas — the whole training history on one board. It lives next to
+          Runs because it answers the same question from the other end: Runs
+          lists what happened, the canvas shows how the runs descend from each
+          other, across every dataset at once. */}
+      {(caps.cloud_training || caps.training_visible) && (
+        <NavLink to="/canvas" className={navItemClass} onClick={() => setOpen(false)}>
+          <span className="inline-flex items-center gap-1"><span aria-hidden>◉</span> Canvas
+            {/* The Beta chip marks the newest surface, not the oldest: the Bank
+                has been in daily use for weeks, the canvas ships today.
+
+                It hides ONLY on the tight desktop bar (md→lg), where a fifth
+                workspace already overflows the row. It stays visible in the
+                mobile panel — a vertical list with room to spare — because that
+                is where this app is actually browsed, and a "beta" warning that
+                disappears on the reader's own screen warns nobody. */}
+            <span className="px-1 py-0.5 rounded border border-amber-400/50 bg-amber-500/10 text-amber-300 text-[0.5625rem] font-semibold uppercase tracking-wide leading-none md:hidden lg:inline">Beta</span>
+          </span>
         </NavLink>
       )}
       {caps.studio_visible && (
         <NavLink to="/studio" className={navItemClass} onClick={() => setOpen(false)}>Test Studio</NavLink>
       )}
+    </>
+  )
+
+  // Mobile keeps every destination reachable as a flat stack — no nested
+  // dropdowns on touch. Order mirrors the old top bar.
+  const mobileLinks = (
+    <>
+      {workspaceLinks}
       <NavLink to="/guide" className={navItemClass} onClick={() => setOpen(false)}>Guide</NavLink>
       <NavLink to="/setup" className={navItemClass} onClick={() => setOpen(false)}>
         <span className="inline-flex items-center gap-1">
           Setup
-          {!recommendedMet(caps) && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />}
+          {setupNeedsAttention && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />}
         </span>
       </NavLink>
       <NavLink to="/settings" className={navItemClass} onClick={() => setOpen(false)}>Settings</NavLink>
@@ -166,11 +234,38 @@ function NavBar() {
           className="shrink-0 whitespace-nowrap bg-gradient-primary bg-clip-text text-base font-bold text-transparent no-underline">
           LoRA Dataset Studio
         </NavLink>
-        {/* Workflow first (make → train in cloud → test), docs/config last. */}
-        <nav className="hidden md:flex gap-1" aria-label="Main navigation">
-          {navLinks}
-          <WhatsNewButton />
-          <CheckUpdatesButton />
+        {/* Desktop: workspaces on the left, utilities grouped into icon menus
+            on the right (Guide/Help under ?, Setup/Settings under ⚙). */}
+        <nav className="hidden md:flex flex-1 items-center gap-1" aria-label="Main navigation">
+          {workspaceLinks}
+          <div className="ml-auto flex items-center gap-1">
+            <HeaderMenu triggerLabel={<span aria-hidden>?</span>}
+              triggerTitle="Help & guide" active={helpMenuActive}>
+              {(close) => (
+                <>
+                  <NavLink to="/guide" role="menuitem" className={menuItemClass} onClick={close}>Guide</NavLink>
+                  <NavLink to="/help" role="menuitem" className={menuItemClass} onClick={close}>Help</NavLink>
+                  <HelpModeToggle onToggle={close} />
+                </>
+              )}
+            </HeaderMenu>
+            <HeaderMenu triggerLabel={<span aria-hidden>⚙</span>}
+              triggerTitle="Setup & settings" active={settingsMenuActive} dot={setupNeedsAttention}>
+              {(close) => (
+                <>
+                  <NavLink to="/setup" role="menuitem" className={menuItemClass} onClick={close}>
+                    <span className="inline-flex items-center gap-1">
+                      Setup
+                      {setupNeedsAttention && <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-primary" />}
+                    </span>
+                  </NavLink>
+                  <NavLink to="/settings" role="menuitem" className={menuItemClass} onClick={close}>Settings</NavLink>
+                </>
+              )}
+            </HeaderMenu>
+            <WhatsNewButton />
+            <CheckUpdatesButton />
+          </div>
         </nav>
         <div className="ml-auto flex items-center gap-1 md:hidden">
           <WhatsNewButton />
@@ -185,7 +280,7 @@ function NavBar() {
       {open && (
         <nav aria-label="Main navigation (mobile)"
           className="flex flex-col gap-1 border-t border-border px-4 py-2 md:hidden">
-          {navLinks}
+          {mobileLinks}
         </nav>
       )}
     </header>
@@ -326,6 +421,9 @@ function Shell() {
       <NavBar />
       <OnboardingRedirect />
       <WhatsNewModal />
+      {/* Above the update banner: "can I reach the server at all" outranks
+          "there is a newer version". */}
+      <ConnectionBanner />
       <UpdateBanner />
       <main id="main-content" tabIndex={-1} className="mx-auto max-w-5xl px-4 py-6">
         <Outlet />
@@ -365,6 +463,7 @@ function AppInner() {
             <Route path="/studio" element={<StudioPage />} />
             <Route path="/dataset/studio/:id" element={<StudioPage />} />
             <Route path="/cloud" element={<CloudRunsPage />} />
+            <Route path="/canvas" element={<CanvasPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
             <Route path="/setup" element={<SetupPage />} />

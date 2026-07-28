@@ -173,6 +173,22 @@ def _execution_error_detail(status) -> str | None:
     return None
 
 
+# Every LOCAL engine that renders a dataset variation links its result back
+# through the same callback, so this is a SET rather than one hardcoded name.
+# It is a set because of how it broke: Krea 2 Edit shipped stamping its own
+# `krea_identity_edit_dataset`, the dispatch below still tested only Klein's
+# name, and twelve images were generated, paid for in GPU time, marked done in
+# the queue — and never attached to their rows. The tile stayed at 0/12 forever
+# with nothing in the logs, because nothing had failed. A new engine must be
+# added HERE, and the contract test that walks this set is what says so.
+DATASET_IMAGE_JOB_NAMES = frozenset({
+    'klein_edit_dataset',           # Klein (FLUX.2)
+    'krea_identity_edit_dataset',   # Krea 2 Identity Edit
+    'qwen_multiangle_dataset',      # Qwen Multi-angle
+    'qwen_edit_dataset',            # Qwen Edit
+})
+
+
 def _dispatch_completion(job, filename, failed):
     """Route a finished job to whichever service created it, per its metadata.
     A callback crash must never take down the worker thread."""
@@ -189,7 +205,17 @@ def _dispatch_completion(job, filename, failed):
             reason = job.error_message if job.error_message != 'generation failed' else None
             lora_test_studio.link_completed_test_image(job.job_id, filename,
                                                        failed=failed, reason=reason)
-        elif md.get('model_name') in ('klein_edit_dataset', 'qwen_multiangle_dataset', 'qwen_edit_dataset'):
+        elif md.get('is_reference_edit'):
+            # A LOCAL ✦ Edit-reference render (Klein / Krea 2 Edit). Checked
+            # BEFORE the model_name branch below: it rides the very same
+            # enqueue_*_edit helpers, so it carries their model_name — but it has
+            # no FaceDatasetImage row, and link_completed_dataset_image would find
+            # nothing and log a bogus "no row for job".
+            from .services import face_dataset_service
+            reason = job.error_message if job.error_message != 'generation failed' else None
+            face_dataset_service.link_completed_reference_edit(
+                job.job_id, filename, failed=failed, reason=reason)
+        elif md.get('model_name') in DATASET_IMAGE_JOB_NAMES:
             from .services import face_dataset_service
             # The bare fallback 'generation failed' is LESS useful than the tile's
             # own default (which points at the server log) — only pass real detail.
@@ -282,6 +308,15 @@ class JobQueueManager:
             return True  # Job was cancelled/claimed while we were selecting
         db.session.refresh(job)
 
+        # A ComfyUI job is about to load models: hand back the vision model's
+        # 7.5 GB if an isolated call leased it warm. No live lease = a monotonic
+        # clock read and nothing else, so this is safe on the queue's hot path.
+        try:
+            from .services.vision_keepalive import revoke as _revoke_vision
+            _revoke_vision('ComfyUI job starting')
+        except Exception:
+            logger.exception('job_queue: vision keep-warm revoke failed')
+
         try:
             workflow = json.loads(job.workflow_data or '{}')
             prompt_id = _submit(workflow, job.job_id)
@@ -324,7 +359,11 @@ class JobQueueManager:
 
     # -- public API (verbatim surface; lifted services call these) --------
     def add_job(self, job_type='image', user_id='local', workflow_data=None, prompt='',
-               job_id=None, metadata=None, priority=10) -> str:
+               job_id=None, metadata=None, priority=10, *, commit=True) -> str:
+        """``commit=False`` leaves the queue row PENDING in the caller's session so a
+        fan-out (a Studio grid) can insert its own row and the job in ONE transaction
+        — one write lock per cell instead of three. The caller MUST then commit (or
+        roll back) itself; the worker only ever sees committed rows either way."""
         if job_type != 'image':
             raise ValueError(f'unsupported job_type: {job_type!r}')
         if not workflow_data:
@@ -340,7 +379,8 @@ class JobQueueManager:
             job_metadata=json.dumps(metadata) if metadata else None,
         )
         db.session.add(job)
-        db.session.commit()
+        if commit:
+            db.session.commit()
         return job_id
 
     def cancel_job(self, job_id, user_id=None, job_type='image', *, commit=True) -> bool:

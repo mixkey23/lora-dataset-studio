@@ -16,6 +16,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The notes are the diff of frontend/src/whatsNew.js against the
+          # PREVIOUS tag, so the job needs real history and every tag - the
+          # default shallow, tag-less checkout cannot resolve either.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Tag must match APP_VERSION
         shell: pwsh
@@ -30,6 +36,25 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the release notes from 🎁 What's new
+        shell: pwsh
+        working-directory: frontend
+        run: |
+          # Runs BEFORE the 10-minute build on purpose: a release that announces
+          # nothing must fail in seconds, not after packaging a ZIP nobody will
+          # read notes for. Needs no npm install - node builtins only.
+          # A deliberate plumbing-only release opts out in-band, by putting
+          # [no-notes] in the annotated tag message.
+          $msg = git tag -l --format='%(contents)' "${{ github.ref_name }}"
+          $extra = @()
+          if ("$msg" -match '\[no-notes\]') { $extra += '--allow-empty' }
+          node scripts/releaseNotes.mjs --tag "${{ github.ref_name }}" --out ../release-notes.md @extra
+          if ($LASTEXITCODE -ne 0) { throw "release notes generation failed (exit $LASTEXITCODE)" }
+          # Same body in the run log, so an empty or wrong release is visible
+          # from the Actions page without downloading anything.
+          Get-Content ../release-notes.md -Raw | Write-Host
+          Get-Content ../release-notes.md -Raw >> $env:GITHUB_STEP_SUMMARY
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -70,11 +95,11 @@ jobs:
       - name: Run the test suite
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check -r backend/requirements.txt
-          # Test-only extras, same as ci.yml: a few suites exercise the numpy/cv2
-          # seams inline (never shipped in requirements — the app installs them
-          # into dedicated envs on demand).
-          python -m pip install --disable-pip-version-check "numpy>=1.26,<2" "opencv-python-headless>=4.9"
+          # The SAME one file ci.yml and a contributor install (it pulls
+          # requirements.txt plus the test-only numpy/cv2 extras). A release must
+          # not be gated by a different environment than the one that went green
+          # on the push — that difference is what this file's history is made of.
+          python -m pip install --disable-pip-version-check -r backend/requirements-dev.txt
           python -m pytest backend/tests -q
 
       - name: Build the Windows source ZIP
@@ -91,7 +116,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # release-notes.md was built at the top of this job: the install
+          # preamble (the ZIP updates only from release to release, a git clone
+          # updates from every commit - people cannot guess that, so every
+          # release says it) followed by the 🎁 What's new entries this tag adds.
+          #
+          # --generate-notes is deliberately GONE. It builds "What's Changed"
+          # from MERGED PULL REQUESTS, and everything here lands straight on
+          # main - so it contributed an empty heading plus one useful line, the
+          # Full Changelog compare link, which the generator now emits itself.
+          # Three releases shipped a preamble-only body before that was noticed.
           gh release create "${{ github.ref_name }}" `
             "packaging/dist/LoRA-Dataset-Studio-windows.zip" `
             --title "LoRA Dataset Studio ${{ github.ref_name }}" `
-            --generate-notes
+            --notes-file release-notes.md

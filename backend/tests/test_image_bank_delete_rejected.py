@@ -47,8 +47,9 @@ def _force_trash(monkeypatch):
     monkeypatch.setitem(sys.modules, 'send2trash', fake)
 
 
-def _force_hard_delete(monkeypatch):
-    """Make ``from send2trash import send2trash`` fail → the os.remove fallback."""
+def _force_app_trash(monkeypatch):
+    """Make ``from send2trash import send2trash`` fail → the app-trash fallback
+    (what a DEFAULT install actually gets: send2trash is not a requirement)."""
     monkeypatch.setitem(sys.modules, 'send2trash', None)
 
 
@@ -80,8 +81,38 @@ def test_delete_rejected_removes_only_rejected_files(client, tmp_path, monkeypat
     assert names == {'keep.jpg', 'undecided.jpg'}
 
 
-def test_hard_delete_fallback_when_send2trash_absent(client, tmp_path, monkeypatch):
-    _force_hard_delete(monkeypatch)
+def test_without_send2trash_the_files_stay_recoverable_in_the_app_trash(
+        client, app, tmp_path, monkeypatch):
+    """send2trash is NOT a requirement, so this is the branch most installs take.
+    It used to unlink the user's own photos for good; they now land in the app's
+    trash, which Settings can still restore from."""
+    _force_app_trash(monkeypatch)
+    bank_id, src = _mkbank(client, tmp_path, ['keep.jpg', 'bad.jpg'])
+    by = _by_name(client, bank_id)
+    _reject(client, bank_id, [by['bad.jpg']['id']])
+
+    out = client.post(f'/api/bank/{bank_id}/delete-rejected', json={}).get_json()
+    assert out['mode'] == 'app_trash'
+    assert out['trashed'] == 1 and out['deleted'] == 0     # recoverable, not gone
+    assert not (src / 'bad.jpg').exists()
+    assert (src / 'keep.jpg').exists()
+    with app.app_context():
+        from app.services import trash
+        recovered = [p for p in trash.trash_root().rglob('bad.jpg')]
+    assert recovered, 'the deleted source file must be recoverable from the app trash'
+
+
+def test_permanent_delete_only_when_neither_trash_can_take_the_file(
+        client, tmp_path, monkeypatch):
+    """Last resort: the request is still honoured, and the run reports 'delete'
+    so the UI can say the files really are gone."""
+    _force_app_trash(monkeypatch)
+    from app.services import image_bank_service as banks
+
+    def refuse(_path, context=''):
+        raise OSError('trash unavailable')
+
+    monkeypatch.setattr(banks.trash, 'send_to_trash', refuse)
     bank_id, src = _mkbank(client, tmp_path, ['keep.jpg', 'bad.jpg'])
     by = _by_name(client, bank_id)
     _reject(client, bank_id, [by['bad.jpg']['id']])

@@ -91,6 +91,16 @@ fail at ComfyUI if they're absent under those exact names.
 - **Balance the framing.** The app tracks four buckets: **face / bust / body / back**.
   A dataset that is 100% face close-ups produces a LoRA that falls apart on
   full-body prompts — it has never seen the body.
+- **Imported images may have no shot type yet.** Only images imported with the
+  head-crop option on are tagged automatically; a plain drag-and-drop import (the
+  default on body-fidelity datasets) leaves the shot type unknown, and unknown
+  images count for nothing in the Composition bar — a whole import can leave it
+  at 0. **📐 Classify framing (N)**, right under that bar in 📸 Add images, reads
+  those images with the local vision model (Ollama) and sorts each into face /
+  bust / body / back. It needs Ollama running with a vision model pulled
+  (Settings ▸ Local tools); it uses the GPU and waits rather than competing with
+  a training run. Nothing is deleted and images it cannot read stay unknown, so
+  running it again only retries those.
 - **Vary everything except the person:** location, lighting, outfit, pose,
   expression, camera angle. Whatever repeats across images gets baked into the
   LoRA — a repeated background wall becomes part of "the person".
@@ -150,8 +160,9 @@ Concretely:
 
 **Concept datasets** (training a *thing/style/act*, not a person) invert the rule:
 describe everything **except the concept** — the concept is what must bind to the
-trigger. Keep masked training **off** for concepts (a person mask would erase the
-very thing you're training).
+trigger. Keep *person* masking **off** for concepts — a person mask would erase the
+very thing you're training. Masking **faces** is the opposite polarity and is
+available on purpose: see §8.
 
 **Stopping a run.** Started a big caption pass and realized it's captioning badly,
 or an option was mis-set? A **⏹ Stop** button sits in the captioning progress
@@ -176,7 +187,7 @@ reuse across datasets and share (import/export as JSON).
 | **Resolution** | 768 + 1024 | 768 + 1024 | 768 + 1024 | 768 + 1024 | 768 + 1024 | Multi-scale: holds up from close-up to full-body. |
 | **Save checkpoint** | every 250 | every 250 | every 250 | every 250 | every 250 | More snapshots → better odds one is at the sweet spot. |
 | **Steps** | auto | auto | auto | auto | auto | ~120 × images, clamped 1500–3500. A fixed 3000 overcooks small sets. |
-| **Masked training** | ON | ON | ON | ON | ON | Background weighs only 10% of the loss → identity binds to the person, not the room. OFF for concepts. |
+| **Masked training** | ON | ON | ON | ON | ON | Background weighs only 10% of the loss → identity binds to the person, not the room. OFF for concepts — they have their own face masking instead (§8). |
 
 Rules of thumb:
 
@@ -250,6 +261,14 @@ just crash the trainer — **zero kept images**, or a **slider with no prompt pa
 — are never offered the option, and the box un-ticks itself the moment the
 blockers change.
 
+**Stopping a training run.** The red **⏹ Stop training** button next to Train
+ends the run in progress — it is not a housekeeping button. It kills the training
+process, clears the pending local training queue, and hands the GPU back to
+ComfyUI. What you keep: **every checkpoint already saved**, which stays testable
+in the Studio and can be continued later with ▶ Continue. Because a run can be
+hours long, the button asks for confirmation first. The same run can also be
+stopped from the **Runs** hub ("Stop run"), which does exactly the same thing.
+
 ---
 
 ## 6. After training: pick the right checkpoint
@@ -286,6 +305,20 @@ dialog:
   The timestep knob enables a known **two-phase recipe**: train balanced first,
   then continue with a low-noise-leaning emphasis to polish fine texture.
 
+- **Run it** — **💻 Local** or **☁ Cloud**. A checkpoint is just a
+  file, so where a run trained doesn't decide where it can be finished: a run
+  trained on your GPU can be continued on a rented one (the checkpoint is uploaded
+  and training picks up from it, on a fresh pod, leaving every local save
+  untouched), and a cloud epoch mirrored into your run folder can be finished
+  locally. A lane you can't use right now — no vast.ai key, no ai-toolkit, a
+  training already running here, a cloud limit reached — is disabled **with the
+  reason**, never hidden. The same choice is offered by the **Runs** page's
+  ▶ Continue, where the cloud reason is counted against *that run's* dataset —
+  the page lists runs from all of them.
+
+You can also click a checkpoint pill in the **◉ Graph** and pick *▶ Continue from
+here*: the dialog opens already set on that step.
+
 Continue works for both **local and cloud** runs from the Runs hub.
 
 ## 7. Dual captions (long + short)
@@ -309,6 +342,54 @@ How the short caption is produced:
 **Local training only for now.** The cloud pod's dataset upload doesn't carry the
 JSON file the short caption is read from, so **cloud runs train on the long
 caption alone** — turning the toggle on simply has no effect there yet.
+
+**Not on Krea 2 or Anima.** Those two families pre-cache their text embeddings and
+unload the text encoder to fit their DiT in VRAM. ai-toolkit caches exactly one
+embedding per image — the long caption — and once the encoder is gone the training
+loop reads those cached embeddings instead of the caption text, so a second caption
+has nowhere to be encoded. Asking for both used to crash the run at the first step,
+*after* the weights download and the whole caching pass (reported by **1Tomber**,
+GitHub #22). The app now refuses the combination when it builds the training config:
+the toggle says so, the pre-launch check warns, and the run trains on the long
+caption alone — trigger word included, exactly like a normal run.
+
+---
+
+## 8. Concept LoRAs: keeping faces out
+
+A Concept LoRA learns the one thing every image shares. If those images all show
+people, it quietly learns **their faces too** — and when you later stack it with a
+Character LoRA, the two pull against each other over whose face to render. This was
+reported by **shivdbz2010 (GitHub)**.
+
+Turn on **Mask faces** in *Advanced options* on a Concept dataset. Faces are
+detected and **weighed down in the training loss**, so the concept binds to the act
+instead of to the people in your photos.
+
+**Your images are not touched.** Nothing is blurred, pixelated or painted over.
+That distinction matters: a blurred face would *be* what the model is trained to
+reproduce, and the LoRA would learn to render blurry faces. A loss mask says
+"don't correct me here" instead, so nothing at all is learned in that area.
+
+Before you rely on it:
+
+- **Variety beats masking.** The people who maintain these trainers say dataset
+  diversity matters more here. A concept demonstrated by ten different people
+  already dilutes identity; with two, the faces are as constant as the concept and
+  no mask fully compensates.
+- **Preview it.** The training panel draws the mask on your own shots and shows how
+  many images got no face at all. A *partly* masked set is the bad case: the faces
+  left unmasked become the only ones the LoRA still learns faces from, so they end
+  up over-represented.
+- **If your concept lives on the face** — an expression, a mouth, a gaze — masking
+  the head can erase what you're teaching. The app warns when your description says
+  so; it doesn't stop you, because only you know your dataset.
+- **Nobody has measured this.** There's no published before/after of a concept LoRA
+  trained with and without face masking. This gives you the lever, not a promise.
+
+Two knobs live in **Settings ▸ Training**: how far the detected face box is grown
+into a head, and how much the masked area still counts. Neither is zero, on
+purpose — see the settings reference.
 
 ---
 

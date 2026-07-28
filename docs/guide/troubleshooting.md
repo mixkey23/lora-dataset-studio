@@ -20,9 +20,24 @@ models/text_encoders/Z image/qwen_3_4b.safetensors
 models/vae/z ae.safetensors
 ```
 
+**The text encoder and the VAE are flexible** — only the base model needs that
+sub-folder. The app resolves those two itself: any capitalisation, any separator
+and any sub-folder work, so `models/vae/z_ae.safetensors`, `models/vae/ae.safetensors`
+(the name ComfyUI's own Z-Image page uses), `text_encoders/Z Image/qwen_3_4b.safetensors`
+and a bare `text_encoders/qwen_3_4b.safetensors` are all found, including under an
+`extra_model_paths.yaml` root. **Do not rename your files to match the layout above.**
+If the app still says one is missing, the message lists what it accepted and where it
+looked; you can also pin either file by hand with the `zimage.vae` /
+`zimage.text_encoder` settings (see *Settings reference → Config-file-only settings*).
+
 A Z-Image LoRA only works on a Z-Image base — a regular SD/SDXL graph
-(20–30 steps, CFG 7) renders garbage; Z-Image-Turbo wants euler / simple /
-**8 steps / CFG 1.0** (the app's workflows already do this).
+(20–30 steps, CFG 7) renders garbage. The two Z-Image builds then want opposite
+sampler settings, and the Test Studio proposes the right pair per base model:
+**Z-Image-Turbo** is guidance-distilled and wants euler / simple / **8 steps /
+CFG 1.0**, while the non-distilled **Z-Image Base** needs roughly **30–50 steps at
+CFG 3–5** (ComfyUI's own recommendation) — run Base at CFG 1 and it renders mush.
+Those are starting points on a sweepable axis, not measured optima: the Studio grid
+exists to let you find yours.
 
 ## "No SDXL checkpoint found" on a fresh install
 
@@ -105,11 +120,130 @@ Check **Settings → Local tools → ComfyUI API URL** (default
 firewall or a different bind interface isn't blocking the connection. The
 **Test** button answers immediately.
 
+## ComfyUI runs in another container (or WSL, or another machine) and generation fails
+
+**Symptom:** setup goes green — the ComfyUI URL answers, the install directory is
+accepted — and then every generation fails.
+
+**Why:** the app talks to ComfyUI through **two** channels, and only one of them is
+the network.
+
+1. **The HTTP API** (`Settings → Local tools → ComfyUI API URL`). This is what the
+   *Test* button and the Setup wizard check.
+2. **The filesystem.** Every local engine (Klein, Krea 2 Edit, Klein watermark
+   cleaning) hands ComfyUI its source image by **copying the file into ComfyUI's
+   `input/` folder**, and the result comes back from its `output/` folder. There is
+   no upload over the API on that path.
+
+A ComfyUI in a separate container, in WSL, or on another host does not share those
+folders with the app by default. The URL answers, so everything looks configured —
+and then the copy writes into a folder ComfyUI cannot see, or fails outright.
+
+**What it takes to work:**
+
+- `input/` and `output/` must be visible **to both sides at the same path**. Not
+  "an equivalent folder": the app writes `<input>/edit_source_….png` and then tells
+  ComfyUI to load `edit_source_….png` from *its own* input folder — the two must be
+  the same directory.
+- The app's process must be able to **write** into `input/` (a read-only bind mount
+  is not enough), and ComfyUI must be able to read it.
+- If ComfyUI was started with `--input-directory` / `--output-directory`, set the
+  matching paths in **Settings → Local tools → Advanced: ComfyUI folder overrides**.
+  Those fields take the path **as seen by the app**.
+
+With Docker, that means bind-mounting the same host folders into both containers at
+identical paths, e.g.:
+
+```yaml
+# both services
+volumes:
+  - /srv/comfyui/input:/srv/comfyui/input
+  - /srv/comfyui/output:/srv/comfyui/output
+```
+
+and then pointing the two override fields at `/srv/comfyui/input` and
+`/srv/comfyui/output`. The shipped `docker-compose.yml` deliberately does **not**
+do this: it runs the app in API-only mode, where ComfyUI is out of scope.
+
+**How you'll know:** the failure now says so. Settings flags an override folder it
+cannot write into, the Setup wizard warns while you configure (a warning, never a
+blocker — mounting volumes afterwards is fine), and a generation that cannot reach
+the folder answers with the folder path and the reason instead of a bare `500`.
+Those messages are path-redacted, so they are safe to paste in a help thread.
+
+**Everything else keeps working without shared folders**: the API engines (Gemini,
+ChatGPT, OpenRouter), scraping, curation, captioning through Ollama, training, and
+Hugging Face publishing. Only the ComfyUI-local engines need the filesystem.
+
+*(Reported by nofaceman on Discord.)*
+
+## "Value not in list" on every model, on Linux (fixed)
+
+**Symptom:** on a Linux install, nothing generated at all. ComfyUI's console showed,
+for every workflow:
+
+```
+Failed to validate prompt for output 28:
+* UNETLoader 20:
+  - Value not in list: unet_name: 'Krea\krea2_turbo_fp8.safetensors'
+    not in ['Krea/krea2_turbo_fp8.safetensors']
+```
+
+**Why:** ComfyUI builds its model lists with the separator of **its own** host —
+backslash on Windows, forward slash on Linux — and validates a model widget by
+exact string match. The app spelled those names with a Windows backslash whatever
+the platform, and it keeps every model in a subfolder (`Krea`, `klein`,
+`z image`, and every LoRA you train), so on Linux the answer was "nothing works"
+rather than "one model is missing".
+
+**Fixed:** the app now reads the spelling from the ComfyUI it is actually talking
+to and matches it. This also covers the reverse case — the app on Windows driving
+a ComfyUI in WSL, Docker or on another machine, which needs forward slashes — so
+there is nothing to configure either way.
+
+*(Found and diagnosed by 1Tomber, [GitHub #21](https://github.com/perfectgf/lora-dataset-studio/issues/21).)*
+
 ## Klein engine stays greyed out
 
 Klein needs a reachable ComfyUI **and** the Klein model files (~16 GB VRAM
 class). **Setup → ComfyUI** offers the download; the license-gated fp8 model
 needs a Hugging Face token (Settings → Local tools).
+
+Whatever the cause, the greyed-out engine now **names it**, and the Setup wizard
+shows the same sentence — the two screens read one verdict, so they cannot send
+you to fix different things. The causes, and what each one means:
+
+| What it says | What it means | What to do |
+| --- | --- | --- |
+| `Configure ComfyUI in Settings` | ComfyUI is not answering | Start it, or fix the API URL |
+| `Klein <file(s)> missing` | that weight is not on disk | Download it in Setup ▸ Install components |
+| `… is on disk but cannot be loaded` | the file is there but unreadable | See below |
+| `Your ComfyUI doesn't have <value>` | the graph pins a widget value your ComfyUI doesn't offer | Install the named node pack, restart ComfyUI |
+| `disabled in Settings (engines)` | you turned the engine off | Re-enable it in Settings ▸ Engines |
+
+### "On disk but cannot be loaded"
+
+A `.safetensors` file declares the length of its JSON header in its first eight
+bytes. A download that was **cut short or corrupted** leaves a file that is
+shorter than it claims — plausible size, right name, right folder, and no loader
+can open it. A licence or login page saved as `.safetensors` fails the same way.
+
+Setup used to tick these as **✓ Installed** (the file existed) while the
+generation page refused the engine. It now shows **⚠ On disk, unreadable** with
+the file name and the reason, and **↻ Download again** replaces the bad file
+instead of reporting "already present" and doing nothing.
+
+If you placed the file by hand somewhere other than the folder Setup downloads
+into, delete it yourself first — the app only replaces files at its own path.
+
+*(Reported by zigzag4794 on Discord.)*
+
+### "Not checked" is not "ready"
+
+With ComfyUI stopped, the checks that need it cannot run, and the app reports no
+gap rather than inventing one. Your files being on disk is therefore **not** a
+clean bill of health, and Setup says so instead of showing a tick it did not
+earn. Start ComfyUI and re-check.
 
 ## Port 5000 conflict on macOS
 
@@ -133,3 +267,17 @@ Open the **Cloud** tab: every run shows its live phase, and the stall watchdog
 (Settings → Training → stall timeout) rescues logs and kills the pod if no step
 progress happens for too long. Orphaned pods are also destroyed automatically
 at every app start — you never pay for a forgotten GPU.
+
+**Decide without opening the vast.ai console.** The longest phase of a fresh
+run is the pod pulling its base weights — 26 GB for Krea 2, half an hour on a
+healthy host. The card shows that download as it happens: how much has landed,
+of how much, at what speed and its ETA. Two readings tell you everything:
+
+- the figures move → it is working, however slow it looks. A crawling download
+  is still a download; the *no training step in 45 min* watchdog will end it if
+  it never gets there;
+- the figures do not move, and the card says **Silent run — no progress
+  reported for N min** → the pod is frozen, not slow. Stop it, or let the
+  freeze watchdog terminate it at the configured limit. That counter is
+  measured on the pod and survives restarting the app, so leaving and coming
+  back does not reset the evidence.

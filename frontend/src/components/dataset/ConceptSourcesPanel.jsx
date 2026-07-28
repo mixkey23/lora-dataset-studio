@@ -19,6 +19,8 @@ import InstallRunner from '../setup/InstallRunner';
 import { clearScraperScanState, loadScraperScanState, saveScraperScanState } from './scraperState';
 import { HelpBadge } from '../../help/HelpMode';
 import PexelsAttribution from './PexelsAttribution';
+import SettingsLink from '../common/SettingsLink';
+import { localEngineUnavailableReason } from '../../utils/localEngineReason';
 import {
   buildPexelsSearchUrl,
   isPexelsUrl,
@@ -60,10 +62,29 @@ const PLATFORM_LABELS = {
 const platformLabel = (platform) => PLATFORM_LABELS[platform]
   || (platform ? platform.charAt(0).toUpperCase() + platform.slice(1) : 'source');
 
-export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
+/**
+ * `destination` picks WHO receives the picked images, and nothing else about the
+ * scan changes: 'dataset' (the historical outlet — training-grade filters and the
+ * Klein rescue of small images apply at import) or 'bank' (the triage pile — what
+ * is downloaded is stored, and the bank's own passes rule on small/duplicate).
+ * `stateKey` scopes the saved scan; it stays the dataset id by default so every
+ * existing localStorage entry keeps its key.
+ */
+export default function ConceptSourcesPanel({ datasetId, onImport, busy,
+  destination = 'dataset', stateKey = undefined }) {
+  const toBank = destination === 'bank';
+  const scanKey = stateKey === undefined ? datasetId : stateKey;
   const toast = useToast();
   const { caps, refresh } = useCapabilities();
-  const [restoredScan] = useState(() => loadScraperScanState(datasetId));
+  // Why Klein can't rescue anything here, in the SAME words every other screen
+  // uses for the same gap. Gated on the EXACT condition that disables the
+  // checkbox (`=== false`, not "not true"): capabilities arrive after the first
+  // paint, and a reason printed under a control that is still enabled would be
+  // the same kind of lie in reverse.
+  const kleinReason = caps.engines?.klein === false
+    ? localEngineUnavailableReason('klein', caps)
+    : null;
+  const [restoredScan] = useState(() => loadScraperScanState(scanKey));
   const [sourceMode, setSourceMode] = useState(restoredScan.sourceMode);
   // `url` is only the editable URL-mode draft. Pagination uses activeScanUrl.
   const [url, setUrl] = useState(restoredScan.url);
@@ -102,10 +123,10 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
   };
 
   useEffect(() => {
-    saveScraperScanState(datasetId, { sourceMode, url, kw, sub, pexelsKeyword,
+    saveScraperScanState(scanKey, { sourceMode, url, kw, sub, pexelsKeyword,
       pexelsLocale, pexelsOrientation, activeScanUrl, activePlatform,
       items, page, paginated, fullAlbums, rescueSmall, selected });
-  }, [datasetId, sourceMode, url, kw, sub, pexelsKeyword, pexelsLocale,
+  }, [scanKey, sourceMode, url, kw, sub, pexelsKeyword, pexelsLocale,
     pexelsOrientation, activeScanUrl, activePlatform, items, page, paginated,
     fullAlbums, rescueSmall, selected]);
 
@@ -230,7 +251,7 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
   };
 
   const resetScan = () => {
-    clearScraperScanState(datasetId);
+    clearScraperScanState(scanKey);
     setSourceMode('reddit'); setUrl(''); setKw(''); setSub('');
     setPexelsKeyword(''); setPexelsLocale('fr-FR'); setPexelsOrientation('');
     setActiveScanUrl(''); setActivePlatform(''); setItems([]); setPage(0);
@@ -241,10 +262,14 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
   return (
     <section className="bg-surface rounded-xl border border-border p-3 flex flex-col gap-2">
       <div className="flex items-center gap-2 flex-wrap">
-        <h2 className="text-content font-semibold text-sm">🕷️ Build from scraped images</h2>
+        <h2 className="text-content font-semibold text-sm">
+          {toBank ? '🕷️ Scrape into the bank' : '🕷️ Build from scraped images'}
+        </h2>
         <span className="text-content-subtle text-[0.6875rem]"
-          title="Research-backed: 20-50 curated images beat hundreds of mixed ones; keep at most ~10 per gallery (one gallery ≈ one shoot).">
-          aim for 20-50 varied images
+          title={toBank
+            ? 'A bank is the triage step: bring back MORE than you need, then let the quality, duplicate and framing passes cut it down.'
+            : 'Research-backed: 20-50 curated images beat hundreds of mixed ones; keep at most ~10 per gallery (one gallery ≈ one shoot).'}>
+          {toBank ? 'bring back plenty — you triage after' : 'aim for 20-50 varied images'}
         </span>
       </div>
 
@@ -284,6 +309,12 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
       )}
 
       <div className="flex flex-wrap items-center gap-2">
+        {/* Several sources only return results once their credentials are filled in
+            (Reddit client id, Civitai token, Pexels key) — the picker is where that
+            becomes relevant, not the Settings page the user is not on. */}
+        <SettingsLink section="scraping" focus="scrape-credentials" className="order-last ml-auto">
+          Source credentials
+        </SettingsLink>
         <div role="group" aria-label="Scraper source"
           className="inline-flex rounded-lg border border-border bg-surface-raised p-0.5">
           {SOURCE_MODES.map(([mode, label]) => (
@@ -371,7 +402,7 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
             <select value={pexelsLocale} onChange={(e) => setPexelsLocale(e.target.value)}
               aria-label="Pexels search language"
               className="px-2.5 py-1.5 rounded-lg bg-surface-raised border border-border text-content text-sm focus:border-indigo-500 outline-none">
-              <option value="fr-FR">Français (fr-FR)</option>
+              <option value="fr-FR">French (fr-FR)</option>
               <option value="en-US">English (en-US)</option>
             </select>
             <select value={pexelsOrientation} onChange={(e) => setPexelsOrientation(e.target.value)}
@@ -422,6 +453,7 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
         </div>
       )}
 
+      {!toBank && (
       <label className={`flex items-start gap-2 rounded-lg border px-2.5 py-2 text-[0.75rem] ${
         rescueSmall
           ? 'border-indigo-400/50 bg-indigo-500/10 text-content'
@@ -438,10 +470,16 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
           <span className="text-[0.6875rem] leading-relaxed text-content-subtle">
             Off by default. Only small images are sent to Klein. The original is preserved,
             and neither version enters training until you choose one in Curation.
-            {caps.engines?.klein === false ? ' Klein is not ready in this setup.' : ''}
+            {/* This used to be a bare "not ready in this setup" — a verdict with no
+                cause, so the one thing the sentence existed to give (what to do
+                next) was the one thing missing. The shared reason knows whether it
+                is a stopped ComfyUI, a named missing weight, a broken one, or a
+                widget value this install does not have. */}
+            {kleinReason ? ` ${kleinReason.replace(/^⚠\s*/, '')}` : ''}
           </span>
         </span>
       </label>
+      )}
 
       {items.length > 0 && (() => {
         // Only live thumbnails are shown/pickable; dead source links are hidden.
@@ -482,8 +520,14 @@ export default function ConceptSourcesPanel({ datasetId, onImport, busy }) {
               className="px-2 py-0.5 rounded border border-border hover:text-content disabled:opacity-40">
               Reset scan
             </button>
+            {/* The honest one-liner about what the chosen destination does to the
+                picked images. They differ on purpose: a dataset is trained on, a
+                bank is triaged — so the bank stores what it downloads and its own
+                passes (quality, duplicate groups, semantic) rule on it. */}
             <span className="ml-auto">
-              Filters at import: duplicates, {rescueSmall ? 'Klein review for' : 'skip'} short side &lt; 768px, ratio &gt; 3:1
+              {toBank
+                ? 'Stored as downloaded — small/duplicate/framing are the bank’s passes to judge'
+                : `Filters at import: duplicates, ${rescueSmall ? 'Klein review for' : 'skip'} short side < 768px, ratio > 3:1`}
             </span>
           </div>
 

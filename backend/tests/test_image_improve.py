@@ -95,9 +95,14 @@ def test_improve_existing_image_is_non_destructive_and_uses_metadata_profile(
         assert queued[0]['source_filename'] == source.filename
         assert queued[0]['source_path'] == svc._img_path(source)
         assert queued[0]['edit_prompt'] == svc.KLEIN_IMAGE_IMPROVE_PROMPT
-        assert queued[0]['lora_strength'] == 0.0
+        # The shipped improve profile, now settings-driven (klein.improve_*): a HIGH
+        # consistency because this pass must add detail without redrawing the
+        # composition, the enhancement LoRA off until the user raises it, 4 steps and
+        # the historical 2 MP output budget.
+        assert queued[0]['lora_strength'] == 1.0
         assert queued[0]['sampler_steps'] == 4
         assert queued[0]['base_lora_strength'] == 0.0
+        assert queued[0]['output_megapixels'] == 2.0
         assert queued[0]['extra_metadata']['source_image_id'] == source_id
         assert queued[0]['extra_metadata']['derivation_kind'] == svc.KLEIN_IMAGE_IMPROVE
         assert syncs == [ds.id]
@@ -315,3 +320,44 @@ def test_improve_route_preflights_missing_nodes(client, monkeypatch):
     response = client.post('/api/dataset/image/8/improve', json={})
     assert response.status_code == 409
     assert response.get_json()['klein_nodes_missing'] == missing
+
+
+def test_dataset_payload_publishes_the_parent_link_of_every_derived_image(app):
+    """The lightbox can only put an improvement NEXT TO its original if the
+    payload names that original. Both columns exist in the database, but the UI
+    is fed `dataset_payload` — so this is where the link has to surface, for the
+    two derivations that produce a candidate (manual improve, small-image
+    rescue). A pending candidate has no file yet and must still carry the link."""
+    from app.config import LOCAL_USER
+    from app.models import FaceDatasetImage
+    from app.services import face_dataset_service as svc
+
+    with app.app_context():
+        ds, source, _raw = _source(svc, FaceDatasetImage, LOCAL_USER)
+        candidate = FaceDatasetImage(
+            dataset_id=ds.id, source='generated', status='pending',
+            parent_image_id=source.id, derivation_kind=svc.KLEIN_IMAGE_IMPROVE,
+            variation_label='Klein upscale & improve')
+        rescue_source = FaceDatasetImage(
+            dataset_id=ds.id, filename='small.png', source='import', status='pending',
+            derivation_kind=svc.SMALL_IMAGE_SOURCE)
+        svc.db.session.add_all([candidate, rescue_source])
+        svc.db.session.commit()
+        rescue = FaceDatasetImage(
+            dataset_id=ds.id, filename='rescued.png', source='generated', status='pending',
+            parent_image_id=rescue_source.id, derivation_kind=svc.KLEIN_SMALL_IMAGE)
+        svc.db.session.add(rescue)
+        svc.db.session.commit()
+
+        rows = {row['id']: row
+                for row in svc.dataset_payload(LOCAL_USER, ds.id)['images']}
+
+        assert rows[candidate.id]['derivation_kind'] == svc.KLEIN_IMAGE_IMPROVE
+        assert rows[candidate.id]['parent_image_id'] == source.id
+        assert rows[candidate.id]['filename'] is None
+        assert rows[rescue.id]['derivation_kind'] == svc.KLEIN_SMALL_IMAGE
+        assert rows[rescue.id]['parent_image_id'] == rescue_source.id
+        # A plain image carries no link — the UI must keep falling back to
+        # today's single-image lightbox for it.
+        assert rows[source.id]['derivation_kind'] is None
+        assert rows[source.id]['parent_image_id'] is None

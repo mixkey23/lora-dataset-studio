@@ -203,7 +203,7 @@ def test_retry_local_run_replays_slider_config_with_768(app, tmp_path, monkeypat
     """Retrying a failed SLIDER run re-emits the slider recipe faithfully — the
     concept_slider process — and, thanks to the new default, at 768 only (the
     resolution that keeps the slider loss's VRAM peak under 24 GB). This is the
-    exact regression Jeremy hit: the first slider run OOM'd in 768+1024."""
+    exact regression reported: the first slider run OOM'd in 768+1024."""
     from app.services import lora_training as lt
     _configure_aitoolkit(tmp_path, monkeypatch, app)
     monkeypatch.setattr(lt.shutil, 'disk_usage',

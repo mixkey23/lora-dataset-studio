@@ -20,7 +20,21 @@ import StudioPreflightBanner from './StudioPreflightBanner';
 // `datasetId` (optionnel) : requis seulement par RecentPrompts pour les vignettes
 //   (le payload `d` ne porte pas l'id du dataset → StudioShell le transmet). Voir
 //   note de déviation §contrat dans le rapport de livraison de la Task 1.A.
-export default function RunSetupPanel({ d, studio, form, datasetId }) {
+//
+// ◉ LoRA Canvas — ce panneau est MONTÉ TEL QUEL par le canvas, qui ne diffère que
+// sur UN point : les checkpoints s'y choisissent en cliquant les pastilles des
+// nœuds (sur plusieurs datasets), pas dans le CheckpointPicker. D'où trois props
+// optionnelles, sans effet quand elles sont absentes :
+//   `checkpointSlot`        remplace le CheckpointPicker par le récapitulatif de
+//                           la sélection du board ;
+//   `launchBlocked`/`launchLabel` : le bouton dit CE QU'IL VA FAIRE (« Deploy 2
+//                           checkpoints, then generate ») ou POURQUOI il ne peut
+//                           pas (familles mélangées). Jamais un bouton mort muet.
+// Tout le reste — modèle, format, cfg, steps, steps2, seed, ×N, LoRA always-on,
+// rebalance, négatif… — est le MÊME code, donc les deux écrans ne divergent pas.
+export default function RunSetupPanel({ d, studio, form, datasetId,
+  checkpointSlot = null, launchBlocked = false, launchLabel = null, launchHint = null, actionBar = true,
+  genStoragePrefix = null }) {
   // Réglages de génération GLOBAUX (parité Generate, hors prompt builder) remontés par
   // StudioGenerationSettings : objet snake_case déjà prêt à fusionner dans le POST /run
   // (source unique de vérité pour rebalance/enhancer/precision/format/detail/negative +
@@ -33,11 +47,16 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
   // contredit la famille du Studio (déploiement mal classé) → bandeau distinct.
   const [archMismatch, setArchMismatch] = useState(null);
 
-  const canLaunch = form.total > 0 && !d.pending && !d.gpu_busy && !studio.launching;
+  const canLaunch = form.total > 0 && !d.pending && !d.gpu_busy && !studio.launching
+    && !launchBlocked;
   // Axe ⚖ batch (Always-on LoRA cochés batch) : chaque config tourne SANS puis
   // AVEC chaque LoRA coché → le compteur d'images/temps doit en tenir compte
   // (le backend multiplie déjà les cellules par 1 + nb cochés).
   const batchMult = 1 + ((genSettings.batch_loras || []).length);
+  // The canvas swaps `studio.launch` itself (see useCanvasStudio), so EVERY
+  // setting — genSettings included — travels through this one call site on both
+  // screens. Overriding the handler here instead would have quietly dropped the
+  // global generation settings from a canvas run.
   const onLaunch = async () => {
     const res = await studio.launch(
       form.chosenCps, form.selSts, form.nextSeed(), form.effectivePrompt,
@@ -93,7 +112,12 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
       {/* --- Setup du run ------------------------------------------------ */}
       {!d.pending && (
         <div id="st-setup" className="flex flex-col gap-2 scroll-mt-16">
-          <CheckpointPicker checkpoints={d.checkpoints} chosen={form.chosenCps} onToggle={form.toggleCp} />
+          {/* The ONE thing the canvas does differently: its checkpoints are the
+              pills ticked on the board, so it hands in its own recap here and
+              the picker stays out of the way. */}
+          {checkpointSlot ?? (
+            <CheckpointPicker checkpoints={d.checkpoints} chosen={form.chosenCps} onToggle={form.toggleCp} />
+          )}
 
           <StrengthPicker choices={STRENGTH_CHOICES} selected={form.selSts} onToggle={form.toggleSt} fmt={fmt} />
 
@@ -118,15 +142,16 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
             cfgChoices={d.cfg_choices}
             effectiveCfgs={form.effectiveCfgs}
             onToggleCfg={form.toggleCfg}
-            defaultCfg={d.default_cfg}
+            defaultCfg={form.modelDefaultCfg}
             stepsChoices={d.steps_choices}
             effectiveSteps={form.effectiveSteps}
             onToggleStep={form.toggleStep}
-            defaultSteps={d.default_steps}
+            defaultSteps={form.modelDefaultSteps}
             steps2Choices={d.steps2_choices}
             effectiveSteps2={form.effectiveSteps2}
             onToggleStep2={form.toggleStep2}
             defaultSteps2={d.default_steps2}
+            mixedDefaults={form.mixedModelDefaults}
             fmt={fmt}
           />
 
@@ -135,7 +160,12 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
               always-on)/negative. Source unique de vérité, partagée avec la comparaison. */}
           <StudioGenerationSettings
             family={d.family}
-            storagePrefix={`studioGen_${datasetId || 'x'}_${d.family || 'default'}`}
+            // The canvas overrides the namespace: its runs are cross-dataset, so
+            // "the engine settings of dataset 7" would be restored (and saved)
+            // under whichever pick happened to be first — the same reason
+            // useStudioForm is namespaced by family there, not by dataset.
+            storagePrefix={genStoragePrefix
+              || `studioGen_${datasetId || 'x'}_${d.family || 'default'}`}
             permanentLoras={d.permanent_loras}
             onChange={setGenSettings}
           />
@@ -152,13 +182,27 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
               batchMult={batchMult}
               fmt={fmt}
             />
-            <LaunchBar canLaunch={canLaunch} launching={studio.launching} onLaunch={onLaunch} />
+            <LaunchBar canLaunch={canLaunch} launching={studio.launching} onLaunch={onLaunch}
+              label={launchLabel} title={launchHint} />
           </div>
+          {/* A dead button that does not say why is what this replaces: the
+              canvas passes the real reason (mixed families, nothing picked) and
+              it is shown right under the button, not only in a tooltip. */}
+          {launchHint && (
+            <p className={'m-0 text-[0.6875rem] ' + (launchBlocked ? 'text-amber-200' : 'text-content-muted')}
+              role={launchBlocked ? 'status' : undefined}>
+              {launchHint}
+            </p>
+          )}
         </div>
       )}
 
       {/* Barre de commande fixe : Run toujours visible + raccourcis de sections
-          (mêmes ancres que la comparaison ; le ratio reste l'axe Formats ici). */}
+          (mêmes ancres que la comparaison ; le ratio reste l'axe Formats ici).
+          Retirée sur le canvas, où le panneau est déjà un tiroir à pied collant :
+          deux barres empilées au ras de l'écran, à 400 px, mangeaient la moitié
+          de la hauteur utile. */}
+      {actionBar && (
       <StudioActionBar
         shortcuts={[
           { id: 'st-loras', emoji: '🧬', label: 'LoRAs' },
@@ -175,7 +219,9 @@ export default function RunSetupPanel({ d, studio, form, datasetId }) {
         canRun={canLaunch}
         running={studio.launching}
         onRun={onLaunch}
+        runLabel={launchLabel ? `🚀 ${launchLabel}` : undefined}
       />
+      )}
     </>
   );
 }

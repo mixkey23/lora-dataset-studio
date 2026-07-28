@@ -17,6 +17,9 @@ from .. import config as cfg
 from ..config import LOCAL_USER
 from ..services import cloud_training as ct
 from ..services import face_dataset_service as svc
+from ..services import face_mask
+from ..services import face_mask_preview as fmp
+from ..models import FaceDatasetImage
 from ..services import lora_training as lt
 from ..services import zimage_convert as zc
 from ..utils.comfyui import get_zimage_models, get_checkpoint_models
@@ -316,17 +319,30 @@ def dataset_train_checkpoints(dataset_id):
                            .filter_by(dataset_id=dataset_id).all()))
     checkpoint_registry.ensure_baseline(LOCAL_USER, dataset_id, fam_resolved,
                                         had_training)
-    return jsonify({'checkpoints': lt.list_checkpoints(LOCAL_USER, dataset_id, **kw),
+    # Deployment stamp (testable + deployed_filename) on EVERY listed save, from
+    # the same join the ◉ Graph pills use — this is what lets the panel show
+    # "✓ Deployed + ⏏ Undeploy" in place of a misleading second "Import →", and
+    # aim the undeploy at the right ComfyUI file. Local rows name their own run,
+    # so they are grouped by run; a cloud group IS one run.
+    local_cks = ct.annotate_deployed_by_run(
+        dataset_id, fam_resolved, lt.list_checkpoints(LOCAL_USER, dataset_id, **kw))
+    cloud_groups = ct.cloud_checkpoint_groups(dataset_id, fam_resolved, variant=variant)
+    for _g in cloud_groups:
+        ct.annotate_deployed_checkpoints(dataset_id, fam_resolved,
+                                         _g.get('checkpoints') or [],
+                                         run_tag=('cloud', _g.get('run_id')))
+    return jsonify({'checkpoints': local_cks,
                     # cloud saves synced locally (incl. an ACTIVE run's latest)
                     # — separate field: the resume-or-fresh prompt reasons on
                     # LOCAL checkpoints only
-                    'cloud_checkpoints': ct.cloud_checkpoints(
-                        dataset_id, fam_resolved, variant=variant),
+                    'cloud_checkpoints': ct.annotate_deployed_by_run(
+                        dataset_id, fam_resolved,
+                        [dict(c, run_source='cloud') for c in ct.cloud_checkpoints(
+                            dataset_id, fam_resolved, variant=variant)]),
                     # same saves grouped BY SOURCE RUN (id/status/gpu/cost/time)
                     # so the panel labels which run produced which epochs and
                     # deep-links each group back to its Runs row
-                    'cloud_checkpoint_groups': ct.cloud_checkpoint_groups(
-                        dataset_id, fam_resolved, variant=variant),
+                    'cloud_checkpoint_groups': cloud_groups,
                     'recommended_steps': lt.recommended_steps(
                         dataset_id, train_type=fam_resolved, variant=variant),
                     'recommended_steps_info': lt.recommended_steps_info(
@@ -401,8 +417,17 @@ def dataset_train_preflight(dataset_id):
     """Pre-launch sanity report (blockers + warnings): image floor per family,
     composition balance, caption quality, identity leaks, near-duplicates,
     untriaged images, VRAM. The TrainingPanel calls it before Train/Queue/
-    Schedule and turns warnings into ONE confirm."""
-    gate = _require_aitoolkit()
+    Schedule and turns warnings into ONE confirm.
+
+    `?lane=cloud` drops the rows that read THIS machine (GPU memory, torch build)
+    — they describe hardware that will not run a cloud job. Absent or `local`
+    returns the historical payload unchanged."""
+    # The gate follows the lane. A cloud-only install has no ai-toolkit, so the
+    # historical _require_aitoolkit() would 409 exactly where these warnings matter
+    # most (money is about to be spent) — and the caller treats a non-200 as "no
+    # objection", which would have made the whole cloud preflight a silent no-op.
+    lane = request.args.get('lane') or None
+    gate = _require_cloud() if lane == 'cloud' else _require_aitoolkit()
     if gate:
         return gate
     if not svc.get_dataset(LOCAL_USER, dataset_id):
@@ -411,7 +436,8 @@ def dataset_train_preflight(dataset_id):
         return jsonify({'ok': True, **lt.training_preflight(
             LOCAL_USER, dataset_id,
             train_type=request.args.get('train_type') or None,
-            variant=request.args.get('variant') or None)})
+            variant=request.args.get('variant') or None,
+            lane=lane)})
     except Exception as e:
         return _map_error(e)
 
@@ -438,6 +464,124 @@ def dataset_train_best_epoch(dataset_id):
         return jsonify({'ok': True, **lt.score_checkpoint_samples(LOCAL_USER, dataset_id, **kw)})
     except Exception as e:
         return _map_error(e)
+
+
+def _face_preview_kept(dataset_id):
+    """The kept set as PLAIN data — {path: (image_id, filename)} — plus a
+    fingerprint of it. Plain on purpose: the detection runs in a worker thread and
+    ORM rows must not travel across the session that loaded them."""
+    kept = (FaceDatasetImage.query
+            .filter_by(dataset_id=dataset_id, status='keep')
+            .filter(FaceDatasetImage.filename.isnot(None)).all())
+    by_path, stamps = {}, []
+    for img in kept:
+        p = os.path.join(svc._dataset_dir(dataset_id), img.filename)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue        # deleted under us — not part of what would be trained
+        by_path[p] = (img.id, img.filename)
+        stamps.append((img.id, img.filename, st.st_size, st.st_mtime_ns))
+    return by_path, fmp.fingerprint(stamps)
+
+
+def _face_preview_payload(results, by_path, limit):
+    """Fold a detection result map into what the panel draws.
+
+    The SAMPLE is deliberately failure-first: images where no face was found are
+    the instructive ones (profile, cropped, too small) — a preview of successes
+    only would hide exactly what the user needs to see. `coverage` is computed
+    over the WHOLE kept set regardless, because a partially masked set is the bad
+    case."""
+    missed = [p for p, r in results.items() if (r or {}).get('state') != 'masked']
+    found = [p for p, r in results.items() if (r or {}).get('state') == 'masked']
+    samples = [{'image_id': by_path[p][0], 'filename': by_path[p][1],
+                'state': (results[p] or {}).get('state'),
+                'boxes': (results[p] or {}).get('boxes') or []}
+               for p in (missed + found)[:limit] if p in by_path]
+    return {'samples': samples, 'coverage': face_mask.coverage_summary(results),
+            'expand': face_mask.expand_factor()}
+
+
+def _face_preview_guard(dataset_id, require_tool=True):
+    """Shared gate. Returns an error response, or None."""
+    ds = svc.get_dataset(LOCAL_USER, dataset_id)
+    if not ds:
+        return jsonify({'error': 'not found'}), 404
+    if not svc.is_concept(ds):
+        return jsonify({'ok': False, 'error': 'face masking is for concept datasets'}), 400
+    if require_tool and not face_mask.is_available():
+        # Degrade by SAYING SO, INSTANTLY. The option itself is disabled in the UI
+        # on the same capability, so this is the belt to that brace — and an install
+        # without face detection must hear it now, not after a timeout.
+        return jsonify({'ok': False, 'error': 'face detection unavailable',
+                        'reason': 'face_scoring'}), 409
+    return None
+
+
+@bp.post('/dataset/<int:dataset_id>/train/face-mask-preview')
+def dataset_face_mask_preview(dataset_id):
+    """START (or JOIN) the face detection behind the training panel's mask preview,
+    so it can draw what face masking would cover before anything is trained.
+
+    Detection only — no generation, no training, nothing written to disk.
+
+    Asynchronous on purpose. A blocking request could show nothing while it ran
+    (the InsightFace model load alone is tens of seconds before image 1) and could
+    not be rejoined: leaving the page threw the pass away and coming back offered
+    to start a second one. The job lives in face_mask_preview, so a second click —
+    or a return to the page — joins the pass in flight instead of duplicating it.
+
+    RAW boxes are returned, not grown ones: the expand factor is applied in the
+    browser (utils/faceMaskBox.js mirrors infer/face_mask_infer.dilate_box), so
+    dragging the slider redraws instantly instead of paying for another InsightFace
+    pass. One pass, then the knob is free."""
+    gate = _face_preview_guard(dataset_id)
+    if gate:
+        return gate
+    limit = max(1, min(12, int((request.get_json(silent=True) or {}).get('limit') or 6)))
+    by_path, fp = _face_preview_kept(dataset_id)
+    if not by_path:
+        # Nothing kept is a valid answer, not a job. Publish it so a return to the
+        # page shows the same thing rather than an inviting button.
+        fmp.set_result(dataset_id, _face_preview_payload({}, {}, limit), fp)
+        return jsonify({'ok': True, 'started': False, **fmp.snapshot(dataset_id, fp)})
+
+    paths = list(by_path)
+    app = current_app._get_current_object()
+
+    def _work(job):
+        data = face_mask.detect_faces(
+            paths, on_progress=lambda rec: fmp.progress(job, rec))
+        if not data.get('ok'):
+            # An operation that failed must LOOK failed. The reason travels all the
+            # way to the panel instead of dying in a log line.
+            fmp.fail(job, data.get('error') or 'face detection failed')
+            return
+        # Zero faces is a RESULT, not a failure: a concept dataset may legitimately
+        # hold no people. It publishes like any other pass.
+        fmp.set_result(dataset_id, _face_preview_payload(
+            data.get('results') or {}, by_path, limit), fp)
+
+    job, started = fmp.start(app, dataset_id, _work, total=len(paths), fp=fp)
+    return jsonify({'ok': True, 'started': started, **fmp.snapshot(dataset_id, fp)}), 202
+
+
+@bp.get('/dataset/<int:dataset_id>/train/face-mask-preview')
+def dataset_face_mask_preview_status(dataset_id):
+    """Rebind: the running pass (phase + i/M) and the last preview computed for
+    this dataset. Called on mount and while polling, so leaving the page and
+    coming back picks the pass back up instead of restarting it.
+
+    `result.stale` is the honest half: the stored preview describes the kept set
+    it was computed from, and if that set moved since, showing it as fresh would
+    be worse than showing nothing."""
+    gate = _face_preview_guard(dataset_id, require_tool=False)
+    if gate:
+        return gate
+    _, fp = _face_preview_kept(dataset_id)
+    return jsonify({'ok': True, 'available': face_mask.is_available(),
+                    **fmp.snapshot(dataset_id, fp)})
 
 
 @bp.get('/dataset/<int:dataset_id>/train/base-info')
@@ -517,6 +661,14 @@ def dataset_train_base_info(dataset_id):
                     # Slider LoRA mode (Beta) : état + prompts persistés + knobs résolus
                     # (colonne dédiée train_slider — jamais écrasé par un preset).
                     'slider': lt.effective_slider_settings(ds),
+                    # Can this machine actually train Anima? The arch is an ai-toolkit
+                    # EXTENSION, so an older checkout simply doesn't have it (the launch
+                    # refuses with a 400). Exposed here rather than in /api/capabilities
+                    # because the check walks the extensions tree: base-info is fetched
+                    # when the training panel opens, capabilities is polled every 30s.
+                    # The panel uses it to stay quiet instead of recommending Anima to
+                    # someone who cannot run it.
+                    'anima_supported': lt._aitoolkit_supports_anima(),
                     'bases_by_type': {'zimage': bases, 'sdxl': sdxl_bases,
                                       'krea': krea_bases, 'flux': flux_bases,
                                       'flux2klein': flux2klein_bases,
@@ -635,14 +787,19 @@ _STYLE_BUILTIN_PRESETS = [
     # style included"); weighted = the zimage arch default in options.ts and
     # the community's non-character recommendation.
     {
+        # id kept ('...-base') for saved references, but the recipe is the
+        # Z-Image ARCH DEFAULT (weighted timesteps), not a Base-only choice — so
+        # it now applies to every Z-Image variant (Turbo / Base / De-Turbo), like
+        # the FLUX.1 and SDXL style presets. Previously gated to ['base'], which
+        # left a Turbo Z-Image style dataset with no built-in style preset.
         'id': 'builtin-style-zimage-base',
-        'name': 'Z-Image · Style (Base)',
+        'name': 'Z-Image · Style',
         'train_type': 'zimage',
         'dataset_kind': 'style',
-        'variants': ['base'],
+        'variants': [],
         'builtin': True,
-        'description': 'Rank 32/32 with weighted timesteps (arch default) on '
-                       'the Base recipe; content-only probes so no hidden '
+        'description': 'Rank 32/32 with weighted timesteps (the Z-Image arch '
+                       'default, all variants); content-only probes so no hidden '
                        'trigger leaks into an always-on style.',
         'settings': _style_preset_settings(32, 32, timestep_type='weighted'),
     },
@@ -1230,6 +1387,41 @@ def dataset_train_cloud_purge():
     return jsonify({'ok': True, **ct.purge_finished_runs()})
 
 
+@bp.get('/dataset/train/cloud/staging-sizes')
+def dataset_train_cloud_staging_sizes():
+    """How much disk each cloud run's staging dir still holds, so the Runs hub can
+    show "8.2 GB on disk" on a card and name that weight in the per-run 🧹
+    confirmation. DELIBERATELY its own endpoint (and not a field of the runs
+    payload): sizing means walking thousands of files, which must not ride the
+    hub's 5 s poll. Optional ?run_ids=1,2,3 narrows the walk to the shown cards."""
+    raw = (request.args.get('run_ids') or '').strip()
+    ids = None
+    if raw:
+        try:
+            ids = [int(x) for x in raw.split(',') if x.strip()]
+        except ValueError:
+            return jsonify({'error': 'run_ids must be a comma-separated list of run ids'}), 400
+    sizes = ct.staging_sizes(ids)
+    return jsonify({'ok': True,
+                    'sizes': {str(k): v for k, v in sizes.items()},
+                    'total_bytes': sum(sizes.values())})
+
+
+@bp.post('/dataset/train/cloud/purge-run')
+def dataset_train_cloud_purge_run():
+    """Trash the staging dir of ONE finished cloud run — targeted cleanup, so a
+    45-run history no longer forces an all-or-nothing purge. Spares exactly what
+    the global purge spares (active runs, kept pods) via the shared rule."""
+    body = request.get_json(silent=True) or {}
+    if body.get('run_id') in (None, ''):
+        return jsonify({'error': 'run_id is required'}), 400
+    try:
+        res = ct.purge_run_staging(body['run_id'])
+    except Exception as e:
+        return _map_error(e)
+    return jsonify({'ok': True, **res})
+
+
 @bp.post('/dataset/<int:dataset_id>/train/import')
 def dataset_train_import(dataset_id):
     gate = _require_aitoolkit()
@@ -1422,6 +1614,45 @@ def dataset_train_cloud_continue():
     return jsonify({'ok': True, **res})
 
 
+@bp.post('/dataset/<int:dataset_id>/train/cloud/continue-local')
+def dataset_train_cloud_continue_local(dataset_id):
+    """▶ Continue d'un checkpoint LOCAL dans le CLOUD (voie « Cloud » de la modale
+    Continue, côté dataset) : le fichier du run local est semé sur un pod frais
+    (resume_ckpt_path) et le job vise step_de_reprise + extra_steps. Mêmes
+    garde-fous que tout launch cloud (clé vast.ai, budget, limite de runs actifs,
+    unicité par famille) — c'est un launch_cloud_training normal."""
+    gate = _require_cloud()
+    if gate:
+        return gate
+    if not svc.get_dataset(LOCAL_USER, dataset_id):
+        return jsonify({'error': 'not found'}), 404
+    d = request.get_json(silent=True) or {}
+    kw = {'extra_steps': d.get('extra_steps', 1000)}
+    if 'base_model' in d:
+        kw['base_model'] = d.get('base_model')
+    if d.get('variant'):
+        kw['variant'] = d.get('variant')
+    if d.get('train_type'):
+        kw['train_type'] = d.get('train_type')
+    if d.get('from_step') is not None:
+        kw['from_step'] = d.get('from_step')
+    if d.get('overrides') is not None:
+        kw['overrides'] = d.get('overrides')
+    if d.get('gpu_name'):
+        kw['gpu_name'] = d.get('gpu_name')
+    kw['masked'] = d.get('masked', True)
+    kw['allow_unverified_weights'] = bool(d.get('allow_unverified_weights'))
+    kw['allow_caption_mismatch'] = bool(d.get('allow_caption_mismatch'))
+    kw['allow_uncaptioned'] = bool(d.get('allow_uncaptioned'))
+    kw['allow_caption_quality'] = bool(d.get('allow_caption_quality'))
+    kw['allow_not_ready'] = bool(d.get('allow_not_ready'))
+    try:
+        res = ct.continue_local_run_in_cloud(LOCAL_USER, dataset_id, **kw)
+    except Exception as e:
+        return _map_error(e)
+    return jsonify({'ok': True, **res})
+
+
 @bp.get('/dataset/<int:dataset_id>/train/cloud/offers')
 def dataset_train_cloud_offers(dataset_id):
     """Live GPU speed tiers for the launch dialog (price/h + approx time+cost).
@@ -1480,13 +1711,75 @@ def dataset_train_run_lineage(record_id):
     return jsonify(tree)
 
 
+@bp.get('/dataset/train/runs/compare')
+def dataset_train_runs_compare():
+    """Everything that differs between two runs: recipe, dataset (added/removed
+    images, edited captions WITH their text, re-edited pixels) and the machine.
+
+    Query: `?a=<record_id>&b=<record_id>`. Deliberately its own read rather than
+    a fatter lineage payload — caption text is kilobytes per run and the graph
+    draws dozens of nodes. Unknown id → 404."""
+    from ..services import run_compare
+    try:
+        a = int(request.args.get('a', ''))
+        b = int(request.args.get('b', ''))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'two run ids are required'}), 400
+    out = run_compare.compare(a, b)
+    if out.get('error'):
+        return jsonify(out), 404
+    return jsonify(out)
+
+
+@bp.get('/dataset/runs/archive/<sig>')
+def dataset_run_archive_blob(sig):
+    """Serve an ARCHIVED training image by its content hash — the only way to
+    look at an image that has since been deleted from its dataset. Unknown or
+    never-archived hash → 404 (the panel then says the picture is unavailable
+    instead of showing a wrong one)."""
+    from flask import send_file
+    from ..services import run_archive
+    path = run_archive.path_for(sig)
+    if not path:
+        return jsonify({'error': 'not archived'}), 404
+    return send_file(path, max_age=31536000)
+
+
+@bp.get('/dataset/train/runs/<int:record_id>/deletion-impact')
+def dataset_train_run_deletion_impact(record_id):
+    """What deleting this run would take with it, counted — read by the
+    confirmation dialog so a destructive action is announced BEFORE it happens.
+
+    Returns checkpoint notes, preview links, generated images that would lose
+    their provenance (they are unlinked, never deleted), canvas positions,
+    children that would be detached, and archived source images this run is the
+    last referrer of. Unknown id → 404."""
+    impact = ct.run_deletion_impact(record_id)
+    if impact is None:
+        return jsonify({'error': 'unknown run'}), 404
+    return jsonify(impact)
+
+
 @bp.delete('/dataset/train/runs/<int:record_id>')
 def dataset_train_run_delete(record_id):
-    """Remove a GONE run (no checkpoints on disk) from the lineage graph — metadata
-    only: the record, its checkpoint notes, and its lineage edge (disk untouched;
-    the checkpoints are already gone). A run whose checkpoints are still on disk is
-    refused with 409 (delete those first) — never a silent erase. Children that
-    resumed from it are detached, not deleted. Unknown id → 404."""
+    """Remove a GONE run (no checkpoints on disk) from the lineage graph with
+    everything that only existed for it: the record, its checkpoint notes, its
+    preview links and its canvas position. Generated images are UNLINKED, not
+    deleted; archived source blobs are freed only when no other run references
+    them. A run whose checkpoints are still on disk is refused with 409 (delete
+    those first) — never a silent erase. Children that resumed from it are
+    detached, not deleted. Unknown id → 404.
+
+    `?cascade=1` is the OPT-IN destructive mode the run panel's "Delete run"
+    asks for: the checkpoints go to the trash, the generated images with them,
+    then the row. It is a query flag rather than a new default so no existing
+    caller of this route starts shredding files because the semantics moved
+    under it. Even then children are DETACHED, 👍 images and LoRAs already
+    deployed into ComfyUI are KEPT — see services.run_cascade_delete. A dataset
+    that is training right now → 409; a checkpoint that could not be moved →
+    409 with the counts of what did go, and the run row left in place."""
+    if (request.args.get('cascade') or '').lower() in ('1', 'true', 'yes'):
+        return _dataset_train_run_delete_cascade(record_id)
     status = ct.delete_run_record(record_id)
     if status == 'not_found':
         return jsonify({'error': 'unknown run'}), 404
@@ -1497,6 +1790,32 @@ def dataset_train_run_delete(record_id):
         return jsonify({'error': 'This run is still referenced and could not be '
                                  'removed. Refresh and try again.'}), 409
     return jsonify({'ok': True})
+
+
+def _dataset_train_run_delete_cascade(record_id):
+    """The `?cascade=1` branch. Split out so the conservative path above reads
+    exactly as it did — the two modes share a URL, never a body of code.
+
+    A PARTIAL result is an error (409), not a 200 with a sad number: the run row
+    is still there and its remaining weights are still on disk, so telling the
+    user "deleted" would be a lie he only discovers on the next refresh. The
+    message is already path-redacted by the service."""
+    from ..services import run_cascade_delete
+    out = run_cascade_delete.delete_run_cascade(record_id)
+    status = out.get('status')
+    if status == 'not_found':
+        return jsonify({'error': 'unknown run'}), 404
+    if status == 'training':
+        where = ('a cloud pod' if out.get('error') == 'cloud' else 'this dataset')
+        return jsonify({**out, 'error': f'{where} is training right now — stop the '
+                                        'run before deleting it.'}), 409
+    if status == 'partial':
+        return jsonify({**out, 'error': 'Some files could not be removed, so the run '
+                                        'was kept. ' + (out.get('error') or '')}), 409
+    if status == 'conflict':
+        return jsonify({**out, 'error': 'This run is still referenced and could not be '
+                                        'removed. Refresh and try again.'}), 409
+    return jsonify({**out, 'ok': True})
 
 
 @bp.put('/dataset/train/runs/<int:record_id>/note')
@@ -1580,8 +1899,18 @@ def dataset_train_cloud_progress(dataset_id):
 
 @bp.post('/dataset/train/cloud/stop')
 def dataset_train_cloud_stop():
+    """Stop a cloud run and report what really happened.
+
+    The answer is never a courtesy 'ok': when no monitor thread is in a state
+    to honour the request, request_stop terminates the pod itself, and if even
+    that fails the payload carries the instance id the user must destroy by
+    hand (HTTP stays 200 — the request was understood, the outcome is in the
+    body, which is what the UI renders)."""
     d = request.get_json(silent=True) or {}
-    return jsonify({'ok': ct.request_stop(d.get('run_id'))})
+    res = ct.request_stop(d.get('run_id'))
+    if not isinstance(res, dict):       # defensive: legacy bool contract
+        res = {'ok': bool(res)}
+    return jsonify(res)
 
 
 @bp.get('/dataset/<int:dataset_id>/train/cloud/sample/<path:filename>')
@@ -1653,6 +1982,207 @@ def dataset_train_checkpoint_file(dataset_id):
     if not path:
         abort(404)
     return send_file(path, as_attachment=True)
+
+
+@bp.get('/train/activity')
+def train_activity():
+    """🏋️ Live "something is training" signal for the nav indicator, local and
+    cloud. Ungated and free by design (one flag + one COUNT): every page polls
+    it, so it must never probe, touch the disk or reach the network. An
+    unconfigured cloud simply reports zero."""
+    return jsonify(ct.training_activity())
+
+
+@bp.get('/train/canvas/datasets')
+def train_canvas_datasets():
+    """◉ LoRA Canvas index: which datasets have runs worth drawing, how many, and
+    in which families. Cheap by design (no checkpoints, no disk) — the canvas
+    fetches each selected dataset's genealogy separately, so the board and its
+    filter appear immediately instead of after a full-library disk scan."""
+    return jsonify(ct.canvas_dataset_index(LOCAL_USER))
+
+
+@bp.post('/train/canvas/generate')
+def train_canvas_generate():
+    """◉ Generate from the LoRA Canvas — the same Test-Studio engine, driven by
+    the checkpoints ticked on the board instead of by a picker. Body:
+    {selections:[{dataset_id, checkpoint, record_id, step}], …every Studio
+    setting}. Selections MAY span several datasets (that is the point of the
+    canvas); they may NOT span several families — the engine refuses, and the
+    reason travels back so the button can say it. Same gates as the other launch
+    routes: ComfyUI not set up → 409/503, missing models/nodes → the actionable
+    409 the Studio already returns."""
+    from ._common import (_require_comfyui, _studio_arch_mismatch_response,
+                          _studio_missing_response)
+    gate = _require_comfyui()
+    if gate:
+        return gate
+    d = request.get_json(silent=True) or {}
+    try:
+        res = ct.canvas_generate(
+            LOCAL_USER, d.get('selections') or [],
+            strengths=d.get('strengths') or [1.0],
+            seed=d.get('seed'), prompt=d.get('prompt'), z_model=d.get('z_model'),
+            aspects=d.get('aspects'), cfgs=d.get('cfgs'), steps_list=d.get('steps'),
+            steps2_list=d.get('steps2'), count=d.get('count'),
+            permanent_loras=d.get('permanent_loras'), batch_loras=d.get('batch_loras'),
+            rebalance=d.get('rebalance'),
+            rebalance_strength=d.get('rebalance_strength'),
+            negative=d.get('negative'), sampler=d.get('sampler'),
+            scheduler=d.get('scheduler'), weight_dtype=d.get('weight_dtype'),
+            enhancer=d.get('enhancer'), enhancer_strength=d.get('enhancer_strength'),
+            detail_amount=d.get('detail_amount'),
+            resolution_tier=d.get('resolution_tier'),
+            resolution_multiplier=d.get('resolution_multiplier'),
+            init_image=d.get('init_image'), denoise=d.get('denoise'))
+    except Exception as e:
+        from ..services.lora_test_studio import StudioArchMismatch, StudioAssetsMissing
+        if isinstance(e, StudioArchMismatch):
+            return _studio_arch_mismatch_response(e)
+        if isinstance(e, StudioAssetsMissing):
+            return _studio_missing_response(e)
+        return _map_error(e)
+    return jsonify({'ok': True, **{k: res[k]
+                                   for k in ('created', 'seed', 'count', 'run_id')}})
+
+
+@bp.get('/train/checkpoint/<int:record_id>/<int:step>/images')
+def train_checkpoint_images(record_id, step):
+    """🖼 Everything this checkpoint ever generated, newest first — the gallery
+    the ◉ Canvas opens under a node. Reads the link written at generation time,
+    so it holds images made from any surface (Test Studio, canvas, comparison
+    grid). Open like the other Runs-hub reads; a checkpoint with no image simply
+    answers an empty list plus the `unlinked` counter."""
+    return jsonify(ct.checkpoint_gallery(
+        record_id, step, limit=request.args.get('limit', default=120, type=int)))
+
+
+@bp.post('/train/checkpoint/<int:record_id>/<int:step>/images/delete')
+def train_checkpoint_images_delete(record_id, step):
+    """🗑 Delete generated images from a checkpoint's gallery. Body:
+    {image_ids: [id, …]}.
+
+    A real delete: these rows are the Test Studio's cells, so they leave both
+    surfaces — the confirmation says so before arming the button. Files are
+    disposed of the recoverable way (OS recycle bin, else the app trash, else a
+    permanent unlink only when both refuse); the mode used rides back in the
+    answer, and `checkpoint_gallery` announces it beforehand. Ids not linked to
+    this checkpoint are refused rather than deleted, and per-image failures are
+    reported in `skipped` without aborting the batch — an empty selection is a
+    no-op, never an error."""
+    ids = (request.get_json(silent=True) or {}).get('image_ids') or []
+    if not isinstance(ids, list):
+        return jsonify({'error': 'image_ids must be a list'}), 400
+    try:
+        out = ct.delete_checkpoint_images(record_id, step, ids)
+    except OSError as e:
+        current_app.logger.warning('checkpoint gallery delete failed: %s', e)
+        return jsonify({'error': 'Could not delete these images — a file is '
+                                 'locked or unreachable. Try again.'}), 500
+    return jsonify({'ok': True, **out})
+
+
+@bp.get('/train/run/<int:record_id>/images')
+def train_run_images(record_id):
+    """🖼 Everything ONE RUN ever generated, grouped by checkpoint — the gallery
+    the ◉ Canvas opens on a run CARD. Shaped like the checkpoint one (same rows,
+    same `unlinked` footnote, same announced `delete_mode`), with `groups`
+    instead of a flat list: steps descending, the step-less group last.
+
+    Capped, and it says so: `per_step` images per checkpoint, `limit` overall,
+    with `truncated` per group and for the whole answer. A run with fourteen
+    checkpoints must not answer with a payload nobody can scroll."""
+    return jsonify(ct.run_gallery(
+        record_id,
+        limit=request.args.get('limit', default=None, type=int),
+        per_step=request.args.get('per_step', default=None, type=int)))
+
+
+@bp.post('/train/run/<int:record_id>/images/delete')
+def train_run_images_delete(record_id):
+    """🗑 Delete generated images from a RUN's gallery. Body: {image_ids: [id, …]}.
+
+    THE checkpoint delete with its scope widened (``step=None``) — same recycle
+    bin, same refusal of ids that belong elsewhere, same per-image `skipped`
+    report. Ids outside this run are refused, so widening the scope to a run
+    never widens it to the library."""
+    ids = (request.get_json(silent=True) or {}).get('image_ids') or []
+    if not isinstance(ids, list):
+        return jsonify({'error': 'image_ids must be a list'}), 400
+    try:
+        out = ct.delete_checkpoint_images(record_id, None, ids)
+    except OSError as e:
+        current_app.logger.warning('run gallery delete failed: %s', e)
+        return jsonify({'error': 'Could not delete these images — a file is '
+                                 'locked or unreachable. Try again.'}), 500
+    return jsonify({'ok': True, **out})
+
+
+@bp.get('/train/canvas/positions')
+def train_canvas_positions():
+    """◉ LoRA Canvas: every remembered card position, grouped by dataset id.
+    One request for the whole board — the lanes need their overrides before the
+    first paint, and N round-trips for a few dozen tiny rows would cost more
+    than the genealogy fetches they precede."""
+    return jsonify(ct.canvas_positions(LOCAL_USER))
+
+
+@bp.put('/dataset/<int:dataset_id>/canvas/positions')
+def dataset_canvas_positions_save(dataset_id):
+    """Remember where cards sit in ONE lane. Body: {positions:[{record_id,x,y}]}.
+    Upsert, so re-sending the same coordinates is a no-op — the canvas re-pins a
+    lane whenever it gains a run."""
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(ct.save_canvas_positions(
+            LOCAL_USER, dataset_id, data.get('positions')))
+    except LookupError:
+        return jsonify({'error': 'not found'}), 404
+
+
+@bp.delete('/dataset/<int:dataset_id>/canvas/positions')
+def dataset_canvas_positions_clear(dataset_id):
+    """✦ Tidy up one lane: forget every dragged position and fall back to the
+    automatic tree."""
+    try:
+        return jsonify(ct.clear_canvas_positions(LOCAL_USER, dataset_id))
+    except LookupError:
+        return jsonify({'error': 'not found'}), 404
+
+
+@bp.get('/train/canvas/images')
+def train_canvas_images():
+    """🖼 Every image pinned on the ◉ LoRA Canvas, grouped by dataset id, with
+    the image row alongside its geometry — one request for the whole board, like
+    the card positions it sits next to. Rows whose image is gone are pruned
+    server-side rather than answered."""
+    return jsonify(ct.canvas_image_nodes(LOCAL_USER))
+
+
+@bp.put('/dataset/<int:dataset_id>/canvas/images')
+def dataset_canvas_images_save(dataset_id):
+    """Remember pinned images of ONE lane.
+    Body: {nodes:[{image_id,x,y,w,h,visible}]}.
+
+    Closing a pinned image is this call with ``visible: false`` — the geometry
+    stays, so re-opening puts the picture back exactly where and at the size it
+    was closed at."""
+    data = request.get_json(silent=True) or {}
+    try:
+        return jsonify(ct.save_canvas_image_nodes(
+            LOCAL_USER, dataset_id, data.get('nodes')))
+    except LookupError:
+        return jsonify({'error': 'not found'}), 404
+
+
+@bp.delete('/dataset/<int:dataset_id>/canvas/images')
+def dataset_canvas_images_clear(dataset_id):
+    """Forget every pinned image of one lane, geometry included. Deliberately
+    NOT what ✦ Tidy up calls — see clear_canvas_image_nodes."""
+    try:
+        return jsonify(ct.clear_canvas_image_nodes(LOCAL_USER, dataset_id))
+    except LookupError:
+        return jsonify({'error': 'not found'}), 404
 
 
 @bp.get('/dataset/<int:dataset_id>/train/lineage')

@@ -20,6 +20,7 @@ import os
 from ..extensions import db
 from ..models import FaceDatasetImage, TrainingRunRecord
 from . import face_dataset_service as fds
+from . import run_archive, run_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,24 @@ def _file_hash(dataset_id, filename) -> str:
         return '-'
 
 
-def dataset_manifest(dataset_id) -> list:
-    """[[image_id, caption_hash, file_hash], ...] of the KEPT images, id-sorted."""
-    rows = (FaceDatasetImage.query
+def kept_images(dataset_id) -> list:
+    """The KEPT image rows of a dataset, id-sorted — the exact set a launch
+    trains on. Returned so the manifest and the full snapshot are built from ONE
+    read of the dataset and can never disagree about what was in it."""
+    return (FaceDatasetImage.query
             .filter_by(dataset_id=dataset_id, status='keep')
             .order_by(FaceDatasetImage.id.asc()).all())
+
+
+def dataset_manifest(dataset_id, rows=None) -> list:
+    """[[image_id, caption_hash, file_hash], ...] of the KEPT images, id-sorted.
+
+    `file_hash` stays the cheap `size:mtime` proxy on purpose: this list feeds
+    `fingerprint_of()`, and every dataset version already stored in every
+    existing database is keyed on it. The TRUE content hash lives in the run
+    snapshot (`run_snapshot`), where it can improve the diff without renumbering
+    everybody's versions."""
+    rows = kept_images(dataset_id) if rows is None else rows
     return [[r.id, _caption_hash(r.caption), _file_hash(dataset_id, r.filename)]
             for r in rows]
 
@@ -74,20 +88,71 @@ def manifest_diff(old, new) -> dict:
             'captions_changed': captions, 'images_edited': edited}
 
 
+def prepare_launch(user_id, dataset_id, base_model=None):
+    """All the READING a launch registration needs, done BEFORE any lock or
+    transaction: the kept-image rows, the manifest, and the full freeze
+    (captions, per-image content hashes, environment).
+
+    Split out of `register_launch` for one reason: hashing images and probing the
+    environment is file I/O measured in tenths of a second, and the local launch
+    path calls the registry while holding `_queue_lock` — the same launch path
+    that lost cloud runs to `database is locked`. Everything slow happens here,
+    outside; the write is one short commit.
+
+    Returns an opaque dict for `register_launch(prepared=...)`, or None when the
+    dataset is gone. Never raises."""
+    try:
+        ds = fds.get_dataset(user_id, dataset_id)
+        if ds is None:
+            return None
+        rows = kept_images(dataset_id)
+        manifest = dataset_manifest(dataset_id, rows)
+        try:
+            from .. import config as cfg
+            images_dir = str(cfg.dataset_images_root() / str(dataset_id))
+        except Exception:
+            images_dir = ''
+        snapshot, sig_updates = run_snapshot.build(
+            ds, rows, images_dir, base_model=base_model)
+        # The archive plan is materialised HERE, as plain tuples, while the ORM
+        # rows are still live: the background archiver runs after the commit,
+        # where touching an expired row would fire a query per image from a
+        # thread that owns no session.
+        sigs = (snapshot or {}).get('images') or {}
+        plan = []
+        for r in rows:
+            sig = (sigs.get(str(r.id)) or {}).get('c')
+            if sig and r.filename:
+                plan.append((os.path.join(images_dir, r.filename), sig, r.filename))
+        return {'ds': ds, 'manifest': manifest, 'snapshot': snapshot,
+                'sig_updates': sig_updates, 'archive': plan}
+    except Exception:
+        logger.exception('launch snapshot preparation failed (launch continues)')
+        return None
+
+
 def register_launch(user_id, dataset_id, family, source, base_model='',
                     variant=None, masked=True, steps=None, cloud_run_id=None,
-                    settings=None, parent_record_id=None, resumed_from=None):
+                    settings=None, parent_record_id=None, resumed_from=None,
+                    prepared=None):
     """Record a training launch and return its TrainingRunRecord (or None on
     failure — provenance must never block a launch).
 
     ``parent_record_id``/``resumed_from`` are set only by a CONTINUATION (the
     record this launch resumed from, and the step it resumed at) — the lineage
-    edge the Runs-hub genealogy tree draws. Both NULL on a fresh launch."""
+    edge the Runs-hub genealogy tree draws. Both NULL on a fresh launch.
+
+    ``prepared`` is the result of `prepare_launch` when the caller did the
+    reading up front (both real launch paths do). Without it the reading happens
+    here, which is correct but holds whatever lock the caller is under."""
     try:
-        ds = fds.get_dataset(user_id, dataset_id)
-        if ds is None:
+        if prepared is None:
+            prepared = prepare_launch(user_id, dataset_id, base_model=base_model)
+        if prepared is None:
             return None
-        manifest = dataset_manifest(dataset_id)
+        ds = prepared['ds']
+        manifest = prepared['manifest']
+        snapshot = prepared.get('snapshot') or {}
         fp = fingerprint_of(manifest, ds.trigger_word, getattr(ds, 'kind', ''))
         same = (TrainingRunRecord.query
                 .filter_by(dataset_id=dataset_id, family=family, fingerprint=fp)
@@ -105,9 +170,19 @@ def register_launch(user_id, dataset_id, family, source, base_model='',
             variant=variant, masked=bool(masked), steps=steps,
             settings=json.dumps(settings) if settings else None,
             fingerprint=fp, manifest=json.dumps(manifest), version=version,
+            snapshot=json.dumps(snapshot, separators=(',', ':')) if snapshot else None,
             parent_record_id=parent_record_id, resumed_from=resumed_from)
         db.session.add(rec)
+        # The freshly computed image content hashes ride along in the SAME
+        # transaction as the record — one short write, never a second one racing
+        # the launch for the database lock.
+        for row, sig, stat in (prepared.get('sig_updates') or ()):
+            row.content_sig = sig
+            row.content_sig_stat = stat
         db.session.commit()
+        # Archiving copies files; it happens AFTER the commit, off the launch
+        # path, and its failure is invisible to the run.
+        run_archive.archive_async(prepared.get('archive'))
         return rec
     except Exception:
         logger.exception('training run registration failed (launch continues)')
@@ -130,6 +205,43 @@ def newest_record_for(dataset_id, family, base_model='', variant=None):
     if variant is not None:
         q = q.filter_by(variant=variant)
     return q.order_by(TrainingRunRecord.id.desc()).first()
+
+
+def record_by_id(record_id):
+    """One record by primary key, or None. The counterpart of the `record_id`
+    stamp list_checkpoints puts on every save: a continuation resolves its
+    lineage parent from the file it actually resumes, not from whichever record
+    happens to be the newest."""
+    if record_id is None:
+        return None
+    try:
+        return db.session.get(TrainingRunRecord, int(record_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def network_geometry(rec):
+    """The LoRA's FIXED shape as a record trained it: {'rank': int, 'alpha': int}
+    with only the keys that were recorded. Rank and alpha size the LoRA matrices,
+    so they are a property of the weights, never a choice a continuation gets to
+    make — resuming rank-32 weights into a rank-64 network cannot load. Empty
+    dict for a legacy/unparsable record: unknown geometry must not be enforced."""
+    out = {}
+    if rec is None or not getattr(rec, 'settings', None):
+        return out
+    try:
+        cfg = json.loads(rec.settings)
+    except (ValueError, TypeError):
+        return out
+    if not isinstance(cfg, dict):
+        return out
+    for key in ('rank', 'alpha'):
+        val = cfg.get(key)
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, int) and val > 0:
+            out[key] = val
+    return out
 
 
 def resolve_lineage(record_id):

@@ -102,7 +102,7 @@ def test_style_builtin_catalogue_has_researched_family_settings(client):
     styles = {p['id']: p for p in listed if p.get('dataset_kind') == 'style'}
     assert styles['builtin-style-krea-raw']['variants'] == ['base', 'raw']
     assert styles['builtin-style-klein-base']['variants'] == ['4b', '9b']
-    assert styles['builtin-style-zimage-base']['variants'] == ['base']
+    assert styles['builtin-style-zimage-base']['variants'] == []
     expected = {
         'builtin-style-krea-raw': (32, 32, '768,1024', 'linear'),
         'builtin-style-klein-base': (32, 32, '768,1024', 'weighted'),
@@ -166,13 +166,17 @@ _QUICK_PRESET_MATRIX = {
     ('flux', 'concept'): 'builtin-concept-flux1',
     ('flux2klein', 'concept'): 'builtin-concept-klein',
     ('qwen_image', 'concept'): 'builtin-concept-qwen_image',
+    # Anima ships Character + Concept only (Style is out of scope for this family;
+    # it trains and deploys, no per-family style recipe yet).
+    ('anima', 'character'): 'builtin-character-anima',
+    ('anima', 'concept'): 'builtin-concept-anima',
 }
 
 
 def test_quick_preset_catalogue_covers_every_family_and_kind(client):
     listed = client.get('/api/train/presets').get_json()['presets']
     builtins = [p for p in listed if p.get('builtin')]
-    assert len(builtins) == 18
+    assert len(builtins) == 20
     coverage = {(p['train_type'], p['dataset_kind']): p['id'] for p in builtins}
     assert coverage == _QUICK_PRESET_MATRIX
     for p in builtins:
@@ -185,7 +189,7 @@ def test_quick_preset_catalogue_covers_every_family_and_kind(client):
 
 
 def test_every_quick_preset_applies_by_id_with_announced_values(client, app):
-    """Apply each of the 15 by preset_id on a dataset of ITS family and kind:
+    """Apply each of the 17 by preset_id on a dataset of ITS family and kind:
     the scope check passes, nothing is ignored/rejected, and the STORED raw
     settings reproduce the announced settings dict exactly."""
     listed = client.get('/api/train/presets').get_json()['presets']
@@ -258,8 +262,8 @@ def test_builtin_scope_mismatches_never_mutate_dataset(client, app):
         ('krea', None, 'base', 'builtin-style-krea-raw'),
         # family mismatch
         ('zimage', 'style', 'base', 'builtin-style-krea-raw'),
-        # variant mismatch
-        ('zimage', 'style', 'turbo', 'builtin-style-zimage-base'),
+        # variant mismatch (Krea style is scoped to base/raw, not turbo)
+        ('krea', 'style', 'turbo', 'builtin-style-krea-raw'),
     ]
     for idx, (family, kind, variant, preset_id) in enumerate(cases):
         ds_id = _create_ds(client, name=f'Scope {idx}', trigger=f'scope{idx}',
@@ -278,8 +282,10 @@ def test_builtin_scope_mismatches_never_mutate_dataset(client, app):
             from app.services import lora_training as lt
             assert lt.snapshot_train_settings('local', ds_id) == {'rank': 64}
 
-    # With no requested variant, the persisted/default Turbo selection remains
-    # authoritative; omitting the field cannot sneak the Base recipe through.
+    # The Z-Image style preset is now variant-agnostic (weighted timesteps are the
+    # Z-Image arch default, not a Base-only choice), so applying it with no
+    # requested variant SUCCEEDS on a Turbo-default dataset — a Turbo Z-Image
+    # style dataset is no longer left with no built-in style preset.
     ds_id = _create_ds(client, name='Scope absent', trigger='scope_absent',
                        train_type='zimage', kind='style')
     with app.app_context():
@@ -289,11 +295,10 @@ def test_builtin_scope_mismatches_never_mutate_dataset(client, app):
         'preset_id': 'builtin-style-zimage-base',
         'train_type': 'zimage',
     })
-    assert r.status_code == 409
-    assert r.get_json()['error_code'] == 'PRESET_SCOPE'
+    assert r.status_code == 200
     with app.app_context():
         from app.services import lora_training as lt
-        assert lt.snapshot_train_settings('local', ds_id) == {'rank': 64}
+        assert lt.snapshot_train_settings('local', ds_id)['rank'] == 32
 
 
 def test_numeric_preset_family_mismatch_is_409_without_mutation(client, app):

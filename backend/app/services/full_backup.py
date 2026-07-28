@@ -49,6 +49,7 @@ from typing import Callable, Optional
 from .. import config as cfg
 from ..extensions import db
 from . import face_dataset_service as svc
+from . import run_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,12 @@ _LORAS_PREFIX = 'loras/'
 # future cloud run on the new machine. Restore nulls it (the run still shows as a
 # ☁ cloud launch via `source`, with its settings snapshot intact).
 _RUN_FIELDS = ('dataset_id', 'family', 'source', 'base_model', 'variant',
-               'masked', 'steps', 'fingerprint', 'manifest', 'settings', 'version')
+               'masked', 'steps', 'fingerprint', 'manifest', 'settings', 'version',
+               # The full launch freeze. Only its id-free half is REPLAYED on
+               # restore (run_snapshot.portable): a restore allocates fresh image
+               # ids, so carrying captions keyed by the source machine's ids would
+               # attach one run's caption to a different picture.
+               'snapshot')
 
 # A .safetensors compresses to ~nothing but costs real CPU to deflate at 100s of
 # MB — matched by the STORED per-dataset entries.
@@ -622,6 +628,7 @@ def _restore_runs(z, names, id_map) -> int:
             fingerprint=str(fingerprint)[:16],
             manifest=(r.get('manifest') if isinstance(r.get('manifest'), str) else None),
             settings=(r.get('settings') if isinstance(r.get('settings'), str) else None),
+            snapshot=run_snapshot.portable(r.get('snapshot')),
             version=version)
         if created_at is not None:
             rec.created_at = created_at

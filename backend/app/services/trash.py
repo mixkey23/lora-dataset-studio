@@ -118,6 +118,51 @@ def send_to_trash(path, context='') -> str:
     raise last_err if last_err is not None else OSError(f'could not trash {src}')
 
 
+def disposal_mode() -> str:
+    """Where a deleted file WOULD go, without deleting anything, so a
+    confirmation can NAME the outcome before the click. Mirrors :func:`dispose`'s
+    preference order. 'trash' = the OS recycle bin, 'app_trash' = data/trash.
+    A permanent removal is never predicted: it only happens when both refuse."""
+    try:
+        import send2trash          # noqa: F401  (probe only)
+    except Exception:
+        return 'app_trash'
+    return 'trash'
+
+
+def dispose(path, context='') -> str:
+    """Get a file out of the user's folder, keeping it recoverable.
+
+    Order of preference: the OS trash (send2trash — real, familiar, restores in
+    place), then the app's own trash (a MOVE into data/trash, recoverable until
+    the user empties it from Settings). A permanent unlink is the last resort,
+    when neither can take the file. send2trash is an OPTIONAL dependency and is
+    absent from a default install, so the app trash is the branch most people
+    actually get — destroying a user's images with no way back was never an
+    acceptable default. Returns the mode used: 'trash' | 'app_trash' | 'delete'.
+
+    Lives here rather than next to one caller because it is the app-wide answer
+    to "the user asked for this file to go away": the image bank's rejected
+    sweep and the checkpoint gallery both owe the same guarantee, and a second
+    copy of it would be a second place to forget the fallback."""
+    try:
+        from send2trash import send2trash   # optional dependency
+    except Exception:
+        pass
+    else:
+        send2trash(path)
+        return 'trash'
+    try:
+        send_to_trash(path, context=context)
+        return 'app_trash'
+    except OSError:
+        # Cross-device copy refused, locked file, unwritable trash… the file is
+        # still in the user's folder at this point, so a plain remove is the only
+        # way to honour the request. It raises on its own failure.
+        os.remove(path)
+        return 'delete'
+
+
 def open_trash_folder() -> str:
     """Open the fixed app trash directory in the host file explorer."""
     path = str(trash_root())

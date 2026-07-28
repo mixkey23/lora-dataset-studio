@@ -233,6 +233,53 @@ test('edge falls back to the card edge when no pill matches the resume step', ()
   assert.ok(Math.abs(Number(start[1]) - (parent.x + CARD_W)) < 0.01); // card right edge
 });
 
+test('a resume whose source pill is GONE is still a drawn, superseded edge', () => {
+  /* The Estelle shape: a 3500-step parent whose saves past 2000 were cleaned,
+     and a child that resumed at 2500. The pill it resumed from no longer
+     exists — the edge must still leave the parent CARD (never vanish), and stay
+     flagged superseded so the renderer paints it in its own colour. Reported as
+     "the edge is missing"; it was there, just painted at 12% opacity. */
+  const g = buildLineageGraph({
+    root_id: 1, current_id: 2,
+    nodes: [
+      { record_id: 1, parent_record_id: null, steps: 3500,
+        checkpoints: [ck(1500), ck(2000)] },
+      { record_id: 2, parent_record_id: 1, resumed_from: 2500, steps: 3000,
+        is_current: true, checkpoints: [ck(2750), ck(3000)] },
+    ],
+    edges: [{ parent: 1, child: 2, resumed_from: 2500, superseded: true }],
+  });
+  assert.equal(g.edges.length, 1);
+  const edge = g.edges[0];
+  assert.equal(edge.superseded, true);
+  assert.equal(edge.anchoredStep, null);          // no pill to anchor on
+  assert.equal(edge.onSpine, true);               // root → current
+  assert.ok(/^M[\d.]+,[\d.]+ C/.test(edge.d));    // a real path, not empty
+  const parent = g.nodes.find((n) => n.node.record_id === 1);
+  const start = edge.d.match(/^M([\d.]+),/);
+  assert.ok(Math.abs(Number(start[1]) - (parent.x + CARD_W)) < 0.01);
+});
+
+test('a flat edge never has a zero-height bounding box', () => {
+  /* An objectBoundingBox gradient — which is what every lineage edge is painted
+     with — is not rendered when the geometry's bbox has zero height. A plain
+     parent→child chain is exactly horizontal, so its edge disappeared entirely.
+     The path must therefore end at a different y than it started. */
+  const g = buildLineageGraph({
+    root_id: 1, current_id: 2,
+    nodes: [
+      { record_id: 1, parent_record_id: null },
+      { record_id: 2, parent_record_id: 1, is_current: true },
+    ],
+    edges: [{ parent: 1, child: 2 }],
+  });
+  const m = g.edges[0].d.match(
+    /^M([\d.]+),([\d.]+) C([\d.]+),([\d.]+) ([\d.]+),([\d.]+) ([\d.]+),([\d.]+)$/);
+  const [y1, y2] = [Number(m[2]), Number(m[8])];
+  assert.notEqual(y1, y2);
+  assert.ok(Math.abs(y2 - y1) <= 1);                   // …and imperceptibly so
+});
+
 // --- 🔍 big-preview mode (adaptive geometry) --------------------------------
 
 test('graphMetrics: compact is the default, big enlarges the tiles', () => {
@@ -264,6 +311,45 @@ test('big-preview mode sizes the pills up and grows the cell height', () => {
   // The taller tiles make the cell (and the whole graph) taller than compact.
   assert.ok(big.nodes[0].cellH > compact.nodes[0].cellH);
   assert.ok(big.height > compact.height);
+});
+
+test('a deployed pill keeps the name of its ComfyUI copy', () => {
+  // Regression: the layout used to drop `deployed_filename`, which is the ONLY
+  // handle the popover has on the deployed copy — so ⏏ Undeploy (and the 🗑 it
+  // grew out of) silently disappeared from every deployed pill, whatever the
+  // server sent. The field must survive the pill build.
+  const g = buildLineageGraph({
+    root_id: 1, current_id: 1, single: true,
+    nodes: [{ record_id: 1, parent_record_id: null, is_current: true,
+      checkpoints: [
+        ck(1000),
+        ck(1500, { testable: true, deployed_filename: 'z image/lora_nova_000001500_rc96_v1.safetensors' }),
+      ] }],
+    edges: [],
+  });
+  const [plain, deployed] = g.nodes[0].checkpoints;
+  assert.equal(deployed.testable, true);
+  assert.equal(deployed.deployed_filename, 'z image/lora_nova_000001500_rc96_v1.safetensors');
+  assert.equal(plain.deployed_filename, null);   // never invented for a plain pill
+});
+
+test('a pill keeps the SIZE of its gallery, not only its newest preview', () => {
+  // Same trap as deployed_filename, hit again while building the canvas gallery:
+  // the server sent `preview_count`, this layer did not copy it onto the pill,
+  // and the × N badge was invisible everywhere with nothing failing. The pill
+  // objects ARE what the renderers read — a field missing here does not exist.
+  const g = buildLineageGraph({
+    root_id: 1, current_id: 1, single: true,
+    nodes: [{ record_id: 1, parent_record_id: null, is_current: true,
+      checkpoints: [
+        ck(1000),
+        ck(2000, { preview_count: 4, preview_url: '/api/dataset/1/img/a.png' }),
+      ] }],
+    edges: [],
+  });
+  const [plain, withGallery] = g.nodes[0].checkpoints;
+  assert.equal(withGallery.preview_count, 4);
+  assert.equal(plain.preview_count, 0);          // absent → 0, never undefined
 });
 
 test('empty / missing payloads return a safe empty shape', () => {

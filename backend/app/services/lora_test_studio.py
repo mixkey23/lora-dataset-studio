@@ -127,34 +127,104 @@ _ASPECT_TO_TIER_RATIO = {
 }
 
 
-def _aspect_dims(aspect, train_type=None, resolution_tier=None):
+def _aspect_dims(aspect, train_type=None, resolution_tier=None, resolution_multiplier=1.0):
     """(width, height) d'un format. Si `resolution_tier` (fast|standard|hq|max) est fourni,
-    délègue à `compute_tier_dims` (ratio nommé + mégapixels du palier, comme Generate) ;
-    sinon table fixe par famille (SDXL côté long ≤1024, sinon table Z-Image historique).
-    Format inconnu → défaut. SDXL + palier : on re-borne le côté long à 1024 (bande
-    SDXL-safe, multiples de 64) car compute_tier_dims monte jusqu'à 1536 (safe Z-Image,
-    déforme les merges/DMD SDXL)."""
+    délègue à `compute_tier_dims` (ratio nommé + mégapixels du palier, comme Generate),
+    avec le multiplicateur de résolution (1.0–1.9, clampé, défaut 1.0 = palier inchangé) ;
+    sinon table fixe par famille (SDXL côté long ≤1024, sinon table Z-Image historique -
+    le multiplicateur n'agit QUE sur le chemin par palier, pas sur les tables legacy).
+    Format inconnu → défaut. SDXL + palier : on re-borne le côté long à 1024×multiplicateur
+    (la bande SDXL-safe monte aussi avec le multiplicateur, multiples de 64) car
+    compute_tier_dims monte jusqu'à 1536 (safe Z-Image, déforme les merges/DMD SDXL)."""
     if resolution_tier in RESOLUTION_TIERS:
         named = _ASPECT_TO_TIER_RATIO.get(aspect)
         if named:
-            from ..utils.resolution import compute_tier_dims
-            w, h = compute_tier_dims(named, resolution_tier)
+            from ..utils.resolution import clamp_multiplier, compute_tier_dims
+            w, h = compute_tier_dims(named, resolution_tier, resolution_multiplier)
             if (train_type or '').lower() == 'sdxl':
+                # Plafond SDXL mis à l'échelle du multiplicateur, sinon celui-ci serait
+                # silencieusement écrasé (le front affiche déjà 1024×mult pour SDXL).
+                ceiling = 1024.0 * clamp_multiplier(resolution_multiplier)
                 longest = max(w, h)
-                if longest > 1024:
-                    sc = 1024.0 / longest
+                if longest > ceiling:
+                    sc = ceiling / longest
                     w = max(64, int(round(w * sc / 64)) * 64)
                     h = max(64, int(round(h * sc / 64)) * 64)
             return w, h
     table = TEST_ASPECTS_SDXL if (train_type or '').lower() == 'sdxl' else TEST_ASPECTS
     return table.get(aspect, table[DEFAULT_ASPECT])
 
-# Axes optionnels CFG / steps (Z-Image Turbo : défaut cfg=1.0, 8 steps). Tester
-# plusieurs valeurs aide à trouver le réglage qui tient le mieux l'identité.
+# Axes optionnels CFG / steps. Le défaut de la FAMILLE reste le réglage distillé
+# (cfg=1.0, 8 steps) : c'est ce que valent Z-Image Turbo, Krea 2 Turbo et les
+# checkpoints SDXL DMD-distillés que le studio teste. Tester plusieurs valeurs aide
+# à trouver le réglage qui tient le mieux l'identité.
 DEFAULT_CFG = 1.0
 DEFAULT_STEPS = 8
-CFG_CHOICES = [1.0, 1.5, 2.0, 2.5, 3.0]
-STEPS_CHOICES = [6, 8, 10, 12, 16, 20, 24, 32, 40]
+# Additive only — these lists are echoed into the Studio pickers and a value that
+# disappears would strand a persisted selection. 3.5/4.0/5.0 and 30/50 exist so the
+# NON-distilled Z-Image Base defaults below are reachable from the picker at all.
+CFG_CHOICES = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+STEPS_CHOICES = [6, 8, 10, 12, 16, 20, 24, 30, 32, 40, 50]
+
+# --- Per-BASE-MODEL sampler defaults (bobba84, GitHub #18) --------------------
+# Z-Image ships in two flavours that need opposite sampler settings, and the app
+# used to hand both the same one: picking "Z-Image Base" in the Test Studio landed
+# on cfg 1 / 8 steps, which are Turbo's numbers. Turbo is guidance-DISTILLED — cfg 1
+# is correct there and ruinous on Base, where it means "no guidance at all". A user
+# trying Base with those settings concludes the model is bad.
+#
+# PROVENANCE OF THE BASE NUMBERS: ComfyUI's own Z-Image day-0 announcement states
+# Z-Image-Base "requires 30-50 steps with cfg 3~5 for optimal quality". We take the
+# CONSERVATIVE end of the step range (30, the cheapest of the recommended window)
+# and the middle of the cfg range (4.0). These are documented starting points, NOT
+# values this project measured — they are defaults for an axis the user can and
+# should sweep, which is the entire point of the Studio grid.
+ZIMAGE_TURBO_DEFAULTS = {'cfg': DEFAULT_CFG, 'steps': DEFAULT_STEPS}
+ZIMAGE_BASE_DEFAULTS = {'cfg': 4.0, 'steps': 30}
+
+# Whole-word phrases (see zimage_model_resolver._phrase: separators and case are
+# normalised away) that identify a build. Distilled markers are checked FIRST, so a
+# name carrying both stays on today's behaviour rather than flipping to slow+guided.
+_ZIMAGE_DISTILLED_PHRASES = ('turbo', 'zt1', 'zt2', 'zt3', 'distill', 'distilled',
+                             'lightning', 'lightx2v', 'step')
+_ZIMAGE_BASE_PHRASES = ('base', 'deturbo', 'de turbo', 'raw')
+
+
+def zimage_build_of(model_name) -> str:
+    """'turbo' | 'base' | 'unknown' for a Z-Image UNET filename, read from its NAME —
+    the only signal available, since these are loose files a user downloaded. 'unknown'
+    deliberately keeps the historical Turbo defaults: the overwhelming majority of
+    Z-Image checkpoints in the wild are Turbo finetunes, and changing the defaults for
+    an unrecognised name would be a regression for everyone who is fine today."""
+    from .zimage_model_resolver import _phrase
+    key = _phrase(_basename(model_name))
+    if any(f' {p} ' in key for p in _ZIMAGE_DISTILLED_PHRASES):
+        return 'turbo'
+    if any(f' {p} ' in key for p in _ZIMAGE_BASE_PHRASES):
+        return 'base'
+    return 'unknown'
+
+
+def zimage_model_defaults(model_name) -> dict:
+    """{'cfg', 'steps'} for ONE Z-Image base model. Turbo/unknown -> today's values."""
+    return dict(ZIMAGE_BASE_DEFAULTS if zimage_build_of(model_name) == 'base'
+                else ZIMAGE_TURBO_DEFAULTS)
+
+
+def studio_model_defaults(family, models) -> dict:
+    """{model_value: {'cfg', 'steps'}} for the bases the Studio offers, so the front
+    can seed its axes from the SELECTED base instead of one family-wide constant.
+    Only Z-Image differentiates today (SDXL/Krea return nothing and keep
+    `default_cfg`/`default_steps`); the shape is per-family on purpose so the next
+    family that needs it has nowhere else to put it."""
+    if (family or '').lower() != 'zimage':
+        return {}
+    out = {}
+    for m in models or []:
+        value = m.get('value') if isinstance(m, dict) else m
+        if value:
+            out[value] = zimage_model_defaults(value)
+    return out
 
 
 def _basename(path: str) -> str:
@@ -541,8 +611,12 @@ def describe_test_prompt(image_bytes: bytes) -> str:
     """Describe an uploaded image into a ready-to-paste Studio TEST PROMPT via the
     Ollama vision model (the same abliterated Qwen3-VL the app captions with, so NSFW
     passes). Resizes to <=1024 long side (like captioning) before the call, force-starts
-    a stopped LOCAL Ollama, and unloads the model right after (keep_alive=0) so ComfyUI
-    gets its VRAM back for the next generation.
+    a stopped LOCAL Ollama. Whether the model stays resident afterwards is decided by
+    CONTENTION (services/vision_keepalive.py): with a generation queued or a training
+    running, ComfyUI gets its VRAM back immediately, exactly as before; on an otherwise
+    idle card the model is leased warm so describing several images in a row doesn't pay
+    the 12.8 s cold load every time. The lease is revoked the moment the queue picks up
+    a job.
 
     Raises ValueError on a missing / oversized / unreadable (non-image) upload, and
     RuntimeError when Ollama is unavailable or rejects the request (its own reason is
@@ -556,9 +630,10 @@ def describe_test_prompt(image_bytes: bytes) -> str:
     except Exception as e:
         raise ValueError('unreadable image — expected a webp, png or jpg file') from e
     from .vision_ollama import describe_image_ollama
+    from .vision_keepalive import keep_alive_for_isolated_call
     text = describe_image_ollama(
-        webp, STUDIO_DESCRIBE_PROMPT,
-        num_predict=500, auto_start_local=True, keep_alive=0)
+        webp, STUDIO_DESCRIBE_PROMPT, num_predict=500, auto_start_local=True,
+        keep_alive=keep_alive_for_isolated_call())
     text = (text or '').strip().strip('"').strip()
     if not text:
         raise RuntimeError(
@@ -1131,23 +1206,65 @@ def _build_cell_workflow(user_id, checkpoint, strength, prompt, seed, z_model,
     return _resolve_workflow_node_classes(workflow, available_classes)
 
 
-def _enqueue_cell(user_id, dataset_id, workflow, prompt) -> str:
+def _enqueue_cell(user_id, dataset_id, workflow, prompt, job_id=None, commit=True) -> str:
     """Enqueue one cell as a normal (serialized) image job. Free: never
     debited - the failure path in job_queue skips the refund for
-    is_lora_test jobs exactly like is_dataset (no credit minting)."""
-    job_id = str(uuid.uuid4())
+    is_lora_test jobs exactly like is_dataset (no credit minting).
+
+    `job_id` lets the caller mint the id BEFORE inserting its own row (so the row
+    carries its job_id from the start instead of being re-written afterwards) and
+    `commit=False` keeps the queue row in the caller's open transaction — together
+    they turn a cell into ONE commit instead of three."""
+    job_id = job_id or str(uuid.uuid4())
     queue_manager.add_job(job_type='image', user_id=str(user_id),
                           workflow_data=workflow, prompt=prompt, job_id=job_id,
                           metadata={'model_name': 'zimage_lora_test',
                                     'is_lora_test': True,
-                                    'dataset_id': dataset_id})
+                                    'dataset_id': dataset_id},
+                          commit=commit)
+    return job_id
+
+
+def _persist_and_enqueue_cell(img, user_id, dataset_id, prompt, build_workflow) -> str:
+    """Insert ONE grid cell and its queue job in a SINGLE transaction, and return
+    its job_id.
+
+    Why one commit and not zero (a single commit for the whole grid): a grid is
+    enqueued cell by cell and an enqueue failure at cell 20/50 must LEAVE the 19
+    already-queued cells in the database — a batch commit would roll their rows back
+    while their jobs stay in the queue (orphan jobs, ghost tiles). Why not three
+    (the historical shape: insert row, enqueue, re-write row with its job_id): each
+    commit takes SQLite's write lock, and a 50-cell grid firing 150 of them back to
+    back is exactly the profile that starves a concurrent writer into
+    'database is locked'.
+
+    On failure the half-built transaction is rolled back (dropping the queue row that
+    may already have been staged) and the cell is re-inserted as 'failed' with the
+    reason, so the caller's `raise` still surfaces a visible, explained tile."""
+    job_id = str(uuid.uuid4())
+    img.job_id = job_id
+    db.session.add(img)
+    try:
+        workflow = build_workflow()
+        _enqueue_cell(user_id, dataset_id, workflow, prompt, job_id=job_id, commit=False)
+        db.session.commit()
+    except Exception as e:
+        # rollback expunges the pending cell + job rows; the cell object goes back to
+        # transient and can be re-added as the failed marker.
+        db.session.rollback()
+        img.job_id = None
+        img.status = 'failed'
+        img.error = str(e)[:400] or 'enqueue failed'   # say WHY, not a mute red tile
+        db.session.add(img)
+        db.session.commit()
+        raise
     return job_id
 
 
 def _sanitize_gen_knobs(run_family, *, negative=None, sampler=None, scheduler=None,
                         weight_dtype=None, enhancer=None, enhancer_strength=None,
-                        detail_amount=None, resolution_tier=None, init_image=None,
-                        denoise=None) -> dict:
+                        detail_amount=None, resolution_tier=None, resolution_multiplier=None,
+                        init_image=None, denoise=None) -> dict:
     """Normalise + valide les réglages de génération GLOBAUX d'un run (parité Generate),
     filtrés PAR FAMILLE (un sampler Krea n'a aucun sens en Z-Image). Renvoie un dict prêt
     à la fois à persister sur LoraTestImage ET à passer à `_build_cell_workflow`. Chaque
@@ -1174,6 +1291,10 @@ def _sanitize_gen_knobs(run_family, *, negative=None, sampler=None, scheduler=No
         except (TypeError, ValueError):
             dta = None
     tier = resolution_tier if resolution_tier in RESOLUTION_TIERS else None
+    # Multiplicateur de résolution clampé [1.0, 1.9] (défaut 1.0). Ne s'applique qu'au
+    # chemin par palier ; sans palier (table fixe) il reste 1.0 et n'a aucun effet.
+    from ..utils.resolution import clamp_multiplier
+    mult = clamp_multiplier(resolution_multiplier if resolution_multiplier is not None else 1.0)
     den = None
     if fam == 'krea' and denoise is not None:
         try:
@@ -1183,7 +1304,7 @@ def _sanitize_gen_knobs(run_family, *, negative=None, sampler=None, scheduler=No
     ini = ((init_image or '').strip() or None) if fam == 'krea' else None
     return {'negative': neg, 'sampler': smp, 'scheduler': sch, 'weight_dtype': wdt,
             'enhancer_strength': enh, 'detail_amount': dta, 'resolution_tier': tier,
-            'init_image': ini, 'denoise': den}
+            'resolution_multiplier': mult, 'init_image': ini, 'denoise': den}
 
 
 # --- Studio preflight (model files on disk + custom nodes in ComfyUI) ---------
@@ -1423,6 +1544,16 @@ def _scan_workflow_assets(workflow, models_root):
             abs_path = _resolve_model_abs(models_root, subfolders, ref)
             if abs_path is None:
                 entry = {'path': display, 'kind': kind}
+                # A resolver that came up empty leaves `_meta.lds_missing_hint` on the
+                # node saying WHAT it accepted and WHERE it looked (see
+                # utils/zimage_helper._resolve_zimage_assets). Carrying it into the 409
+                # is what keeps the preflight honest now that resolution is automatic:
+                # "this file is missing" alone would suggest the exact name is required,
+                # when a dozen spellings would have done.
+                meta = node.get('_meta')
+                hint = meta.get('lds_missing_hint') if isinstance(meta, dict) else None
+                if hint:
+                    entry['hint'] = str(hint)
                 if entry not in missing:
                     missing.append(entry)
                 continue
@@ -1549,6 +1680,44 @@ def _batch_lora_axis(batch_loras, run_family) -> list:
     return [None] + entries[:4] if entries else [None]
 
 
+def checkpoint_origins(checkpoints, explicit=None) -> dict:
+    """{deployed filename: (record_id, step)} — WHICH training checkpoint each
+    selected LoRA came from, so every cell can record it on its row instead of
+    the app re-deriving it from the filename on every render (the heuristic that
+    already shipped a bug, see LoraTestImage.record_id).
+
+    `explicit` is the mapping a caller that ALREADY knows the answer provides —
+    the LoRA Canvas, where the user picked a lineage pill, so the run and the
+    step are the identity of what was clicked. It always wins.
+
+    Without it the origin is read back from the run tag the DEPLOY stamped into
+    the name (`_rl<record>` / `_rc<cloud run>` + the zero-padded step): the Test
+    Studio picks a filename out of a folder and has no other handle. That tag was
+    written by the app, not inferred from a trigger word — and a name that
+    carries none resolves to (None, None), i.e. an honestly unlinked cell.
+
+    Resolved ONCE per distinct filename: a 40-cell grid over 6 checkpoints costs
+    6 lookups."""
+    out = {}
+    for cp in checkpoints or []:
+        if cp in out:
+            continue
+        hint = (explicit or {}).get(cp)
+        if hint:
+            try:
+                out[cp] = (int(hint['record_id']), int(hint['step']))
+                continue
+            except (KeyError, TypeError, ValueError):
+                pass                     # malformed hint → fall through to the tag
+        try:
+            from .checkpoint_link_backfill import resolve_checkpoint_name
+            hit = resolve_checkpoint_name(cp)
+        except Exception:                # a registry read must never fail a launch
+            hit = None
+        out[cp] = (hit[0], hit[1]) if hit else (None, None)
+    return out
+
+
 def _batch_lora_label(row):
     """Nom lisible du LoRA « batch » d'une cellule (entrée batch:true de son JSON
     extra_loras), ou None - badge de la grille/lightbox."""
@@ -1561,12 +1730,12 @@ def _batch_lora_label(row):
     return None
 
 
-def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=None, z_model=None, z_models=None, aspects=None, cfgs=None, steps_list=None, steps2_list=None, count=1, family=None, permanent_loras=None, batch_loras=None, rebalance=None, rebalance_strength=None, negative=None, sampler=None, scheduler=None, weight_dtype=None, enhancer=None, enhancer_strength=None, detail_amount=None, resolution_tier=None, init_image=None, denoise=None) -> dict:
+def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=None, z_model=None, z_models=None, aspects=None, cfgs=None, steps_list=None, steps2_list=None, count=1, family=None, permanent_loras=None, batch_loras=None, rebalance=None, rebalance_strength=None, negative=None, sampler=None, scheduler=None, weight_dtype=None, enhancer=None, enhancer_strength=None, detail_amount=None, resolution_tier=None, resolution_multiplier=None, init_image=None, denoise=None, origins=None) -> dict:
     """Validate + materialize the grid and enqueue every cell.
 
-    Each row is committed BEFORE its enqueue (anti-orphan rule of the dataset
-    fan-out); an enqueue failure marks that row 'failed' and re-raises -
-    already-enqueued cells keep their jobs. Returns {'created', 'seed', 'count', 'ids'}."""
+    Each cell's row and its queue job land in ONE commit (`_persist_and_enqueue_cell`);
+    an enqueue failure marks that row 'failed' and re-raises - already-enqueued cells
+    keep their rows AND their jobs. Returns {'created', 'seed', 'count', 'ids'}."""
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
@@ -1636,6 +1805,7 @@ def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=No
         run_family, negative=negative, sampler=sampler, scheduler=scheduler,
         weight_dtype=weight_dtype, enhancer=enhancer, enhancer_strength=enhancer_strength,
         detail_amount=detail_amount, resolution_tier=resolution_tier,
+        resolution_multiplier=resolution_multiplier,
         init_image=init_image, denoise=denoise)
 
     cells = build_matrix(checkpoints, strengths, aspects, cfgs, steps_list, steps2_list)
@@ -1699,11 +1869,16 @@ def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=No
     # sert pour réécrire les nodes à variantes (node 30 Krea) vers le nom réellement
     # enregistré. None (probe échouée) = on garde les noms canoniques.
     available_classes = _target_node_classes()
+    # WHICH lineage checkpoint each selected LoRA is, stamped on every cell it
+    # produces (see checkpoint_origins) — the canvas gallery reads these columns,
+    # it never re-parses a filename.
+    origin_of = checkpoint_origins(cps_in, origins)
     ids = []
     for zm in valid_models:                       # AXE modèle de base (multi-sélection)
         for checkpoint, strength, cell_aspect, cell_cfg, cell_steps, cell_steps2 in cells:
             # Format/CFG/steps (1 et 2) testés comme axes à part entière (multi-sélection).
-            width, height = _aspect_dims(cell_aspect, run_family, knobs['resolution_tier'])
+            width, height = _aspect_dims(cell_aspect, run_family, knobs['resolution_tier'],
+                                         knobs['resolution_multiplier'])
             for batch_lora in batch_axis:  # AXE ⚖ batch : sans, puis avec chaque LoRA coché
               row_extra = extra_loras + ([{**batch_lora, 'batch': True}] if batch_lora else [])
               wf_extra = extra_loras + ([batch_lora] if batch_lora else [])
@@ -1719,31 +1894,25 @@ def create_run(user_id, dataset_id, checkpoints, strengths, seed=None, prompt=No
                                     enhancer_strength=knobs['enhancer_strength'],
                                     detail_amount=knobs['detail_amount'],
                                     resolution_tier=knobs['resolution_tier'],
-                                    init_image=knobs['init_image'], denoise=knobs['denoise'])
-                db.session.add(img)
-                db.session.commit()
-                try:
-                    workflow = _build_cell_workflow(user_id, checkpoint, strength,
-                                                    prompt, cell_seed, zm, allowed,
-                                                    width=width, height=height,
-                                                    cfg=cell_cfg, steps=cell_steps, steps2=cell_steps2,
-                                                    dataset_id=dataset_id,
-                                                    train_type=run_family, extra_loras=wf_extra,
-                                                    rebalance=cell_rebalance,
-                                                    negative=knobs['negative'], sampler=knobs['sampler'],
-                                                    scheduler=knobs['scheduler'], weight_dtype=knobs['weight_dtype'],
-                                                    enhancer_strength=knobs['enhancer_strength'],
-                                                    detail_amount=knobs['detail_amount'],
-                                                    trigger_word=ds.trigger_word,
-                                                    available_classes=available_classes)
-                    job_id = _enqueue_cell(user_id, dataset_id, workflow, prompt)
-                except Exception as e:
-                    img.status = 'failed'
-                    img.error = str(e)[:400] or 'enqueue failed'  # say WHY, not a mute red tile
-                    db.session.commit()
-                    raise
-                img.job_id = job_id
-                db.session.commit()
+                                    resolution_multiplier=knobs['resolution_multiplier'],
+                                    init_image=knobs['init_image'], denoise=knobs['denoise'],
+                                    record_id=origin_of.get(checkpoint, (None, None))[0],
+                                    step=origin_of.get(checkpoint, (None, None))[1])
+                _persist_and_enqueue_cell(
+                    img, user_id, dataset_id, prompt,
+                    lambda: _build_cell_workflow(user_id, checkpoint, strength,
+                                                 prompt, cell_seed, zm, allowed,
+                                                 width=width, height=height,
+                                                 cfg=cell_cfg, steps=cell_steps, steps2=cell_steps2,
+                                                 dataset_id=dataset_id,
+                                                 train_type=run_family, extra_loras=wf_extra,
+                                                 rebalance=cell_rebalance,
+                                                 negative=knobs['negative'], sampler=knobs['sampler'],
+                                                 scheduler=knobs['scheduler'], weight_dtype=knobs['weight_dtype'],
+                                                 enhancer_strength=knobs['enhancer_strength'],
+                                                 detail_amount=knobs['detail_amount'],
+                                                 trigger_word=ds.trigger_word,
+                                                 available_classes=available_classes))
                 ids.append(img.id)
     logger.info(f"lora-test: run dataset {dataset_id} -> {len(ids)} cellule(s) "
                 f"({len(valid_models)} modèle(s)), base seed {seed} ×{count}")
@@ -1755,9 +1924,13 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
                           count=1, permanent_loras=None, batch_loras=None, rebalance=None, rebalance_strength=None,
                           negative=None, sampler=None, scheduler=None, weight_dtype=None,
                           enhancer=None, enhancer_strength=None, detail_amount=None,
-                          resolution_tier=None, init_image=None, denoise=None) -> dict:
+                          resolution_tier=None, resolution_multiplier=None,
+                          init_image=None, denoise=None) -> dict:
     """Lance UN run de comparaison sur plusieurs LoRA. `selections` =
-    [{dataset_id, checkpoint}]. Toutes les cellules partagent un run_id + le seed
+    [{dataset_id, checkpoint}] — chaque entrée peut aussi porter `record_id`/`step`
+    (le LoRA Canvas les connaît : ce sont l'identité de la pastille cliquée), ce qui
+    est alors stampé tel quel sur les cellules ; sinon l'origine est relue du tag de
+    déploiement (cf. checkpoint_origins). Toutes les cellules partagent un run_id + le seed
     (équité). Le prompt : `prompt` commun si fourni, sinon l'identity_prompt du
     dataset de CHAQUE cellule (chaque LoRA a son trigger). 1 selection => run mono-LoRA.
 
@@ -1836,6 +2009,7 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
         run_type, negative=negative, sampler=sampler, scheduler=scheduler,
         weight_dtype=weight_dtype, enhancer=enhancer, enhancer_strength=enhancer_strength,
         detail_amount=detail_amount, resolution_tier=resolution_tier,
+        resolution_multiplier=resolution_multiplier,
         init_image=init_image, denoise=denoise)
 
     # Arch guard (même contrat que create_run) : l'arch RÉELLE de chaque
@@ -1844,14 +2018,28 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
     # toute ligne → 409 actionnable.
     _preflight_checkpoint_arch(run_type,
                                [s.get('checkpoint') for s in selections if s.get('checkpoint')])
+    # Un dataset = UN scan de LoRA. `list_test_checkpoints` walks the family's whole
+    # LoRA folder (and stats every match): its result only depends on (dataset, family),
+    # so a 24-cell grid over 8 checkpoints of the same dataset re-scanned that folder 9
+    # times for one identical answer. Memoised for the duration of THIS call only — the
+    # deployed set can change between two runs.
+    _ckpt_memo = {}
+
+    def _dataset_and_checkpoints(ds_id):
+        """(dataset, allowed checkpoint filenames) for this run's family, scanned once."""
+        if ds_id not in _ckpt_memo:
+            _ds = fds.get_dataset(user_id, ds_id)
+            _allowed = {c['filename'] for c in list_test_checkpoints(_ds, run_type)} if _ds else set()
+            _ckpt_memo[ds_id] = (_ds, _allowed)
+        return _ckpt_memo[ds_id]
+
     # Preflight (même contrat que create_run) : le ComfyUI cible peut-il vraiment
     # exécuter le workflow de cette famille ? On vérifie sur la 1re sélection valable
     # (le run est mono-famille) AVANT de créer les lignes → un seul 409 actionnable.
     for _sel in selections:
-        _pf_ds = fds.get_dataset(user_id, _sel.get('dataset_id'))
+        _pf_ds, _pf_allowed = _dataset_and_checkpoints(_sel.get('dataset_id'))
         if not _pf_ds:
             continue
-        _pf_allowed = {c['filename'] for c in list_test_checkpoints(_pf_ds, run_type)}
         _pf_cp = _sel.get('checkpoint')
         if _pf_cp in _pf_allowed:
             _preflight_run(user_id, run_type, _pf_cp, [z_model], _pf_allowed,
@@ -1862,20 +2050,28 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
     # Classes du ComfyUI cible, lues UNE fois pour tout le run (cf. create_run) →
     # réécriture des nodes à variantes (node 30 Krea) vers le nom réellement enregistré.
     available_classes = _target_node_classes()
+    # Origine (run + step) de chaque LoRA sélectionné : explicite quand l'appelant
+    # la connaît (canvas), sinon relue du tag de déploiement. Une seule résolution
+    # par nom de fichier distinct.
+    origin_of = checkpoint_origins(
+        [s.get('checkpoint') for s in selections if s.get('checkpoint')],
+        {s['checkpoint']: s for s in selections
+         if s.get('checkpoint') and s.get('record_id') is not None
+         and s.get('step') is not None})
     run_id = uuid.uuid4().hex
     ids = []
     for sel in selections:
-        ds = fds.get_dataset(user_id, sel.get('dataset_id'))
+        ds, allowed = _dataset_and_checkpoints(sel.get('dataset_id'))
         if not ds:
             raise ValueError(f"dataset {sel.get('dataset_id')} not found")
-        allowed = {c['filename'] for c in list_test_checkpoints(ds, run_type)}
         checkpoint = sel.get('checkpoint')
         if checkpoint not in allowed:
             raise ValueError(f'unknown checkpoint for {ds.name}: {checkpoint}')
         cell_prompt = common_prompt or identity_prompt(ds)
         cells = build_matrix([checkpoint], strengths, aspects, cfgs, steps_list, steps2_list)
         for cp, strength, cell_aspect, cell_cfg, cell_steps, cell_steps2 in cells:
-            width, height = _aspect_dims(cell_aspect, run_type, knobs['resolution_tier'])
+            width, height = _aspect_dims(cell_aspect, run_type, knobs['resolution_tier'],
+                                         knobs['resolution_multiplier'])
             for batch_lora in batch_axis:  # AXE ⚖ batch : sans, puis avec chaque LoRA coché
               row_extra = extra_loras + ([{**batch_lora, 'batch': True}] if batch_lora else [])
               wf_extra = extra_loras + ([batch_lora] if batch_lora else [])
@@ -1891,26 +2087,25 @@ def create_comparison_run(user_id, selections, strengths, seed=None, prompt=None
                                     enhancer_strength=knobs['enhancer_strength'],
                                     detail_amount=knobs['detail_amount'],
                                     resolution_tier=knobs['resolution_tier'],
-                                    init_image=knobs['init_image'], denoise=knobs['denoise'])
-                db.session.add(img); db.session.commit()
-                try:
-                    workflow = _build_cell_workflow(user_id, cp, strength, cell_prompt,
-                                                    cell_seed, z_model, allowed, width=width,
-                                                    height=height, cfg=cell_cfg, steps=cell_steps,
-                                                    steps2=cell_steps2, dataset_id=ds.id,
-                                                    train_type=run_type, extra_loras=wf_extra,
-                                                    rebalance=cell_rebalance,
-                                                    negative=knobs['negative'], sampler=knobs['sampler'],
-                                                    scheduler=knobs['scheduler'], weight_dtype=knobs['weight_dtype'],
-                                                    enhancer_strength=knobs['enhancer_strength'],
-                                                    detail_amount=knobs['detail_amount'],
-                                                    trigger_word=ds.trigger_word,
-                                                    available_classes=available_classes)
-                    job_id = _enqueue_cell(user_id, ds.id, workflow, cell_prompt)
-                except Exception as e:
-                    img.status = 'failed'; img.error = str(e)[:400] or 'enqueue failed'
-                    db.session.commit(); raise
-                img.job_id = job_id; db.session.commit(); ids.append(img.id)
+                                    resolution_multiplier=knobs['resolution_multiplier'],
+                                    init_image=knobs['init_image'], denoise=knobs['denoise'],
+                                    record_id=origin_of.get(cp, (None, None))[0],
+                                    step=origin_of.get(cp, (None, None))[1])
+                _persist_and_enqueue_cell(
+                    img, user_id, ds.id, cell_prompt,
+                    lambda: _build_cell_workflow(user_id, cp, strength, cell_prompt,
+                                         cell_seed, z_model, allowed, width=width,
+                                         height=height, cfg=cell_cfg, steps=cell_steps,
+                                         steps2=cell_steps2, dataset_id=ds.id,
+                                         train_type=run_type, extra_loras=wf_extra,
+                                         rebalance=cell_rebalance,
+                                         negative=knobs['negative'], sampler=knobs['sampler'],
+                                         scheduler=knobs['scheduler'], weight_dtype=knobs['weight_dtype'],
+                                         enhancer_strength=knobs['enhancer_strength'],
+                                         detail_amount=knobs['detail_amount'],
+                                         trigger_word=ds.trigger_word,
+                                         available_classes=available_classes))
+                ids.append(img.id)
     logger.info(f"lora-test: comparison run {run_id} -> {len(ids)} cellule(s), {len(selections)} LoRA, seed {seed}")
     return {'created': len(ids), 'seed': seed, 'count': count, 'run_id': run_id, 'ids': ids}
 
@@ -2046,8 +2241,10 @@ def resume_run(user_id, dataset_id=None, run_id=None) -> dict:
         z_model = (img.z_model if (img.z_model and img.z_model in cell_models)
                    else (cell_models[0] if cell_models else None))
         aspect = img.aspect if img.aspect in TEST_ASPECTS else DEFAULT_ASPECT
-        # Palier de résolution persisté → mêmes dims qu'au 1er run (sinon table fixe).
-        width, height = _aspect_dims(aspect, cell_family, getattr(img, 'resolution_tier', None))
+        # Palier + multiplicateur de résolution persistés → mêmes dims qu'au 1er run
+        # (sinon table fixe / multiplicateur 1.0 sur les cellules legacy sans la colonne).
+        width, height = _aspect_dims(aspect, cell_family, getattr(img, 'resolution_tier', None),
+                                     getattr(img, 'resolution_multiplier', None) or 1.0)
         prompt = (img.prompt or '').strip() or identity_prompt(cell_ds)
         seed = img.seed or random.randint(1, 2**31 - 1)
         # LoRA always-on stockés sur la cellule → réappliqués à l'identique au resume.
@@ -2437,6 +2634,28 @@ def _best_for_family(ds, family) -> dict | None:
     return _best_map(ds).get((family or 'zimage').lower())
 
 
+def best_settings_lora_filenames(ds) -> list[str]:
+    """Every LoRA filename this dataset pins as a ★ best setting — a LIST, one
+    entry per family, because the pin is stored per family (a dataset can have a
+    winning ZIT combo and a winning SDXL one at the same time).
+
+    This is what the "you are about to delete the pinned LoRA" guard-rail needs.
+    Readers used to reach for `best_settings.lora_filename` straight off the
+    payload, which only ever matched the LEGACY flat format: since the pin became
+    a {family: setting} map that key does not exist any more, so the ⚠ line
+    silently stopped appearing for every modern pin. Going through _best_map
+    covers both shapes at once. Order is deterministic (family order as stored),
+    duplicates collapsed."""
+    out: list[str] = []
+    for setting in _best_map(ds).values():
+        if not isinstance(setting, dict):
+            continue
+        fn = setting.get('lora_filename')
+        if fn and fn not in out:
+            out.append(str(fn))
+    return out
+
+
 def set_best_settings(user_id, dataset_id, checkpoint, strength,
                       z_model=None, cfg=None, steps=None, steps2=None, aspect=None) -> dict:
     """Persiste la config gagnante COMPLÈTE - checkpoint, strength, modèle/cfg/steps(1+2)/
@@ -2529,6 +2748,13 @@ def score_faces(user_id, dataset_id, family=None) -> dict:
     ds = fds.get_dataset(user_id, dataset_id)
     if not ds:
         raise ValueError('dataset not found')
+    # Third InsightFace lane, same single rule (fds.face_scoring_block_reason).
+    # Returned in the shape the panel already renders (scoring_error) so the button
+    # explains itself instead of scoring 0 cells in green.
+    blocked = fds.face_scoring_block_reason(ds)
+    if blocked:
+        return {'scored': 0, 'total': 0, 'ranking': [],
+                'scoring_error': {'kind': 'subject_not_photographic', 'detail': blocked}}
     if not ds.ref_filename:
         raise ValueError('reference photo missing')
     ref_path = fds._ref_path(ds)
@@ -2687,6 +2913,11 @@ def studio_payload(user_id, dataset_id, family=None) -> dict | None:
         'default_aspect': DEFAULT_ASPECT,
         'cfg_choices': CFG_CHOICES, 'default_cfg': DEFAULT_CFG,
         'steps_choices': STEPS_CHOICES, 'default_steps': DEFAULT_STEPS,
+        # Per-BASE-MODEL cfg/steps, keyed by the same `value` as `z_models` (bobba84,
+        # GitHub #18): Z-Image Base is not guidance-distilled and must not inherit
+        # Turbo's cfg 1 / 8 steps. `default_cfg`/`default_steps` stay the fallback for
+        # every base not listed here, so an older frontend behaves exactly as before.
+        'model_defaults': studio_model_defaults(eff, z_models),
         # 2e passe (detail daemon) : exposée UNIQUEMENT pour SDXL (le workflow HQ a deux
         # passes). NULL sinon → le frontend ne montre pas le 2e picker de steps.
         'steps2_choices': (STEPS_CHOICES if eff == 'sdxl' else None),
@@ -2791,11 +3022,14 @@ def studio_payload_run(user_id, run_id) -> dict | None:
     }
 
 
-def _recent_prompts(rows, limit=6) -> list[dict]:
+def _recent_prompts(rows, limit=None) -> list[dict]:
     """Prompts distincts utilisés (récent→ancien) AVEC une vignette : une image 👍
     générée avec ce prompt (à défaut, la plus récente terminée), + le nombre d'images.
     Permet de voir ce que fait chaque prompt dans le menu. `thumb_dataset_id` porte
     le dataset de la vignette (nécessaire quand les rows couvrent PLUSIEURS datasets).
+    `limit=None` (défaut) = tous les prompts distincts trouvés dans `rows` — le
+    plafond arbitraire (10) a été retiré à la demande de l'utilisateur ; la seule
+    borne restante est le scan des 1500 dernières cellules dans user_recent_prompts.
     Retour: [{prompt, thumbnail(filename|None), thumb_dataset_id, thumb_rating, count}]."""
     seen = {}  # prompt -> dict (ordre d'insertion = récent→ancien)
     for r in sorted(rows, key=lambda x: -x.id):  # plus récent d'abord
@@ -2803,7 +3037,7 @@ def _recent_prompts(rows, limit=6) -> list[dict]:
         if not p:
             continue
         if p not in seen:
-            if len(seen) >= limit:
+            if limit is not None and len(seen) >= limit:
                 continue
             seen[p] = {'prompt': p, 'thumbnail': None, 'thumb_dataset_id': None,
                        'thumb_rating': 0, 'count': 0}
@@ -2819,11 +3053,13 @@ def _recent_prompts(rows, limit=6) -> list[dict]:
     return list(seen.values())
 
 
-def user_recent_prompts(user_id, limit=10) -> list[dict]:
+def user_recent_prompts(user_id, limit=None) -> list[dict]:
     """Prompts de test récents de l'UTILISATEUR, TOUS datasets confondus (demande
     2026-07-03 : la mémoire des prompts/presets ne doit plus être cloisonnée par
-    dataset - un prompt réglé sur Emma doit se recharger sur Adele). Scan borné aux
-    1500 dernières cellules (perf) ; chaque entrée porte `thumb_dataset_id` pour que
+    dataset - un prompt réglé sur Emma doit se recharger sur Adele). `limit=None`
+    (défaut) = tous les prompts distincts trouvés (le plafond de 10 a été retiré à
+    la demande de l'utilisateur). La seule borne restante est le scan des 1500
+    dernières cellules (perf) ; chaque entrée porte `thumb_dataset_id` pour que
     le front construise l'URL de vignette du BON dataset."""
     ds_ids = [d.id for d in FaceDataset.query.filter_by(user_id=str(user_id)).all()]
     if not ds_ids:

@@ -3,11 +3,10 @@
    same in either: its family label, its status dot, its on-disk/gone chip. Kept
    in one place so the two views can never drift apart. */
 
-export const FAMILY_LABEL = {
-  zimage: 'Z-Image', krea: 'Krea 2', sdxl: 'SDXL',
-  flux: 'FLUX.1', flux2klein: 'FLUX.2 Klein', qwen_image: 'Qwen-Image',
-};
-export const famLabel = (f) => FAMILY_LABEL[f] || f || 'LoRA';
+// The family names live in a JSX-free module so the canvas's "you mixed Krea and
+// Z-Image" refusal can name them in a unit-testable helper. Re-exported here so
+// every existing import keeps working.
+export { FAMILY_LABEL, famLabel } from '../../utils/familyLabels';
 
 const STATUS_TONE = {
   done: 'bg-emerald-400',

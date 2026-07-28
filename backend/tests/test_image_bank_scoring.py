@@ -209,15 +209,34 @@ def test_watermark_gate_503_when_model_absent(client, tmp_path, monkeypatch):
     assert 'vision model' in r.get_json()['error']
 
 
-def test_score_refuses_when_gpu_busy(client, tmp_path, monkeypatch):
+def test_score_refuses_when_gpu_busy_and_the_pass_wants_the_gpu(
+        client, tmp_path, monkeypatch):
     bank_id, _ = _mkbank(client, tmp_path, {'a.jpg': _flat()})
     from app import capabilities
     from app.services import image_bank_service as banks
     monkeypatch.setattr(capabilities, 'probe_bank_scoring', lambda: {'ok': True, 'detail': ''})
+    monkeypatch.setattr(capabilities, 'bank_scoring_gpu_available', lambda: True)
     monkeypatch.setattr(banks, '_gpu_busy_reason', lambda: 'training is running on the GPU')
     r = client.post(f'/api/bank/{bank_id}/score', json={})
     assert r.status_code == 503
     assert 'training' in r.get_json()['error']
+
+
+def test_a_cpu_scoring_pass_is_not_blocked_by_a_busy_gpu(
+        client, tmp_path, monkeypatch):
+    """The scoring extra ships CPU-only torch, so the usual pass never touches
+    the card. Making it wait for a training run to finish would cost an hour of
+    work for nothing — and the pass no longer takes the GPU window either."""
+    bank_id, _ = _mkbank(client, tmp_path, {'a.jpg': _flat()})
+    from app import capabilities
+    from app.services import bank_jobs
+    from app.services import image_bank_service as banks
+    monkeypatch.setattr(capabilities, 'probe_bank_scoring', lambda: {'ok': True, 'detail': ''})
+    monkeypatch.setattr(capabilities, 'bank_scoring_gpu_available', lambda: False)
+    monkeypatch.setattr(banks, '_gpu_busy_reason', lambda: 'training is running on the GPU')
+    monkeypatch.setattr(bank_jobs, 'start', lambda *a, **k: 'job')
+    r = client.post(f'/api/bank/{bank_id}/score', json={})
+    assert r.status_code == 202, r.get_json()
 
 
 # --- watermark pass (mocked detector — hermetic) -----------------------------

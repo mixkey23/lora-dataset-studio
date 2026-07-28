@@ -24,11 +24,17 @@ def test_chatgpt_never_sends_input_fidelity(app, monkeypatch):
     assert '/images/edits' in sent.args[0]
 
 
-def test_chatgpt_returns_none_without_key(app, monkeypatch):
+def test_chatgpt_raises_a_named_fatal_without_key(app, monkeypatch):
+    """Was `is None` until the engine models became user-editable: None makes the
+    fan-out say "empty response (often a content-policy refusal)", which sent
+    people to rewrite a prompt when the fix was pasting a key. Now the cause is
+    named and the batch stops — the contract OpenRouter already had."""
+    import pytest
     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     from app.services import chatgpt_image
     with patch('app.services.chatgpt_image.requests.post') as post:
-        assert chatgpt_image.generate_variation(b'r', 'p') is None
+        with pytest.raises(chatgpt_image.ChatGPTImageFatal, match='OPENAI_API_KEY'):
+            chatgpt_image.generate_variation(b'r', 'p')
     post.assert_not_called()
 
 
@@ -46,11 +52,14 @@ def test_nanobanana_sends_aspect_config(app, monkeypatch):
     assert len(body['contents'][0]['parts']) >= 3   # prompt + 2 refs
 
 
-def test_nanobanana_returns_none_without_key(app, monkeypatch):
+def test_nanobanana_raises_a_named_fatal_without_key(app, monkeypatch):
+    """Same change of contract as the ChatGPT one above, same reason."""
+    import pytest
     monkeypatch.delenv('GEMINI_API_KEY', raising=False)
     from app.services import nanobanana
     with patch('app.services.nanobanana.requests.post') as post:
-        assert nanobanana.generate_variation(b'r', 'p') is None
+        with pytest.raises(nanobanana.NanoBananaFatal, match='GEMINI_API_KEY'):
+            nanobanana.generate_variation(b'r', 'p')
     post.assert_not_called()
 
 

@@ -1,0 +1,73 @@
+/* 🗃 Banks that share files — the DECIDABLE part, kept free of JSX so
+ * `node --test` can run it.
+ *
+ * Nothing stops two banks pointing at nested folders, and while you are only
+ * triaging that is harmless: statuses live on the bank, not on the file. It
+ * stops being harmless at 🗑 Delete rejected, the one action that removes the
+ * FILES — the other bank simply finds them gone. These helpers turn the backend
+ * facts into the sentences that have to be said BEFORE that click.
+ */
+
+/* Where the files end up is not a bank question — every destructive
+ * confirmation in the app says it, so the sentence lives in utils and is
+ * re-exported here for the callers (and tests) that already address it. */
+export { deleteDestination, isRecoverable } from '../../utils/deletionWording.js'
+
+/** The one-line notice for a bank created over a folder another bank already
+ *  covers — or null when there is nothing to say. */
+export function overlapNotice(overlaps) {
+  const list = (overlaps || []).filter((o) => o && o.name)
+  if (!list.length) return null
+  const names = list.map((o) => `“${o.name}”`).join(', ')
+  return `Heads up: this folder overlaps ${names}. Both banks list the same files, `
+    + 'so 🗑 Delete rejected in one removes them from the other too.'
+}
+
+/** The blocking warning inside the delete confirmation: which OTHER banks lose
+ *  files, and how many. null when this bank is on its own. */
+export function sharedFilesWarning(preview) {
+  const shared = (preview?.shared || []).filter((s) => s && s.files > 0)
+  if (!shared.length) return null
+  const parts = shared.map((s) => `${s.files} of them are also in “${s.name}”`)
+  return `${parts.join('; ')}. Deleting them here removes them from that bank too `
+    + '— its own decisions on those images are lost with the files.'
+}
+
+/** Total files another bank would lose, across every overlapping bank. Used to
+ *  decide how loud the confirmation has to be. */
+export function sharedFileCount(preview) {
+  return (preview?.shared || []).reduce((n, s) => n + (Number(s?.files) || 0), 0)
+}
+
+/** May the delete confirmation arm — and what to say while it may not.
+ *
+ *  A destructive control has to fail CLOSED when its evidence is missing. Every
+ *  warning in this dialog is MADE of the preview: which other bank loses files,
+ *  and whether they land somewhere recoverable. With no preview, all of that
+ *  simply does not render — the ⚠ banner vanishes, the destination silently
+ *  falls back to "deleted for good", and the button arms anyway. That is the
+ *  protection disappearing at the exact moment it could not do its job, so the
+ *  button stays disabled until the answer is in.
+ *
+ *  Returns {ready, state: 'checking'|'failed'|'ready', title, text}. */
+export function deletePreviewState(preview) {
+  if (preview?.failed) {
+    return {
+      ready: false,
+      state: 'failed',
+      title: '⚠ Could not check what this delete would do',
+      text: 'The app could not ask where these files would go, nor whether another '
+        + 'bank shares them. Nothing is deleted while that is unknown — close this, '
+        + 'make sure the app is still running, and open it again.',
+    }
+  }
+  if (!preview) {
+    return {
+      ready: false,
+      state: 'checking',
+      title: 'Checking what this delete would do…',
+      text: 'Asking where the files would go, and whether another bank shares them.',
+    }
+  }
+  return { ready: true, state: 'ready', title: '', text: '' }
+}

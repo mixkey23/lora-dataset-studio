@@ -5,11 +5,14 @@ bearer auth on /api/* except /api/img/ and /api/files/ (public, path-restricted)
 job_config is stored verbatim and executed by the pod's worker, so the config
 built by lora_training.build_job_config() is submitted as-is (with cloud
 overrides applied by the orchestrator)."""
+import logging
 import os
 import posixpath
 from urllib.parse import quote
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30
 _UPLOAD_TIMEOUT = 300
@@ -112,6 +115,22 @@ class RemoteAiToolkit:
             raise RemoteError(f'create_job -> HTTP {r.status_code}: {r.text[:200]}')
         return str(r.json().get('id'))
 
+    def find_job_by_name(self, name: str):
+        """The job row whose `name` matches exactly, or None.
+
+        `GET /api/jobs` with no `id` query param returns `{'jobs': [...]}` —
+        every job row, newest first, with its `id`, `name`, `status` and
+        `step`. This is what makes a create/adopt retry possible: the pod's
+        job `name` carries a UNIQUE constraint (POST /api/jobs answers
+        `409 {"error":"Job name already exists"}` on the violation), so a name
+        we already submitted can be resolved back to its id instead of being a
+        dead end."""
+        jobs = (self._json('GET', '/api/jobs') or {}).get('jobs') or []
+        for job in jobs:
+            if isinstance(job, dict) and job.get('name') == name:
+                return job
+        return None
+
     def start_job(self, job_id: str, gpu_ids: str = '0') -> None:
         self._json('GET', f'/api/jobs/{job_id}/start')
         self._json('GET', f'/api/queue/{gpu_ids}/start')
@@ -133,7 +152,8 @@ class RemoteAiToolkit:
 
     # -- downloads (public, path-restricted routes) ---------------------------
     def _download(self, route: str, remote_path: str, dest_path: str,
-                  timeout=None, expected_size=None, attempts=3) -> None:
+                  timeout=None, expected_size=None, attempts=3,
+                  on_progress=None) -> None:
         """Stream to dest_path.part, then rename. RESUME-CAPABLE: some vast
         hosts' proxies cut the stream every ~0.5-2 MB (observed live
         2026-07-13 on 2 of 3 pods — an 85 MB checkpoint needed ~100 resumed
@@ -141,7 +161,11 @@ class RemoteAiToolkit:
         HTTP Range header, as long as the previous attempt made progress.
         With expected_size, completion means EXACTLY that many bytes (a clean
         EOF short of it is just another resume point); without it, completion
-        is a stream that ends without error (small files: samples)."""
+        is a stream that ends without error (small files: samples).
+        on_progress(bytes_so_far, expected_size) is called as the bytes land,
+        so a caller can prove to its own watchdogs that a long transfer is
+        alive; it is throttled by the caller, and never allowed to break the
+        download (a raising callback is logged and disabled)."""
         url_path = f'{route}{quote(remote_path, safe="")}'
         tmp = dest_path + '.part'
         try:
@@ -165,10 +189,20 @@ class RemoteAiToolkit:
                                 f'download {remote_path} -> HTTP {r.status_code}')
                         if got and r.status_code == 200:
                             got = 0           # Range ignored -> full restart
+                        written = got
                         with open(tmp, 'ab' if got else 'wb') as fh:
                             for chunk in r.iter_content(chunk_size=1024 * 256):
                                 if chunk:
                                     fh.write(chunk)
+                                    written += len(chunk)
+                                    if on_progress:
+                                        try:
+                                            on_progress(written, want)
+                                        except Exception:
+                                            on_progress = None
+                                            logger.debug('download progress '
+                                                         'callback disabled',
+                                                         exc_info=True)
                         clean = True          # stream ended without exception
             except RemoteError:
                 raise                          # HTTP-level refusal: no point retrying
@@ -195,13 +229,15 @@ class RemoteAiToolkit:
                           f'({got}{f"/{want}" if want else ""} bytes after resume attempts)')
 
     def download_public_file(self, remote_path: str, dest_path: str,
-                             timeout=None, expected_size=None, attempts=3) -> None:
+                             timeout=None, expected_size=None, attempts=3,
+                             on_progress=None) -> None:
         # timeout/attempts overrides: the OPPORTUNISTIC mid-run checkpoint sync
         # fails fast (few attempts, short timeout — the monitor loop must not
         # hang); the FINAL end-of-run download passes a large attempts budget
         # so a sick-proxy host still delivers via many resumed connections.
         self._download('/api/files/', remote_path, dest_path, timeout=timeout,
-                       expected_size=expected_size, attempts=attempts)
+                       expected_size=expected_size, attempts=attempts,
+                       on_progress=on_progress)
 
     def download_sample(self, remote_path: str, dest_path: str) -> None:
         self._download('/api/img/', remote_path, dest_path)

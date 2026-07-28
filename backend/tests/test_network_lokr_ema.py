@@ -136,15 +136,21 @@ def test_effective_settings_exposes_choices_and_supported(app):
 
 def test_launch_snapshot_and_share_carry_lokr_ema(app):
     """The launch snapshot (stamped into the run's provenance and rendered by the
-    ⎘ Share config) omits the levers by default and carries them once set — and the
-    share renderer knows both keys as first-class rows."""
+    ⎘ Share config) stamps BOTH levers with their effective value — including the
+    default — and the share renderer knows both keys as first-class rows.
+
+    These two used to be omitted while they matched the default. That reads as
+    "compact" until two runs are compared: an absent `ema` was then
+    indistinguishable from a run recorded before the key existed, so the compare
+    panel could not say which of the two had EMA on — the one question the EMA
+    experiment exists to answer. An explicit 'off' cannot be misread."""
     from app.services import lora_training as lt
     from app.services import face_dataset_service as svc
     from app.services.run_share import _KNOWN_SETTING_KEYS
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'K', 'kt', train_type='krea')
         snap = lt.launch_settings_snapshot(ds, 'krea')
-        assert 'network_type' not in snap and 'ema' not in snap
+        assert snap['network_type'] == 'lora' and snap['ema'] == 'off'
         lt.update_train_settings(LOCAL_USER, ds.id, {'network_type': 'lokr', 'ema': 0.99})
         snap2 = lt.launch_settings_snapshot(svc.get_dataset(LOCAL_USER, ds.id), 'krea')
         assert snap2['network_type'] == 'lokr' and snap2['ema'] == 0.99

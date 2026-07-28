@@ -182,15 +182,22 @@ def test_create_run_commits_rows_before_enqueue(app, monkeypatch, tmp_path):
         monkeypatch.setattr(comfyui_utils, '_zimage_models_cache', {'data': None, 'timestamp': 0})
         ds = svc.create_dataset(LOCAL_USER, 'S2', 's')
         monkeypatch.setattr(lts, '_build_cell_workflow', lambda *a, **k: {'1': {}})
-        # create_run calls queue_manager.add_job through lts._enqueue_cell, which
-        # generates its own job_id and returns THAT (ignoring add_job's return value)
-        # -- patch _enqueue_cell itself so the assertion below can pin the job_id.
-        monkeypatch.setattr(lts, '_enqueue_cell', lambda *a, **k: 'job-xyz')
+        # The cell row now carries the job_id it was CREATED with (the id is minted
+        # before the insert, so row + queue job land in one commit) -- capture what
+        # the enqueue was handed and assert the row matches it.
+        seen = []
+
+        def fake_enqueue(user_id, dataset_id, workflow, prompt, job_id=None, commit=True):
+            seen.append(job_id)
+            return job_id
+        monkeypatch.setattr(lts, '_enqueue_cell', fake_enqueue)
         monkeypatch.setattr(lts, 'gpu_busy_reason', lambda: None)
         out = lts.create_run(LOCAL_USER, ds.id, [ck], [1.0], prompt='p', count=1)
         rows = LoraTestImage.query.filter_by(dataset_id=ds.id).all()
         assert out['created'] == len(rows) >= 1
-        assert all(r.job_id == 'job-xyz' and r.status == 'pending' for r in rows)
+        assert seen and all(j for j in seen)
+        assert sorted(r.job_id for r in rows) == sorted(seen)
+        assert all(r.status == 'pending' for r in rows)
 
 
 def test_create_run_with_resolution_tier_resolves_dims_via_lifted_resolution_module(app, monkeypatch, tmp_path):
@@ -235,35 +242,206 @@ def test_create_run_with_resolution_tier_resolves_dims_via_lifted_resolution_mod
         assert (captured['width'], captured['height']) == expected
 
 
-def test_create_comparison_run_commits_rows_before_enqueue(app, monkeypatch, tmp_path):
-    """Same commit-before-enqueue anti-orphan guarantee as create_run, exercised
-    on the multi-LoRA comparison path (its own row-commit + enqueue loop)."""
-    from app.services import lora_test_studio as lts, face_dataset_service as svc
-    from app.models import LoraTestImage
+# Literal transcription of the FRONTEND `tierDims` (react-frontend/src/components/
+# shared/ResolutionSelector.jsx) for the Z-Image/Krea path (maxLongSide undefined).
+# It MUST stay byte-for-byte equivalent to compute_tier_dims — this is the invariant
+# the studio relies on (px shown == px generated). Keep both in sync; this mirror
+# exists so a one-sided edit (a changed cap, snap rounding or multiplier clamp) fails
+# the test loudly instead of drifting silently.
+def _front_tier_dims(aspect, mp, multiplier=1.0):
+    import math
+    _R = {'square': (1, 1), 'landscape': (4, 3), 'portrait': (3, 4), 'widescreen': (16, 9),
+          'tall': (9, 16), 'photo': (3, 2), 'phototall': (2, 3), 'ultrawide': (21, 9)}
+    CAP, ABS_CAP, FLOOR, M = 1536, 3072, 512, 16
+    snap = lambda v: max(FLOOR, int(math.floor(v / M + 0.5)) * M)  # JS Math.round (positives)
+    m = max(1.0, min(1.9, multiplier))
+    rw, rh = _R.get(aspect, _R['square'])
+    r = rw / rh
+    h = math.sqrt(mp * 1e6 / r); w = r * h
+    longest = max(w, h)
+    if longest > CAP:
+        s = CAP / longest; w *= s; h *= s
+    w *= m; h *= m
+    longest = max(w, h)
+    if longest > ABS_CAP:
+        s = ABS_CAP / longest; w *= s; h *= s
+    return snap(w), snap(h)
+
+
+def test_compute_tier_dims_mirrors_frontend_over_full_grid():
+    """INVARIANT: compute_tier_dims (backend source of truth) and the frontend
+    tierDims produce the SAME (w, h) for every (aspect, tier, multiplier) — so the
+    Test Studio's live W×H readout matches the pixels actually generated. Swept over
+    all 8 ratios × 4 tiers × 10 multiplier steps (1.0…1.9)."""
+    from app.utils.resolution import compute_tier_dims, _RATIOS, _TIERS
+    for aspect in _RATIOS:
+        for tier, mp in _TIERS.items():
+            for mi in range(10, 20):
+                mult = mi / 10
+                assert compute_tier_dims(aspect, tier, mult) == _front_tier_dims(aspect, mp, mult), \
+                    f'front/back divergence at {aspect}/{tier}/x{mult}'
+
+
+def test_compute_tier_dims_multiplier_semantics():
+    """Multiplier: default 1.0 = preset unchanged; linear enlarge on both sides;
+    clamped to [1.0, 1.9] (None/garbage/too-small → 1.0, never shrinks)."""
+    from app.utils.resolution import compute_tier_dims, clamp_multiplier
+    base = compute_tier_dims('square', 'standard')            # default multiplier
+    assert base == (1008, 1008)                                # matches the frontend preset
+    assert compute_tier_dims('square', 'standard', 1.0) == base
+    # ×1.9 enlarges both sides (pre-snap base 1000 × 1.9 = 1900 → snap 1904).
+    assert compute_tier_dims('square', 'standard', 1.9) == (1904, 1904)
+    # Clamp: below 1.0 floors to preset, above 1.9 caps, junk → 1.0.
+    assert compute_tier_dims('square', 'standard', 0.5) == base
+    assert compute_tier_dims('square', 'standard', 5.0) == compute_tier_dims('square', 'standard', 1.9)
+    assert clamp_multiplier(None) == 1.0 and clamp_multiplier('x') == 1.0
+    assert clamp_multiplier(2.5) == 1.9 and clamp_multiplier(0.2) == 1.0
+
+
+def test_aspect_dims_applies_multiplier():
+    """_aspect_dims threads the multiplier into compute_tier_dims (tier path) and,
+    for SDXL, scales the 1024 safe-band ceiling by the multiplier so it isn't
+    silently clobbered. Legacy fixed-table path (no tier) ignores the multiplier."""
+    from app.services.lora_test_studio import _aspect_dims
+    from app.utils.resolution import compute_tier_dims
+    # Z-Image/Krea: exactly compute_tier_dims with the multiplier.
+    assert _aspect_dims('1:1', 'zimage', 'standard', 1.9) == compute_tier_dims('square', 'standard', 1.9)
+    # A bigger multiplier yields a strictly larger square (monotonic).
+    w1, _ = _aspect_dims('1:1', 'zimage', 'standard', 1.0)
+    w2, _ = _aspect_dims('1:1', 'zimage', 'standard', 1.9)
+    assert w2 > w1
+    # SDXL widescreen: base long side exceeds 1024, so it rides the SDXL safe-band
+    # ceiling (scaled by the multiplier) and snaps to ÷64. At ×1.0 the historical
+    # 1024 cap holds; ×1.9 raises it instead of clobbering the multiplier.
+    sw0, sh0 = _aspect_dims('16:9', 'sdxl', 'standard', 1.0)
+    sw, sh = _aspect_dims('16:9', 'sdxl', 'standard', 1.9)
+    assert sw0 <= 1024
+    assert sw % 64 == 0 and sh % 64 == 0 and sw > sw0
+    # No tier → legacy fixed table, multiplier is inert.
+    assert _aspect_dims('1:1', 'zimage', None, 1.9) == _aspect_dims('1:1', 'zimage', None, 1.0)
+
+
+def _studio_fixture(tmp_path, monkeypatch, name, trigger, steps=(2000,)):
+    """A configured ComfyUI tree + a dataset whose trigger matches `steps` checkpoints.
+    Returns (dataset, [checkpoint filenames])."""
+    from app.services import face_dataset_service as svc
     from app.config import LOCAL_USER
     from app import config
+    base = tmp_path / 'Comfy'
+    lora_dir = base / 'models' / 'loras' / 'z image'
+    lora_dir.mkdir(parents=True, exist_ok=True)
+    cks = []
+    for st in steps:
+        fn = f'lora_{trigger}_{st:09d}.safetensors'
+        (lora_dir / fn).write_bytes(_ST)
+        cks.append('z image\\' + fn)
+    unet_dir = base / 'models' / 'unet' / 'z image'
+    unet_dir.mkdir(parents=True, exist_ok=True)
+    (unet_dir / 'zmodel.safetensors').write_bytes(_ST)
+    config.save_config({'comfyui': {'base_dir': str(base)}})
+    import app.utils.comfyui as comfyui_utils
+    monkeypatch.setattr(comfyui_utils, '_zimage_models_cache', {'data': None, 'timestamp': 0})
+    return svc.create_dataset(LOCAL_USER, name, trigger), cks
+
+
+def test_create_comparison_run_commits_rows_before_enqueue(app, monkeypatch, tmp_path):
+    """Same anti-orphan guarantee as create_run on the multi-LoRA comparison path:
+    every created cell is COMMITTED, already carrying the job_id its enqueue used."""
+    from app.services import lora_test_studio as lts
+    from app.models import LoraTestImage
+    from app.config import LOCAL_USER
     with app.app_context():
-        base = tmp_path / 'Comfy'
-        lora_dir = base / 'models' / 'loras' / 'z image'
-        lora_dir.mkdir(parents=True)
-        ck = 'z image\\lora_c_000002000.safetensors'
-        (lora_dir / 'lora_c_000002000.safetensors').touch()
-        unet_dir = base / 'models' / 'unet' / 'z image'
-        unet_dir.mkdir(parents=True)
-        (unet_dir / 'zmodel.safetensors').write_bytes(_ST)
-        config.save_config({'comfyui': {'base_dir': str(base)}})
-        import app.utils.comfyui as comfyui_utils
-        monkeypatch.setattr(comfyui_utils, '_zimage_models_cache', {'data': None, 'timestamp': 0})
-        ds = svc.create_dataset(LOCAL_USER, 'C', 'c')
+        ds, cks = _studio_fixture(tmp_path, monkeypatch, 'C', 'c')
+        seen = []
+
+        def fake_enqueue(user_id, dataset_id, workflow, prompt, job_id=None, commit=True):
+            seen.append(job_id)
+            return job_id
         monkeypatch.setattr(lts, '_build_cell_workflow', lambda *a, **k: {'1': {}})
-        monkeypatch.setattr(lts, '_enqueue_cell', lambda *a, **k: 'job-cmp')
+        monkeypatch.setattr(lts, '_enqueue_cell', fake_enqueue)
         monkeypatch.setattr(lts, 'gpu_busy_reason', lambda: None)
-        out = lts.create_comparison_run(LOCAL_USER, [{'dataset_id': ds.id, 'checkpoint': ck}],
+        out = lts.create_comparison_run(LOCAL_USER, [{'dataset_id': ds.id, 'checkpoint': cks[0]}],
                                         [1.0], prompt='p', count=1)
         rows = LoraTestImage.query.filter_by(dataset_id=ds.id).all()
         assert out['created'] == len(rows) >= 1
-        assert all(r.job_id == 'job-cmp' and r.status == 'pending' and r.run_id == out['run_id']
-                  for r in rows)
+        assert seen and all(j for j in seen)
+        assert sorted(r.job_id for r in rows) == sorted(seen)
+        assert all(r.status == 'pending' and r.run_id == out['run_id'] for r in rows)
+
+
+def test_comparison_run_failure_keeps_previous_cells_and_marks_the_failed_one(app, monkeypatch, tmp_path):
+    """THE invariant behind 'one commit per cell, not zero': an enqueue that blows up
+    on cell N must leave the N-1 already-queued cells in the DB WITH their job_id
+    (their ComfyUI jobs exist - rolling their rows back would orphan them), and cell N
+    persisted as 'failed' with the reason. Cell N must NOT keep a job_id: its queue row
+    was rolled back with it."""
+    from app.services import lora_test_studio as lts
+    from app.models import LoraTestImage, ImageGenerationQueue
+    from app.config import LOCAL_USER
+    with app.app_context():
+        ds, cks = _studio_fixture(tmp_path, monkeypatch, 'F', 'f')
+        calls = {'n': 0}
+        real_enqueue = lts._enqueue_cell
+
+        def flaky_enqueue(user_id, dataset_id, workflow, prompt, job_id=None, commit=True):
+            calls['n'] += 1
+            if calls['n'] == 3:              # blow up on the THIRD of five cells
+                raise RuntimeError('comfy exploded')
+            return real_enqueue(user_id, dataset_id, workflow, prompt,
+                                job_id=job_id, commit=commit)
+        monkeypatch.setattr(lts, '_build_cell_workflow', lambda *a, **k: {'1': {}})
+        monkeypatch.setattr(lts, '_enqueue_cell', flaky_enqueue)
+        monkeypatch.setattr(lts, 'gpu_busy_reason', lambda: None)
+        monkeypatch.setattr(lts, '_target_node_classes', lambda: None)
+        monkeypatch.setattr(lts, '_preflight_run', lambda *a, **k: None)
+        with pytest.raises(RuntimeError, match='comfy exploded'):
+            lts.create_comparison_run(LOCAL_USER, [{'dataset_id': ds.id, 'checkpoint': cks[0]}],
+                                      [0.6, 0.8, 1.0, 1.2, 1.4], prompt='p', count=1)
+        rows = LoraTestImage.query.filter_by(dataset_id=ds.id).order_by(LoraTestImage.id).all()
+        assert len(rows) == 3                       # the 2 survivors + the failed one
+        queued = {j.job_id for j in ImageGenerationQueue.query.all()}
+        for r in rows[:2]:
+            assert r.status == 'pending' and r.job_id and r.job_id in queued
+        assert rows[2].status == 'failed' and 'comfy exploded' in (rows[2].error or '')
+        assert rows[2].job_id is None
+        assert len(queued) == 2                     # no job without its cell row
+
+
+def test_comparison_run_writes_one_transaction_per_cell_and_scans_loras_once(app, monkeypatch, tmp_path):
+    """Perf contract of the Studio launch: a grid must cost ONE commit per cell (not
+    the historical three) and ONE LoRA-folder scan per (dataset, family) - not one per
+    selection. 3 selections x 2 strengths = 6 cells => 6 commits, 1 scan."""
+    from app.services import lora_test_studio as lts
+    from app.config import LOCAL_USER
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+    with app.app_context():
+        ds, cks = _studio_fixture(tmp_path, monkeypatch, 'P', 'p', steps=(1000, 2000, 3000))
+        scans = {'n': 0}
+        real_list = lts.list_test_checkpoints
+
+        def counting_list(_ds, family=None):
+            scans['n'] += 1
+            return real_list(_ds, family)
+        monkeypatch.setattr(lts, 'list_test_checkpoints', counting_list)
+        monkeypatch.setattr(lts, '_build_cell_workflow', lambda *a, **k: {'1': {}})
+        monkeypatch.setattr(lts, 'gpu_busy_reason', lambda: None)
+        monkeypatch.setattr(lts, '_preflight_run', lambda *a, **k: None)
+        monkeypatch.setattr(lts, '_target_node_classes', lambda: None)
+        commits = {'n': 0}
+
+        def _count(_session):
+            commits['n'] += 1
+        event.listen(Session, 'after_commit', _count)
+        try:
+            out = lts.create_comparison_run(
+                LOCAL_USER, [{'dataset_id': ds.id, 'checkpoint': c} for c in cks],
+                [0.8, 1.0], prompt='p', count=1)
+        finally:
+            event.remove(Session, 'after_commit', _count)
+        assert out['created'] == 6
+        assert commits['n'] == 6, f'expected 1 commit per cell, got {commits["n"]}'
+        assert scans['n'] == 1, f'expected 1 LoRA scan for the dataset, got {scans["n"]}'
 
 
 def test_rate_image_accepts_only_valid_ratings(app):
@@ -1140,10 +1318,14 @@ def test_embedded_workflow_model_refs_are_all_layout_independent():
     EXPECTED = {
         ('ZImage_bigLove_ZT3_optimal.json', '1', 'unet_name'):
             ('z image\\bigLove_zt3.safetensors', 'OVERRIDDEN'),
+        # RESOLVED since bobba84 / GitHub #18: both refs are rewritten to whatever the
+        # target ComfyUI actually holds (services/zimage_model_resolver) instead of
+        # demanding this exact spelling. They stay PREFLIGHT-documented when nothing
+        # resolves — the workflow keeps these values and the 409 names them.
         ('ZImage_bigLove_ZT3_optimal.json', '2', 'clip_name'):
-            ('Z image\\qwen_3_4b.safetensors', 'PREFLIGHT_DOCUMENTED'),
+            ('Z image\\qwen_3_4b.safetensors', 'RESOLVED'),
         ('ZImage_bigLove_ZT3_optimal.json', '3', 'vae_name'):
-            ('z ae.safetensors', 'PREFLIGHT_DOCUMENTED'),
+            ('z ae.safetensors', 'RESOLVED'),
         ('image_real_HQ.json', '1', 'ckpt_name'):
             ('Biglove\\mopMixtureOfPervertsDMD_v40.safetensors', 'OVERRIDDEN'),
         ('image_real_HQ.json', '10', 'lora_name'):

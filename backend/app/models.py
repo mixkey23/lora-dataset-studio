@@ -63,6 +63,12 @@ class FaceDataset(db.Model):
     # consistency LoRA (anchors PHOTOGRAPHIC composition) is auto-skipped. Additive
     # migration in create_app.
     render_style = db.Column(String(16), nullable=True)
+    # WHAT the subject is: NULL/'human' (historique) or animal/creature/object/other.
+    # ORTHOGONALE à `kind` (character/concept/style) — un chien précis = character+animal,
+    # « les chiens en général » = concept+animal. Steers the generation catalog + the
+    # identity lock so the prompts stop assuming a person; NULL behaves exactly as
+    # 'human' (byte-identical). Colonne additive (migration in create_app).
+    subject_type = db.Column(String(16), nullable=True)
     # Cible de fidélité (datasets personnage) : NULL/'face' (historique) ou 'body'.
     # 'body' = le LoRA doit reproduire AUSSI la morphologie/les marques corporelles →
     # captions bannissent en plus tatouages/cicatrices/grains de beauté (ils se lient
@@ -129,6 +135,14 @@ class FaceDatasetImage(db.Model):
     # both stay outside training until the user resolves the pair explicitly.
     parent_image_id = db.Column(Integer, nullable=True)
     derivation_kind = db.Column(String(32), nullable=True)
+    # The bank_image this row was promoted FROM (NULL for everything else). It is
+    # what makes "already promoted into this dataset" a fact we can re-check
+    # instead of a one-way flag: when the user deletes the image here, the row —
+    # and with it the link — disappears, so the bank offers the image again.
+    # Deliberately no ForeignKey, like parent_image_id: legacy databases cannot
+    # gain one, and a dangling id must read as "not promoted", never as a boot
+    # error. Additive column (migration in create_app).
+    bank_image_id = db.Column(Integer, nullable=True, index=True)
     # Ressemblance faciale vs la reference (face analyzer Lot A). face_score = cosinus
     # ArcFace brut (NULL si non note) ; face_state = scorable|no_face|low_det|too_small|
     # extreme_pose|unreadable|error. Score brut persiste -> seuils recalibrables cote UI.
@@ -138,14 +152,18 @@ class FaceDatasetImage(db.Model):
     # affiché sur la tuile — sinon l'échec est muet et l'utilisateur relance à
     # l'aveugle. Nettoyé au regenerate. Colonne additive (migration create_app).
     fail_reason = db.Column(Text, nullable=True)
-    # Facteur d'agrandissement appliqué par le crop (head-crop auto à l'import OU
-    # recadrage manuel) pour atteindre le carré 1024 : size / côté_de_la_box. NULL =
+    # De combien la box recadrée (head-crop auto à l'import OU recadrage manuel) est
+    # en-dessous de la résolution d'entraînement : size / côté_de_la_box. NULL =
     # jamais croppé (import plein cadre) ou pas encore recalculé (anciennes lignes).
-    # >1 = le crop était plus petit que 1024 et a été agrandi (LANCZOS) — ce pixel-là
-    # est donc de la texture inventée, pas du détail réel, et sur-pèse la loss de
-    # cette image proportionnellement à sa part du cadre. Colonne additive (migration
-    # create_app). Alimente composition_upscaled (dataset_payload) pour repérer un
-    # dataset trop chargé en gros plans fabriqués plutôt que natifs.
+    # >1 = la box était plus petite que 1024. Deux producteurs, pixels différents,
+    # MÊME sens et même remède :
+    #   - import head-crop : la box est agrandie (LANCZOS) → texture inventée ;
+    #   - recadrage manuel : depuis la fin de l'agrandissement, la tuile garde ses
+    #     pixels et reste donc simplement sous la résolution d'entraînement.
+    # Dans les deux cas le cadrage est « rempli en recadrant », pas par une vraie
+    # prise native. Valeur et échelle INCHANGÉES (ne pas plafonner : le seuil
+    # UPSCALE_WARN_THRESHOLD et les lignes existantes en dépendent). Colonne additive
+    # (migration create_app). Alimente composition_upscaled (dataset_payload).
     upscale_ratio = db.Column(Float, nullable=True)
     # Watermark auto-correction (V1) : détection + suppression des watermarks INCRUSTÉS
     # (logo de site, URL, pseudo, texte de studio ajouté PAR-DESSUS la photo scrapée) —
@@ -165,6 +183,15 @@ class FaceDatasetImage(db.Model):
     # intégration prise en charge est Pexels : plateforme, page photo et crédit
     # photographe. Toute écriture passe par la validation stricte du service.
     source_metadata = db.Column(Text, nullable=True)
+    # Cached CONTENT hash of the file (sha1 of its bytes) and the `size:mtime` it
+    # was computed for. The run snapshot needs to know whether the PIXELS changed
+    # between two trainings — a re-crop, a "Reset to auto", a rembg mask or a
+    # scrubbed watermark all keep the same id and filename. Hashing every image
+    # at every launch would put file I/O on the launch path, so it is computed
+    # once and reused while the stat still matches. Purely derived: dropping both
+    # values only costs one re-hash. Additive columns (migration in create_app).
+    content_sig = db.Column(String(24), nullable=True)
+    content_sig_stat = db.Column(String(40), nullable=True)
     created_at = db.Column(DateTime, default=db.func.current_timestamp())
 
     def __repr__(self):
@@ -254,9 +281,23 @@ class BankImage(db.Model):
     style_cluster = db.Column(Integer, nullable=True, index=True)
     # Watermark pass (V2): reuses the dataset Qwen3-VL overlaid-watermark detector.
     # NULL = not scanned | 'none' (clean) | 'detected' (an overlaid watermark/logo/
-    # URL was found → the read-time 'watermark' flag) | 'error'. Detection only; the
-    # bank never edits the source file (cleaning stays a dataset-side action).
+    # URL was found → the read-time 'watermark' flag) | 'error' | 'cleaned' (one of
+    # the two cleaning levels produced a clean version) | 'dismissed' (the user ruled
+    # the flag a false positive — skipped by both cleaning levels and by re-scans).
+    # The SOURCE FILE is never edited: a cleaned image is a separate blob in the
+    # bank's own working directory (see image_bank_service.clean_image_path).
     watermark_state = db.Column(String(16), nullable=True)
+    # The detected mark's normalized bbox, JSON [x1,y1,x2,y2] in 0..1 — the SAME
+    # shape the dataset stores. Persisted (the detector parses it anyway) because
+    # the two cleaning levels route on it: without a bbox there is nothing to crop
+    # or to repaint. NULL on a row scanned by a build that only kept the boolean —
+    # such rows are re-picked by the next scan (see start_watermark).
+    watermark_bbox = db.Column(Text, nullable=True)
+    # How the cleaned blob was produced: NULL = none (no cleaned version on disk) |
+    # 'crop' (level 1, PIL, invents no pixel) | 'lama' | 'klein' (level 2, inpaint).
+    # Non-NULL is what makes the readers (promote, thumbnails, the file route)
+    # prefer the cleaned blob over the untouched source.
+    watermark_clean_method = db.Column(String(16), nullable=True)
     # Caption pass — a plain DESCRIPTIVE caption (no trigger, no identity omission:
     # a bank has no trigger word and nothing to protect). It doubles as the bank's
     # search text (the search bar matches caption + relpath) AND rides along to the
@@ -270,14 +311,58 @@ class BankImage(db.Model):
     # the 📐 Framing filter chips AND the coverage advice. Additive column —
     # created by db.create_all(), no migration (see _SCHEMA_ADDITIONS).
     framing = db.Column(String(8), nullable=True, index=True)
+    # Provenance pass — computed by the SAME pure-PIL quality scan (no numpy, no
+    # model), so every install gets them. See services/image_provenance.py for
+    # what each one measures and what it CANNOT tell.
+    #   detail_ratio    : effective resolution, 0..1 of the stored size. 0.5 = half
+    #                     the stored width is interpolation. RAW score — the
+    #                     'soft_detail' verdict is recomputed at read time against
+    #                     bank.detail_min, like every other bank score. NOT blur:
+    #                     sharpness is a contrast figure, this is a SCALE. It still
+    #                     cannot separate an enlargement from a soft photograph.
+    #   bars_ratio      : fraction of the frame taken by flat black letterbox bars.
+    #   jpeg_quality    : quality of the last JPEG save, 1..100, from the
+    #                     quantization tables. A displayed FACT, never a flag.
+    #   origin          : 'ai' | 'camera' | 'unknown' — THREE states, never two.
+    #                     'unknown' is the normal case (scrapers and chat apps strip
+    #                     metadata); it must never be read as "not AI".
+    #   origin_evidence : short token naming what proved it ('png-prompt',
+    #                     'exif-camera', ...). NEVER the metadata's content — a
+    #                     prompt is user data and this column is shown in the UI.
+    # NULL on any row scanned by a build that predates them; the next quality scan
+    # picks those rows back up on its own (see _scan_pool).
+    detail_ratio = db.Column(Float, nullable=True)
+    bars_ratio = db.Column(Float, nullable=True)
+    jpeg_quality = db.Column(Float, nullable=True)
+    origin = db.Column(String(8), nullable=True, index=True)
+    origin_evidence = db.Column(String(24), nullable=True)
+    # Manual turn, in degrees CLOCKWISE: NULL/0 = untouched | 90 | 180 | 270.
+    # (Idea by 1Tomber, GitHub #17.) A bank is a READ-ONLY view over the user's
+    # own folder, so a rotation cannot rewrite their file — it is stored here and
+    # applied by the ONE resolver every reader goes through
+    # (image_bank_service.resolved_image_path), which materialises a turned copy
+    # in the bank's own working directory. That makes the turn free of loss where
+    # it matters: the source keeps its exact bytes, and the derived copy is always
+    # rebuilt from that pristine source, so ANY angle costs exactly one re-encode
+    # and four quarter turns cost zero (the row is back at 0 and the copy is
+    # dropped). Additive column — existing banks carry NULL and behave as before.
+    rotation = db.Column(Integer, nullable=True)
     # Triage decision — same words as dataset images (pending|keep|reject).
     # reject_reason: blur|noise|uniform|small|duplicate|unreadable|manual
-    #                |low_aesthetic|nsfw|watermark (the V2 score-derived flags).
+    #                |low_aesthetic|nsfw|watermark (the V2 score-derived flags)
+    #                |soft_detail|bars (the provenance pass).
     status = db.Column(String(10), nullable=False, default='pending', index=True)
     reject_reason = db.Column(String(16), nullable=True)
     # Set once the image has been promoted (copied) into a dataset — the funnel's
     # provenance, and the guard against promoting the same file twice by accident.
     promoted_dataset_id = db.Column(Integer, nullable=True)
+    # Set once the image has been promoted (copied) into another BANK — the
+    # second destination of ⬆ Promote, for isolating candidates out of a big
+    # dump without committing them to a training container yet. A SEPARATE
+    # column on purpose: promoted_dataset_id is stored in user databases and
+    # read as "a dataset id" everywhere, so it is never re-pointed at a bank.
+    # An image can have gone to both; the two answers stay independent.
+    promoted_bank_id = db.Column(Integer, nullable=True)
     created_at = db.Column(DateTime, default=db.func.current_timestamp())
 
     def __repr__(self):
@@ -333,6 +418,7 @@ class LoraTestImage(db.Model):
     enhancer_strength = db.Column(Float, nullable=True)   # Krea2T-Enhancer : NULL=OFF, sinon force ON
     detail_amount = db.Column(Float, nullable=True)       # SDXL : DetailDaemon detail_amount (NULL=défaut)
     resolution_tier = db.Column(String(12), nullable=True)  # fast|standard|hq|max (compute_tier_dims) ; NULL=table fixe
+    resolution_multiplier = db.Column(Float, nullable=True)  # multiplicateur linéaire du palier [1.0,1.9] ; NULL/1.0=palier inchangé (resume fidèle)
     init_image = db.Column(String(255), nullable=True)    # Krea img2img : fichier init copié dans COMFYUI_INPUT_DIR
     denoise = db.Column(Float, nullable=True)             # Krea img2img : node 26 denoise
     # Scoring facial objectif (« best epoch », méthode jandordoe) : similarité
@@ -340,6 +426,23 @@ class LoraTestImage(db.Model):
     # ('scorable'/'no_face'/'low_det'/…). NULL = cellule pas encore scorée.
     face_score = db.Column(Float, nullable=True)
     face_state = db.Column(String(16), nullable=True)
+    # WHICH training checkpoint produced this image — the run's record id and the
+    # step, written AT GENERATION TIME by every surface that launches (Test
+    # Studio, LoRA Canvas, comparison grid). Deliberately not a ForeignKey: run
+    # records outlive their dataset, exactly like canvas_node_position.
+    #
+    # This inverts a dependency. Membership used to be DERIVED, on every render,
+    # from the deployed LoRA's filename through comfyui._parse_trained_stem — the
+    # heuristic that already shipped a bug (multi-word triggers cut at the
+    # underscore, 2026-07-17). The parse now survives only in the one-shot
+    # backfill (services.checkpoint_link_backfill), never in the hot path.
+    #
+    # NULL means "not linked", never "unknown, guess it": a legacy row whose
+    # filename carries no run tag stays NULL and is simply absent from the
+    # checkpoint gallery, with a counter saying how many there are. Additive
+    # columns → existing databases keep their rows (see _SCHEMA_ADDITIONS).
+    record_id = db.Column(Integer, nullable=True, index=True)
+    step = db.Column(Integer, nullable=True)
     created_at = db.Column(DateTime, default=db.func.current_timestamp())
 
     def __repr__(self):
@@ -500,6 +603,11 @@ class CloudTrainingRun(db.Model):
     error = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # When the user asked this run to stop. Durable on purpose: an in-memory
+    # threading.Event does not survive a restart and cannot be enforced by
+    # anything but the monitor thread — which is exactly what may be dead.
+    # The supervisor uses this to terminate a pod whose stop was never honoured.
+    stop_requested_at = db.Column(db.DateTime)
     finished_at = db.Column(db.DateTime)
 
 
@@ -529,6 +637,15 @@ class TrainingRunRecord(db.Model):
     # launch used (rank/alpha/resolution/optimizer/...) — shown per run on the
     # unified Runs page. NULL on pre-feature rows.
     settings = db.Column(db.Text)
+    # JSON run_snapshot: everything ELSE that defined this launch and that the
+    # manifest could only hash — the caption TEXT of every image, each image's
+    # true content hash, the dataset's kind/fidelity/reference, and the machine
+    # (ai-toolkit revision, torch/CUDA, GPU, identity of the base-model FILE).
+    # Without it a comparison can say "3 captions changed" but never what they
+    # said, and blames the dataset for a gap that came from a trainer upgrade.
+    # NULL on every pre-feature row: that run PREDATES full snapshots, which the
+    # diff states rather than inventing. Additive column (migration in create_app).
+    snapshot = db.Column(db.Text)
     version = db.Column(db.Integer, nullable=False)
     # Lineage (genealogy tree). A CONTINUATION stamps the record it resumed from
     # (parent_record_id) and the step it resumed AT (resumed_from) — the durable,
@@ -567,9 +684,19 @@ class CheckpointPreview(db.Model):
     the preview mapping lives here, keyed by (record_id, step). It does NOT store
     an image itself: the picture is produced by the reused Test-Studio engine and
     lands in the per-dataset folder as a LoraTestImage; `lora_test_image_id` points
-    at that row so the node reads the (async) filename + status live. Regenerating
-    a checkpoint replaces the pointer. New table -> created by db.create_all(),
-    no migration."""
+    at that row so the node reads the (async) filename + status live.
+
+    Previews ACCUMULATE. Until the LoRA Canvas there was a
+    ``UniqueConstraint('record_id', 'step')`` here and regenerating a checkpoint
+    REPLACED the pointer: the previous image stayed on disk but nothing pointed
+    at it any more, so a second look at the same epoch quietly erased the first.
+    A checkpoint now keeps every preview it was ever given, newest first, and the
+    node shows the newest one with the count beside it. Lifting a constraint on
+    SQLite means recreating the table — done once, row-count-guarded, in
+    ``services.checkpoint_preview_migration``.
+
+    New table -> created by db.create_all(); the constraint lift is the only
+    migration."""
     __tablename__ = 'checkpoint_preview'
     id = db.Column(db.Integer, primary_key=True)
     record_id = db.Column(db.Integer, nullable=False, index=True)
@@ -581,8 +708,11 @@ class CheckpointPreview(db.Model):
     prompt = db.Column(db.Text, nullable=False, default='')
     seed = db.Column(db.BigInteger, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    __table_args__ = (db.UniqueConstraint('record_id', 'step',
-                                          name='uq_checkpoint_preview'),)
+    # No UniqueConstraint on (record_id, step) — see the class docstring. The
+    # composite index replaces it: the reads are all "every preview of this
+    # checkpoint", which is exactly what the old unique index used to serve.
+    __table_args__ = (db.Index('ix_checkpoint_preview_record_step',
+                               'record_id', 'step'),)
 
 
 class TrainingPreset(db.Model):
@@ -605,3 +735,92 @@ class TrainingPreset(db.Model):
     variants = db.Column(db.Text, nullable=True)
     settings = db.Column(db.Text, nullable=False, default='{}')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class CanvasNodePosition(db.Model):
+    """Where the user DRAGGED one run's card on the ◉ LoRA Canvas.
+
+    A display preference, never provenance: moving a card changes nothing about
+    which run continued which — that stays derived from ``parent_record_id`` /
+    ``resumed_from``. One row per (dataset, run); no row at all means "wherever
+    the automatic tree puts it", which is why ``✦ Tidy up`` is simply deleting
+    every row of the lane.
+
+    The rows also do a second, less obvious job. The automatic layout re-centres
+    a parent over its children, so a NEW fork would shove every ancestor
+    sideways and quietly destroy an arrangement the user had built. As soon as a
+    lane holds one dragged card, the canvas writes a row for every OTHER card of
+    that lane too, at the position it already occupied — from then on a new run
+    lands in free space and nothing already on the board moves.
+
+    ⚠️ The ``dataset`` relationship is not decoration. Child models here declare
+    only a table-level ForeignKey, and without a mapper-level relationship the
+    unit of work has no ordering dependency: SQLAlchemy emits
+    ``DELETE FROM face_dataset`` first and a legacy database whose FK lacks
+    ON DELETE CASCADE answers HTTP 500. delete_dataset ALSO deletes these rows
+    explicitly and flushes before the parent — belt and braces, because that bug
+    has already shipped once in this project. New table -> created by
+    db.create_all(), no migration."""
+    __tablename__ = 'canvas_node_position'
+    id = db.Column(db.Integer, primary_key=True)
+    dataset_id = db.Column(
+        db.Integer, db.ForeignKey('face_dataset.id', ondelete='CASCADE'),
+        nullable=False, index=True)
+    # The training run's record id (training_run_record.id). Deliberately NOT a
+    # ForeignKey: run records OUTLIVE their dataset (history is kept on purpose,
+    # see delete_dataset), so a constraint here would fight that.
+    record_id = db.Column(db.Integer, nullable=False, index=True)
+    x = db.Column(Float, nullable=False, default=0.0)
+    y = db.Column(Float, nullable=False, default=0.0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow,
+                           onupdate=datetime.utcnow)
+    dataset = db.relationship('FaceDataset')
+    __table_args__ = (db.UniqueConstraint('dataset_id', 'record_id',
+                                          name='uq_canvas_node_position'),)
+
+
+class CanvasImageNode(db.Model):
+    """🖼 A generated image PINNED onto the ◉ LoRA Canvas, as a node of its own.
+
+    The board compares checkpoints; the thing being compared is the picture. A
+    picture you can only see one at a time, in a modal, is a picture you cannot
+    compare — so an image can be dropped onto the board, moved and resized like
+    any other node, next to the pill that made it.
+
+    Same table shape and the same reasoning as ``CanvasNodePosition``, one row
+    per (dataset, image): coordinates are LANE-LOCAL, the same world units the
+    card positions use, so both live in one coordinate system and one lane
+    extent.
+
+    ⚠️ ``visible`` is the whole feature, not a flag. Closing a pinned image must
+    NOT forget where it was: re-opening it has to put it back exactly where and
+    at the size it was closed at. So the close writes ``visible = False`` and
+    keeps the geometry; only an explicit "forget" would delete the row, and
+    nothing in the UI does that today.
+
+    ``image_id`` is ``lora_test_image.id`` and is deliberately NOT a ForeignKey,
+    for the same reason ``record_id`` above is not one: it is resolved on read
+    and a row whose image no longer exists is DELETED there (see
+    ``canvas_image_nodes``). A constraint would turn "the user deleted that
+    render" into a database error instead of a node quietly leaving the board.
+
+    The link to the source checkpoint is NOT stored: it is read off the image
+    row (``record_id`` / ``step``), so a pinned image can never disagree with
+    the gallery about which checkpoint produced it. New table -> created by
+    db.create_all(), no migration."""
+    __tablename__ = 'canvas_image_node'
+    id = db.Column(db.Integer, primary_key=True)
+    dataset_id = db.Column(
+        db.Integer, db.ForeignKey('face_dataset.id', ondelete='CASCADE'),
+        nullable=False, index=True)
+    image_id = db.Column(db.Integer, nullable=False, index=True)
+    x = db.Column(Float, nullable=False, default=0.0)
+    y = db.Column(Float, nullable=False, default=0.0)
+    w = db.Column(Float, nullable=False, default=260.0)
+    h = db.Column(Float, nullable=False, default=260.0)
+    visible = db.Column(db.Boolean, nullable=False, default=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow,
+                           onupdate=datetime.utcnow)
+    dataset = db.relationship('FaceDataset')
+    __table_args__ = (db.UniqueConstraint('dataset_id', 'image_id',
+                                          name='uq_canvas_image_node'),)

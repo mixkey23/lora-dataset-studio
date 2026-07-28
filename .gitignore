@@ -1,5 +1,11 @@
 # secrets & local config — NEVER commit
 .env
+# Per-machine dev overrides, e.g. frontend/.env.local pointing `npm run dev` at a
+# throwaway backend instead of the real one (LDS_DEV_API_TARGET — see
+# frontend/README.md). `.env` above does NOT cover these: it matches that exact
+# name only.
+.env.local
+.env.*.local
 config.json
 
 # runtime data
@@ -24,6 +30,10 @@ packaging/build/
 packaging/dist/
 packaging/*.spec
 
+# Generated release body (frontend/scripts/releaseNotes.mjs --out) — a build
+# artifact of release.yml, and scratch when you run the generator by hand.
+/release-notes.md
+
 # OS
 .DS_Store
 Thumbs.db
@@ -35,3 +45,8 @@ Thumbs.db
 
 # internal planning artifacts (local machine paths) — keep local, never publish
 docs/superpowers/
+
+# Local privacy guard-rail: the identifiers test_no_personal_data.py must never
+# find in tracked files. Kept OUT of the repo — writing them down here would
+# publish exactly what they forbid.
+.privacy-names

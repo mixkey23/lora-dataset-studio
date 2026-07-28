@@ -5,6 +5,34 @@ both API engines uniformly: reference photo(s) + variation prompt -> generated
 image bytes (or None). Uses the multipart /images/edits endpoint (image[0] = the
 base to edit, the rest = extra identity references, 16 max). No GPU, no ComfyUI —
 SFW only by provider policy (moderation 400 -> None, the row just fails).
+
+CHOOSING THE MODEL
+------------------
+`engines.chatgpt_image_model` is free text (Settings ▸ Image engines): OpenAI
+ships image models faster than this app ships releases. Resolution order, read at
+CALL time so a change in Settings applies without a restart:
+
+    engines.chatgpt_image_model  >  CHATGPT_IMAGE_MODEL (env)  >  DEFAULT_IMAGE_MODEL
+
+The environment variable is still honoured, and above the built-in default: it
+existed before the setting did. Only an explicit slug typed in Settings outranks
+it — which is why the config default is BLANK rather than a copy of
+DEFAULT_IMAGE_MODEL (see config.DEFAULTS['engines']).
+
+SCOPE: this is the image model of the API-KEY lane. The subscription lane renders
+through OpenAI's own `image_generation` tool, which serves that plan's image model
+(gpt-image-2 today) and takes no slug from us — so the setting does not apply
+there, and the field says so. `engines.chatgpt_subscription_model` is a third
+thing again: the Codex ROUTER model of that lane, which decides nothing about the
+pixels. None of the three are ever merged.
+
+FAILING LOUDLY
+--------------
+A rejected key, an unknown model, or a model gated behind OpenAI organization
+verification now raises a NAMED, FATAL error (see engine_errors) that stops the
+batch instead of returning None — which the fan-out would have worded as "empty
+response (often a content-policy refusal)", the wrong sentence entirely. A
+moderation 400 still returns None: there, that sentence is right.
 """
 from __future__ import annotations
 import base64
@@ -16,16 +44,34 @@ import uuid
 import requests
 
 from .. import config as cfg
+from .engine_errors import EngineError, EngineFatal
 
 logger = logging.getLogger(__name__)
 
 # gpt-image-2 = the only current model usable without OpenAI organization
-# verification (gpt-image-1.5 / chatgpt-image-latest 403 without it).
-CHATGPT_IMAGE_MODEL = os.environ.get('CHATGPT_IMAGE_MODEL', 'gpt-image-2')
+# verification (gpt-image-1.5 / chatgpt-image-latest 403 without it). That trap
+# is surfaced in the Settings field's own help, not just here: someone who types
+# a newer slug and gets a 403 must not conclude their key is broken.
+DEFAULT_IMAGE_MODEL = 'gpt-image-2'
+_ENV_VAR = 'CHATGPT_IMAGE_MODEL'
 # Dataset images are final training material -> default to 'high' (≈ Nano
 # Banana's price point). Override with CHATGPT_IMAGE_QUALITY=medium to iterate.
 CHATGPT_IMAGE_QUALITY = os.environ.get('CHATGPT_IMAGE_QUALITY', 'high')
 _API = "https://api.openai.com/v1/images/edits"
+
+_NO_KEY = ('no OpenAI API key saved — add OPENAI_API_KEY in '
+           'Settings > Image engines, or connect a ChatGPT subscription')
+
+# Fragments OpenAI uses when a 400 blames the MODEL rather than this prompt: an
+# unknown slug, or one that /images/edits does not serve (a text-to-image-only
+# model can never work here — the dataset generator always sends reference
+# images). Matching the provider's own words keeps a genuine moderation 400 —
+# which IS per-prompt — from cancelling the batch.
+_MODEL_FAULT_HINTS = (
+    'model_not_found', 'does not exist', 'do not have access',
+    'supported values are', 'not supported', 'does not support', 'unsupported',
+    'must be verified', 'organization must be verified',
+)
 
 # --- Subscription lane (Codex OAuth) -----------------------------------------
 # EXPERIMENTAL: renders gpt-image-2 on the user's ChatGPT subscription quota via
@@ -34,6 +80,15 @@ CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 # The Codex lane accepts far fewer input images than /images/edits (16).
 SUBSCRIPTION_MAX_REFS = 5
 SUBSCRIPTION_ROUTER_MODEL = 'gpt-5.4-mini'   # routing model only; images are gpt-image-2
+
+
+class ChatGPTImageError(EngineError):
+    """A named ChatGPT-image failure. User-facing text, never carries the key."""
+
+
+class ChatGPTImageFatal(ChatGPTImageError, EngineFatal):
+    """A failure that would repeat on every remaining row (missing/rejected key,
+    unknown model, model gated behind organization verification)."""
 
 
 class SubscriptionQuotaExceeded(RuntimeError):
@@ -51,6 +106,96 @@ class SubscriptionUnavailable(RuntimeError):
 
 def _api_key():
     return cfg.secret('OPENAI_API_KEY')
+
+
+def get_image_model() -> str:
+    """The image model this engine will ask for: setting > env var > built-in
+    default. Read fresh on every call, so a slug typed in Settings applies to the
+    very next generation with no restart."""
+    return ((cfg.get('engines.chatgpt_image_model') or '').strip()
+            or (os.environ.get(_ENV_VAR) or '').strip()
+            or DEFAULT_IMAGE_MODEL)
+
+
+def _error_message(resp) -> str:
+    """OpenAI's own explanation, trimmed. Documented envelope is
+    {"error": {"message", "type", "param", "code"}}; an edge/proxy failure
+    answers something else, so fall back to the raw text."""
+    try:
+        body = resp.json()
+    except Exception:                                  # noqa: BLE001 — non-JSON edge error
+        body = None
+    if isinstance(body, dict):
+        err = body.get('error')
+        if isinstance(err, dict):
+            msg = str(err.get('message') or '').strip()
+            if msg:
+                return msg[:300]
+        elif isinstance(err, str) and err.strip():
+            return err.strip()[:300]
+    try:
+        return (resp.text or '').strip()[:300]
+    except Exception:                                  # noqa: BLE001
+        return ''
+
+
+def _blames_the_model(resp, detail: str) -> bool:
+    """Does this 400 blame the model rather than the prompt? OpenAI marks it in
+    the envelope (`param: "model"`, `code: "model_not_found"`) when it can; the
+    wording check catches the rest."""
+    try:
+        err = (resp.json() or {}).get('error') or {}
+    except Exception:                                  # noqa: BLE001
+        err = {}
+    if isinstance(err, dict):
+        if str(err.get('param') or '') == 'model':
+            return True
+        if str(err.get('code') or '') in ('model_not_found', 'invalid_model'):
+            return True
+    low = detail.lower()
+    return any(h in low for h in _MODEL_FAULT_HINTS)
+
+
+def _raise_for_api_status(resp, *, model: str) -> None:
+    """Turn a non-200 from the API lane into the most specific outcome we can
+    justify. Returns normally for the ONE case that stays a silent per-row
+    failure: a moderation 400, which the caller reports as an empty response —
+    the historical behaviour, and the right words for a refused prompt.
+
+    401/403 (the key, or an unverified organization) and 404 / a model-blaming
+    400 would refuse every other row identically, so they are FATAL. 429 and 5xx
+    are transient and stay per-row."""
+    status = resp.status_code
+    if status == 200:
+        return
+    detail = _error_message(resp)
+    suffix = f': {detail}' if detail else ''
+    if status == 401:
+        raise ChatGPTImageFatal(f'OpenAI rejected the API key (HTTP 401){suffix}')
+    if status == 403:
+        # The organization-verification wall lands here: `gpt-image-2` is the one
+        # model that does not need it, so name that instead of leaving the user to
+        # suspect their key.
+        raise ChatGPTImageFatal(
+            f'OpenAI refused the model "{model}" (HTTP 403){suffix} — models newer '
+            f'than {DEFAULT_IMAGE_MODEL} need OpenAI organization verification; '
+            f'set the model back to {DEFAULT_IMAGE_MODEL} in Settings > Image '
+            'engines, or verify your organization with OpenAI')
+    if status == 404:
+        raise ChatGPTImageFatal(
+            f'OpenAI does not serve the model "{model}" (HTTP 404){suffix} — '
+            'check the model in Settings > Image engines')
+    if status == 429:
+        raise ChatGPTImageError(f'OpenAI rate-limited the request (HTTP 429){suffix}')
+    if status == 400:
+        if _blames_the_model(resp, detail):
+            raise ChatGPTImageFatal(
+                f'OpenAI refused the request for model "{model}" (HTTP 400){suffix} — '
+                'this engine always sends your reference photos to the image-editing '
+                'endpoint, so the model must accept image input; check the model in '
+                'Settings > Image engines')
+        return                                         # moderation / per-prompt refusal
+    raise ChatGPTImageError(f'OpenAI returned HTTP {status}{suffix}')
 
 
 def size_for_aspect(aspect_ratio: str) -> str:
@@ -88,13 +233,15 @@ def _generate_via_api(ref_bytes: bytes | list[bytes], prompt: str, model: str | 
     NB: gpt-image-2 does NOT accept `input_fidelity` (400) — never send it."""
     key = _api_key()
     if not key:
-        logger.warning("chatgpt_image: no OpenAI API key (OPENAI_API_KEY)")
-        return None
+        # An exception, not None: a missing key must never read to the user as
+        # "the provider refused your prompt".
+        raise ChatGPTImageFatal(_NO_KEY)
+    mdl = (model or '').strip() or get_image_model()
     refs = list(ref_bytes) if isinstance(ref_bytes, (list, tuple)) else [ref_bytes]
     refs = refs[:16]
     files = [('image[]', (f'ref{i}.webp', rb, 'image/webp')) for i, rb in enumerate(refs)]
     data = {
-        'model': model or CHATGPT_IMAGE_MODEL,
+        'model': mdl,
         'prompt': prompt,
         'size': size_for_aspect(aspect_ratio),
         'quality': CHATGPT_IMAGE_QUALITY,
@@ -104,12 +251,12 @@ def _generate_via_api(ref_bytes: bytes | list[bytes], prompt: str, model: str | 
         r = requests.post(_API, headers={"Authorization": f"Bearer {key}"},
                           data=data, files=files, timeout=(10, 420))
     except requests.RequestException as e:
-        logger.warning(f"chatgpt_image: request error: {e}")
-        return None
+        raise ChatGPTImageError(f'could not reach OpenAI: {e}')
     if r.status_code != 200:
-        # 400 moderation/content-policy lands here too: the row fails, the user
-        # can switch that shot to Klein (local) — mirrored from the skill notes.
+        # Raises for everything the user can act on; returns for a moderation 400,
+        # where the row simply fails and the shot can be switched to Klein (local).
         logger.warning(f"chatgpt_image: HTTP {r.status_code}: {r.text[:300]}")
+        _raise_for_api_status(r, model=mdl)
         return None
     img = parse_image_response(r.json())
     if img is None:

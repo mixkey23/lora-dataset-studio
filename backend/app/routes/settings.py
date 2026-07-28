@@ -1,4 +1,6 @@
 """Settings API: config/secrets CRUD + capability probes."""
+import sys
+
 from flask import Blueprint, current_app, jsonify, request
 
 from .. import capabilities
@@ -14,6 +16,7 @@ bp = Blueprint('settings', __name__, url_prefix='/api')
 _TEST_TARGETS = {
     'gemini': capabilities.probe_gemini,
     'openai': capabilities.probe_openai,
+    'openrouter': capabilities.probe_openrouter,
     'comfyui': capabilities.probe_comfyui,
     # End-to-end (reachable + vision model pulled), NOT reachability alone: the old
     # reachability-only target returned a green check while the Setup/diagnostic model
@@ -21,7 +24,9 @@ _TEST_TARGETS = {
     # probe_ollama_model so the Test button, the Setup step and the diagnostic are one
     # source of truth.
     'ollama': capabilities.probe_ollama_connection,
-    'aitoolkit': capabilities.probe_aitoolkit,
+    # Folder checks PLUS an `import torch` on the chosen interpreter: a Test that
+    # goes green on a Python without torch is the trap of GitHub #19 (strouder).
+    'aitoolkit': capabilities.probe_aitoolkit_test,
     'musubi_tuner': capabilities.probe_musubi_tuner,
     'face_scoring': capabilities.probe_face_scoring,
     'masks': capabilities.probe_masks,
@@ -88,10 +93,25 @@ def _settings_payload() -> dict:
     # Settings UI can display the REAL default text (and offer "Load default to
     # edit") instead of leaving the field blank behind a generic placeholder.
     # Import-pure module (no Flask); these are code constants, not secrets.
-    from ..services.face_variations import identity_prompt_defaults
+    # `identity_prompt_defaults` stays the HUMAN set (the historical payload key,
+    # unchanged for any client reading it); `_by_subject` adds the other four sets
+    # so the Settings screen — which edits out of any dataset context — can show
+    # the real default next to whichever subject type the user is editing.
+    from ..services.face_variations import (identity_prompt_defaults,
+                                            identity_prompt_defaults_by_subject)
     return {
         'config': cfg.load_config(), 'secrets': _secret_presence(),
+        # The shipped default of every config key, for the SCALAR settings what
+        # identity_prompt_defaults is for the prompts: `config` above is already
+        # merged, so a number in it is indistinguishable from the default and the
+        # UI had no way to offer "Reset to default" on a number, a path or a
+        # select. Sent whole and derived from cfg.DEFAULTS (see cfg.defaults) so
+        # the frontend never carries its own copy of a default that could go
+        # stale. No secret lives here — secrets are in .env, and `secrets` above
+        # only reports presence.
+        'config_defaults': cfg.defaults(),
         'identity_prompt_defaults': identity_prompt_defaults(),
+        'identity_prompt_defaults_by_subject': identity_prompt_defaults_by_subject(),
         # What THIS running process is actually bound to — run.py stamps these
         # before app.run(); a dev/test boot that never went through run.py (or a
         # WSGI launch) leaves them unset, so the Server card just hides the
@@ -112,6 +132,32 @@ def _settings_payload() -> dict:
 @bp.get('/settings')
 def get_settings():
     return jsonify(_settings_payload())
+
+
+@bp.post('/settings/prompt-preview')
+def post_prompt_preview():
+    """The COMPOSED prompt one engine would receive for one shot — the ~1000
+    characters assembled from the six editable parts, which nothing in the app
+    ever showed. Pure text: it calls the same wrappers generation calls, and
+    starts no job, touches no GPU and spends nothing.
+
+    POST (not GET) because it carries the editor's UNSAVED `identity_prompts`
+    tree: Settings saves on an explicit button, so a preview reading the saved
+    config would show the previous text at exactly the moment the user is editing.
+    Omit `identity_prompts` to preview what is saved. A malformed body degrades to
+    a default preview rather than 400 — this panel is a debugging aid, and a
+    broken one that answers 'error' is worth less than one that answers with the
+    shipped prompt."""
+    from ..services import face_variations as fv
+    body = request.get_json(force=True, silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    overrides = body.get('identity_prompts')
+    return jsonify(fv.compose_preview(
+        body.get('engine'), subject_type=body.get('subject_type') or 'human',
+        framing=body.get('framing') or 'bust', nsfw=bool(body.get('nsfw')),
+        suffix=body.get('suffix') if isinstance(body.get('suffix'), str) else '',
+        overrides=overrides if isinstance(overrides, dict) else None))
 
 
 @bp.put('/settings')
@@ -209,6 +255,64 @@ def loras_list():
         current_app.logger.exception('loras list scan failed')
         loras = []
     return jsonify({'loras': loras})
+
+
+@bp.get('/scoring-python')
+def scoring_python_list():
+    """Pythons on this machine that could run the ✨ Score pass, each with a
+    per-dependency verdict — the picker behind "use a GPU Python you already
+    have". ``?force=1`` re-probes (after the user pip-installed something);
+    ``?path=`` adds a hand-typed interpreter to the list. Read-only: nothing is
+    ever installed into an environment the app did not build.
+
+    Degrades rather than 500s, so the panel can never break the page — but it
+    says WHICH degradation it is. An empty list is also the legitimate verdict
+    'nothing to borrow on this machine', and returning that shape for a crash
+    left the user with no reason to press '↻ Check again' about a failure that
+    retrying might well fix. `detection_failed` separates the two, and
+    `default_python` stays filled in: it is the one thing we know regardless."""
+    from ..services import scoring_python
+    force = bool(request.args.get('force'))
+    if force:
+        # "↻ Check again" is what a user clicks right after installing a package
+        # by hand. Re-probing only OUR cache would leave the capability probes
+        # (10 min TTL) still saying "not installed" — two surfaces disagreeing
+        # about the same interpreter is exactly what makes a fix look broken.
+        capabilities.clear_import_cache()
+    try:
+        return jsonify(scoring_python.detect(
+            force=force, extra_path=request.args.get('path') or ''))
+    except Exception as e:
+        current_app.logger.exception('scoring interpreter detection failed')
+        try:
+            selected = (cfg.get('bank_scoring.python') or '').strip()
+        except Exception:      # noqa: BLE001 — a config read that also fails
+            selected = ''
+        return jsonify({
+            'selected': selected,
+            'default_python': sys.executable,
+            'interpreters': [],
+            'detection_failed': True,
+            'detection_error': str(e)[:300],
+        })
+
+
+@bp.post('/scoring-python')
+def scoring_python_select():
+    """Point ✨ Score at an interpreter (``{python: "<path>"}``), or back at the
+    app's own (``{python: ""}``). Refuses — 400, with the verdict attached — any
+    interpreter that could not be proven able to run the pass, so a bad pick can
+    never turn an hour of scoring into an import error."""
+    from ..services import scoring_python
+    body = request.get_json(silent=True) or {}
+    try:
+        result = scoring_python.select(body.get('python') or '')
+    except scoring_python.SelectionError as e:
+        return jsonify({'error': str(e), 'verdict': e.verdict}), 400
+    except Exception as e:
+        current_app.logger.exception('scoring interpreter selection failed')
+        return jsonify({'error': f'could not save the interpreter: {e}'}), 500
+    return jsonify(result)
 
 
 @bp.post('/settings/test/<target>')
@@ -360,6 +464,24 @@ def trash_info():
     return jsonify({'size_bytes': trash.trash_size()})
 
 
+@bp.get('/run-archive')
+def run_archive_info():
+    """Size + ceiling of the training-image archive (the deduplicated copies that
+    let a comparison still SHOW an image deleted since it was trained)."""
+    from ..services import run_archive
+    return jsonify({'size_bytes': run_archive.size_bytes(refresh=True),
+                    'max_bytes': run_archive.max_bytes(),
+                    'enabled': run_archive.enabled()})
+
+
+@bp.post('/run-archive/clear')
+def run_archive_clear():
+    """Drop every archived image. Runs, settings and caption text are in the
+    database and survive; only the ability to LOOK at a since-deleted image goes."""
+    from ..services import run_archive
+    return jsonify({'ok': True, **run_archive.clear()})
+
+
 @bp.post('/trash/open')
 def trash_open():
     """Open the server-resolved trash directory; the client supplies no path."""
@@ -487,7 +609,7 @@ def _recent_generation_errors(scan=40) -> dict:
             low = reason.lower()
             # fail_reason is written as f'{engine}: …' on the generation path, so the
             # engine is the prefix; anything else lands in 'other' (save/queue errors).
-            eng = next((e for e in ('klein', 'chatgpt', 'nanobanana')
+            eng = next((e for e in ('klein', 'chatgpt', 'nanobanana', 'openrouter')
                         if low.startswith(e)), 'other')
             engines.setdefault(eng, reason)  # first hit == most recent for that engine
     except Exception:
@@ -535,6 +657,7 @@ def diagnostic():
     from ..version import APP_VERSION
     from ..services import updater
     from ..services import lineage_backfill as _lineage_backfill
+    from ..services import framing_backfill as _framing_backfill
     conf = cfg.load_config()
     caps = capabilities.probe()
     e = caps.get('engines') or {}
@@ -563,8 +686,12 @@ def diagnostic():
         'disk': _disk_free(),
         'secrets_present': _secret_presence(),
         'capabilities': {
+            # Every engine the build knows about — the formatter already prints
+            # openrouter, so leaving it out of the payload made every report say
+            # "openrouter=no" no matter how it was configured.
             'engines': {'nanobanana': bool(e.get('nanobanana')),
                         'chatgpt': bool(e.get('chatgpt')),
+                        'openrouter': bool(e.get('openrouter')),
                         'klein': bool(e.get('klein'))},
             'comfyui_reachable': bool(comfy.get('reachable')),
             'klein_model': bool((comfy.get('models') or {}).get('klein')),
@@ -617,6 +744,10 @@ def diagnostic():
         # lineage edge was persisted: how many edges it reconstructed (0 on a fresh
         # or fully-native database). Paste-safe — counts only, no paths.
         'lineage_backfill': _lineage_backfill.summary(),
+        # Same idea for the images promoted from a bank before the promotion
+        # carried their framing: how many rows the one-shot pass gave back to the
+        # Composition tally (0 on a fresh database). Counts only, no paths.
+        'framing_backfill': _framing_backfill.summary(),
         'log_tail': log_lines,
         'generated_at': int(time.time()),
     })

@@ -97,9 +97,26 @@ _SETTING_ROWS = [
     ('timestep_type', 'Timestep type', str),
     ('dropout', 'LoRA dropout', str),
     ('ema', 'EMA decay', str),
+    ('batch_size', 'Batch size', str),
+    ('dual_captions', 'Dual captions', lambda v: 'yes' if v else 'no'),
+    # Memory strategy: a quantised run and a full-precision one are different
+    # experiments, so a shared config that omitted them could not be reproduced.
+    ('quantize', 'Quantise base model', lambda v: 'yes' if v else 'no'),
+    ('quantize_te', 'Quantise text encoder', lambda v: 'yes' if v else 'no'),
+    ('low_vram', 'Low-VRAM streaming', lambda v: 'yes' if v else 'no'),
     ('sample_every', 'Sample every', _fmt_steps),
 ]
 _KNOWN_SETTING_KEYS = {k for k, _, _ in _SETTING_ROWS} | {'style_mode'}
+
+
+def _snapshot_env(rec):
+    """The 'machine at launch' block of a record's snapshot, or None. Never
+    raises: a share file must render for a run recorded before snapshots too."""
+    try:
+        from . import run_snapshot
+        return (run_snapshot.loads(rec) or {}).get('env')
+    except Exception:
+        return None
 
 
 def _fmt_dt(dt):
@@ -234,6 +251,30 @@ def build_run_config_text(run_key):
     # masked lives on the run row (not the snapshot) — always known for records.
     if masked is not None:
         L.append(f'{"Masked training:":<24}{"yes" if masked else "no"}')
+
+    # --- machine -------------------------------------------------------------
+    # The trainer's own version is half of any "why did this run come out
+    # different" answer, and it is exactly what a help thread asks for first.
+    # Already redacted at capture time; nothing here is secret.
+    env = (_snapshot_env(rec) or {})
+    if env:
+        L.append('')
+        L.append('## Machine at launch')
+        L.append('')
+        at = env.get('aitoolkit') or {}
+        if at.get('commit'):
+            when = f' ({at["committed_at"][:10]})' if at.get('committed_at') else ''
+            L.append(f'{"ai-toolkit:":<24}{at["commit"]}{when}')
+        if env.get('torch'):
+            cu = f' / CUDA {env["cuda"]}' if env.get('cuda') else ''
+            L.append(f'{"PyTorch:":<24}{env["torch"]}{cu}')
+        if env.get('gpu'):
+            drv = f' (driver {env["gpu_driver"]})' if env.get('gpu_driver') else ''
+            L.append(f'{"Local GPU:":<24}{env["gpu"]}{drv}')
+        bf = env.get('base_file') or {}
+        if bf.get('name'):
+            L.append(f'{"Base file:":<24}{bf["name"]} '
+                     f'({bf.get("size", 0) / (1 << 30):.1f} GB, id {bf.get("sig", "?")})')
 
     # --- run outcome ---------------------------------------------------------
     L.append('')
