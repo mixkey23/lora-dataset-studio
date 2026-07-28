@@ -422,7 +422,7 @@ def test_auto_retry_freezes_advanced_settings_after_dataset_edit(
         'grad_accum': 2, 'timestep_type': 'linear',
         'lr_scheduler': 'constant_with_warmup', 'warmup': 200,
         'network_type': 'lokr', 'ema': 0.99,
-        'sample_every': 500,
+        'sample_enabled': True, 'sample_every': 500,
         'sample_prompts': ['{trigger}, original preview'],
     })
     changed = json.dumps({

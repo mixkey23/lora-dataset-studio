@@ -1798,7 +1798,14 @@ def _sample_prompts(ds, trigger) -> list:
     """Prompts de preview effectifs : liste custom de train_settings si présente,
     sinon défaut selon le kind. `{trigger}` (placeholder explicite) ET le trigger en
     clair sont gérés ; le trigger est auto-préfixé s'il manque. Toujours ≥1 prompt,
-    ≤_MAX_SAMPLE_PROMPTS (borne le nombre d'images générées par palier)."""
+    ≤_MAX_SAMPLE_PROMPTS (borne le nombre d'images générées par palier) — SAUF si
+    sample_enabled est faux (défaut), auquel cas [] : ai-toolkit ne génère aucune
+    preview quand sa config `sample.prompts` est vide, et le launch musubi (plus
+    bas) omet tout le bloc --sample_* quand cette liste est vide. Un SEUL point
+    de vérité pour les deux moteurs, plutôt que dupliquer le check à chaque site
+    d'appel (7 builders ai-toolkit + 1 site musubi)."""
+    if not _sample_enabled(ds):
+        return []
     raw = _train_settings(ds).get('sample_prompts')
     tmpl = raw if (isinstance(raw, list)
                    and any(isinstance(x, str) and x.strip() for x in raw)) \
@@ -1831,6 +1838,15 @@ def _sample_prompts(ds, trigger) -> list:
 def _sample_every(ds) -> int:
     v = _train_settings(ds).get('sample_every')
     return v if v in _SAMPLE_EVERY_CHOICES else 250
+
+
+def _sample_enabled(ds) -> bool:
+    """Off by default (feature request, mbermudez.tech): a preview render is an
+    extra VAE-decode-to-pixels pass on top of an already tight VRAM budget (see
+    the musubi sample-resolution cap below) and most runs are unattended, so
+    opting IN is the safer default rather than opting out of a cost nobody asked
+    for."""
+    return bool(_train_settings(ds).get('sample_enabled'))
 
 
 def launch_settings_snapshot(ds, family=None) -> dict:
@@ -2032,6 +2048,7 @@ def effective_train_settings(ds, family=None) -> dict:
             'save_every': _save_every(ds),
             'max_step_saves': _max_step_saves(ds),
             'max_step_saves_choices': list(_MAX_SAVES_CHOICES),
+            'sample_enabled': _sample_enabled(ds),
             'sample_every': _sample_every(ds),
             # liste STOCKÉE brute (telle que tapée) ou [] → textarea vide = « défauts ».
             'sample_prompts': stored_prompts if isinstance(stored_prompts, list) else [],
@@ -2185,6 +2202,13 @@ def update_train_settings(user_id, dataset_id, patch: dict) -> dict:
             cur['dual_captions'] = True
         else:
             cur.pop('dual_captions', None)
+    if 'sample_enabled' in patch:
+        # Same plain-boolean contract as dual_captions: OFF (the default) is
+        # byte-identical to a dataset that never touched the key.
+        if patch['sample_enabled']:
+            cur['sample_enabled'] = True
+        else:
+            cur.pop('sample_enabled', None)
     if 'mask_faces' in patch:
         # Concept face masking (issue #15, shivdbz2010). Same plain-boolean contract
         # as dual_captions: falsy drops the key, so OFF is byte-identical to a
@@ -2228,7 +2252,7 @@ def update_train_settings(user_id, dataset_id, patch: dict) -> dict:
 # new expert lever is added above. This is what makes presets schema-tolerant:
 # a preset key outside this list is IGNORED (and reported), never fatal.
 TRAIN_SETTING_KEYS = ('rank', 'resolution', 'save_every', 'max_step_saves',
-                      'sample_every', 'sample_prompts', 'dropout', 'alpha',
+                      'sample_enabled', 'sample_every', 'sample_prompts', 'dropout', 'alpha',
                       'timestep_type', 'optimizer', 'lr_scheduler', 'warmup',
                       'grad_accum', 'network_type', 'ema', 'dual_captions',
                       'mask_faces', 'learning_rate', 'musubi_profile', *_MEMORY_SETTING_KEYS)
@@ -5998,10 +6022,14 @@ def launch_training(user_id, dataset_id, steps: int | None = None, check_caption
         # only shrinks the thing we added on top. min() so a profile already
         # BELOW 1024 (e.g. vram5 at 768) is never bumped up.
         _musubi_sample_res = min(_musubi_res, 1024)
+        # Off by default (sample_enabled) — None here (not an empty-prompts file)
+        # so build_train_argv's `if sample_prompts:` omits the whole --sample_*
+        # block instead of pointing accelerate at a file with nothing in it.
         _musubi_sample_prompts_path = musubi_tuner.write_sample_prompts(
             _sample_prompts(ds, _safe_trigger(ds)),
             f'{dataset_folder}_musubi_samples.txt',
-            width=_musubi_sample_res, height=_musubi_sample_res)
+            width=_musubi_sample_res, height=_musubi_sample_res) \
+            if _sample_enabled(ds) else None
     else:
         config_path = write_job_config(ds, dataset_folder, steps=steps)
     # Freeze the dataset (manifest + caption text + image content hashes +

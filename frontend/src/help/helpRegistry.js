@@ -733,6 +733,13 @@ const TOPICS = [
       '5090', 'fp8', 'blocks_to_swap', 'vram', 'gpu', 'qwen', 'advanced', 'training'],
     guide: { chapter: 'settings-reference', anchor: 'training' },
     app: { route: '/datasets?section=training' } },
+  // Preview images (sample_enabled) — off by default, every engine — same
+  // "not a global Setting" shape as musubi_profile, same section.
+  { id: 'training.sample_enabled', kind: 'setting', title: 'Preview images during training',
+    keywords: ['preview', 'sample', 'sampling', 'preview images', 'preview every',
+      'preview prompts', 'sample_every', 'sample_prompts', 'thumbnail', 'advanced', 'training'],
+    guide: { chapter: 'settings-reference', anchor: 'training' },
+    app: { route: '/datasets?section=training' } },
   // Concept face masking (issue #15) is a per-DATASET Advanced training option,
   // so like Dual captions it points at the dataset guide rather than
   // settings-reference. Its two tuning knobs live in Settings > Training and are

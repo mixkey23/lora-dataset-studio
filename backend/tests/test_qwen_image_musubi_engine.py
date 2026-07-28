@@ -397,7 +397,8 @@ def test_launch_musubi_sample_resolution_capped_at_1024_for_rtx5090(app, tmp_pat
 
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'QIP6', 'zchar_qip6', train_type='qwen_image')
-        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'rtx5090'})
+        lt.update_train_settings(LOCAL_USER, ds.id,
+                                 {'musubi_profile': 'rtx5090', 'sample_enabled': True})
         with patch.object(mt, 'write_dataset_toml', side_effect=_fake_write_toml), \
              patch.object(mt, 'run_precache', return_value=None), \
              patch.object(mt, 'write_sample_prompts', side_effect=_fake_write_samples), \
@@ -432,7 +433,8 @@ def test_launch_musubi_sample_resolution_not_bumped_up_for_vram5(app, tmp_path, 
 
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'QIP7', 'zchar_qip7', train_type='qwen_image')
-        lt.update_train_settings(LOCAL_USER, ds.id, {'musubi_profile': 'vram5'})
+        lt.update_train_settings(LOCAL_USER, ds.id,
+                                 {'musubi_profile': 'vram5', 'sample_enabled': True})
         with patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'x.toml')), \
              patch.object(mt, 'run_precache', return_value=None), \
              patch.object(mt, 'write_sample_prompts', side_effect=_fake_write_samples), \

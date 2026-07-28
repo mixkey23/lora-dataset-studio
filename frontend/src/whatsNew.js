@@ -48,6 +48,14 @@ import { SETUP_DEEP_LINK_STEPS } from './hooks/useSetupSteps.js';
 // Newest first. Prepend new waves at the top.
 export const WHATS_NEW = [
   {
+    id: '2026-07-28-sample-preview-toggle',
+    date: '2026-07-28',
+    title: '🖼 Preview images during training are now optional (off by default)',
+    blurb:
+      'Advanced options gets a "Preview images" switch, off by default: a preview render is an extra pass on top of an already tight VRAM budget, and most runs are unattended. Turn it on to watch the LoRA converge — works the same on ai-toolkit and musubi-tuner.',
+    to: '/datasets?section=training',
+  },
+  {
     id: '2026-07-27-musubi-live-samples-fix',
     date: '2026-07-27',
     title: '🖼 musubi-tuner training previews now show up live',

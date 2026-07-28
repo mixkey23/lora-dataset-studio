@@ -519,6 +519,7 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
   const advRes = (!!slider?.enabled && !adv?.resolution_explicit) ? '768' : advResStored;
   const advResLabel = { '768': '768px', '1024': '1024px', '768,1024': '768+1024px' }[advRes] || advRes;
   const advSave = adv?.save_every ?? 250;
+  const advSampleEnabled = Boolean(adv?.sample_enabled);
   const advSampleEvery = adv?.sample_every ?? 250;
   const advSampleEveryChoices = adv?.sample_every_choices ?? [100, 250, 500, 1000];
   const advSampleDefault = adv?.sample_prompts_default ?? [];
@@ -2226,11 +2227,28 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
             </div>
 
             <div className="flex flex-col gap-0.5">
-              <div className="flex items-center gap-2 flex-wrap">
+              <label className="flex items-center gap-2 flex-wrap cursor-pointer">
+                <span className="text-content text-[0.75rem] w-28 shrink-0 inline-flex items-center gap-1">
+                  Preview images<HelpBadge topic="training.sample_enabled" />
+                </span>
+                <input type="checkbox" checked={advSampleEnabled}
+                  onChange={(e) => saveAdv({ sample_enabled: e.target.checked })}
+                  aria-label="Render preview images during training"
+                  className="h-4 w-4 rounded border-border bg-surface accent-indigo-500" />
+                <span className="text-content-muted text-[0.75rem]">off by default</span>
+              </label>
+              <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
+                <b className="text-content-muted font-medium">Why:</b> off by default — a preview is an extra
+                render pass on top of an already tight VRAM budget, and most runs are unattended.
+                <b className="text-content-muted font-medium"> How:</b> turn it on to watch the LoRA learn (and
+                later pick the best epoch) from the two controls below.
+              </span>
+              <div className="flex items-center gap-2 flex-wrap mt-1">
                 <span className="text-content text-[0.75rem] w-28 shrink-0">Preview every</span>
                 <select value={String(advSampleEvery)} onChange={(e) => saveAdv({ sample_every: Number(e.target.value) })}
                   aria-label="Preview sample frequency"
-                  className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem]">
+                  disabled={!advSampleEnabled}
+                  className="px-2 py-1 rounded-lg border border-border bg-surface text-content text-[0.75rem] disabled:opacity-50 disabled:cursor-not-allowed">
                   {advSampleEveryChoices.map((n) => (
                     <option key={n} value={String(n)}>every {n} steps</option>
                   ))}
@@ -2242,9 +2260,10 @@ export default function TrainingPanel({ ds, keptCount, kind, onCheckpointsChange
                   onChange={(e) => setSamplePromptsText(e.target.value)}
                   onBlur={saveSamplePrompts}
                   rows={4}
+                  disabled={!advSampleEnabled}
                   placeholder={advSampleDefault.length ? advSampleDefault.join('\n') : 'one prompt per line'}
                   aria-label="Preview sample prompts, one per line"
-                  className="px-2 py-1.5 rounded-lg border border-border bg-surface text-content text-[0.75rem] font-mono leading-relaxed resize-y placeholder:text-content-subtle" />
+                  className="px-2 py-1.5 rounded-lg border border-border bg-surface text-content text-[0.75rem] font-mono leading-relaxed resize-y placeholder:text-content-subtle disabled:opacity-50 disabled:cursor-not-allowed" />
               </label>
               <span className="text-content-subtle text-[0.6875rem] leading-relaxed">
                 <b className="text-content-muted font-medium">Why:</b> these are the test images ai-toolkit renders

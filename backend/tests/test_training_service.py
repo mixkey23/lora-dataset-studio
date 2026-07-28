@@ -254,7 +254,7 @@ def test_style_dataset_job_config_and_steps(app, tmp_path):
         assert ds.fidelity is None            # fidelity = personnage uniquement
         for _ in range(100):
             svc.db.session.add(FaceDatasetImage(dataset_id=ds.id, status='keep', filename='x.webp'))
-        ds.train_settings = json.dumps({'sample_prompts': [
+        ds.train_settings = json.dumps({'sample_enabled': True, 'sample_prompts': [
             'zsty, a harbor at dawn', '{trigger}, a quiet forest path']})
         svc.db.session.commit()
         assert lt.recommended_steps(ds.id) == 2000        # Z-Image Turbo cap
@@ -419,7 +419,7 @@ def test_style_preview_strips_only_legacy_trigger_prefix(app):
     from app.config import LOCAL_USER
     with app.app_context():
         ds = svc.create_dataset(LOCAL_USER, 'Ink', 'ink', kind='style')
-        ds.train_settings = json.dumps({'sample_prompts': [
+        ds.train_settings = json.dumps({'sample_enabled': True, 'sample_prompts': [
             'an ink illustration on paper',
             'ink, a portrait under window light',
             '{trigger}, a mountain landscape',
@@ -1298,6 +1298,81 @@ def test_sample_prompts_defaults_are_kind_aware(app):
         assert not any('portrait' in p or 'headshot' in p for p in cd)
 
 
+def test_sample_enabled_off_by_default_and_toggle_roundtrips(app, tmp_path):
+    """Feature request (mbermudez.tech): preview rendering during training is a
+    VRAM-costing extra pass, so it must be opt-IN, off by default. Off means
+    ai-toolkit's own job config gets an EMPTY prompts list — the confirmed way
+    to make ai-toolkit skip sampling entirely (an empty `sample.prompts` never
+    fires, vs. a `disable_sampling` flag that does not exist in ai-toolkit)."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.config import LOCAL_USER
+    from app import config as cfg
+    with app.app_context():
+        cfg.save_config({'aitoolkit': {'dir': str(tmp_path / 'aitoolkit')}})
+        folder = tmp_path / 'ds'; folder.mkdir()
+        ds = svc.create_dataset(LOCAL_USER, 'SE', 'setrig', train_type='zimage')
+        assert lt.effective_train_settings(ds)['sample_enabled'] is False
+        assert lt._sample_prompts(ds, 'setrig') == []
+        p = lt.build_job_config(ds, str(folder), 500)['config']['process'][0]['sample']
+        assert p['prompts'] == []          # off: ai-toolkit's own no-op state
+
+        eff = lt.update_train_settings(LOCAL_USER, ds.id, {'sample_enabled': True})
+        assert eff['sample_enabled'] is True
+        assert lt._sample_prompts(ds, 'setrig') != []
+        p2 = lt.build_job_config(ds, str(folder), 500)['config']['process'][0]['sample']
+        assert p2['prompts'] != []
+
+        eff2 = lt.update_train_settings(LOCAL_USER, ds.id, {'sample_enabled': False})
+        assert eff2['sample_enabled'] is False    # explicit off -> key dropped, same as never set
+        assert 'sample_enabled' not in (json.loads(ds.train_settings) if ds.train_settings else {})
+        assert lt._sample_prompts(ds, 'setrig') == []
+
+
+def test_sample_enabled_off_omits_musubi_sample_argv(app, tmp_path, monkeypatch):
+    """Off (the default) must not write a sample_prompts.txt file at all, and
+    build_train_argv must receive `sample_prompts=None` so the whole
+    --sample_prompts/--sample_every_n_epochs/--sample_at_first block is
+    omitted — a path to an EMPTY file would still turn the block on."""
+    from app.services import lora_training as lt
+    from app.services import face_dataset_service as svc
+    from app.services import musubi_tuner as mt
+    from app.config import LOCAL_USER
+    from unittest.mock import patch
+    from tests.test_qwen_image_musubi_engine import _configure_aitoolkit, _configure_musubi, \
+        _mock_disk_and_kept
+    _configure_aitoolkit(tmp_path, app)
+    _configure_musubi(tmp_path, app, with_weights=True)
+    _mock_disk_and_kept(monkeypatch, lt, tmp_path)
+
+    write_samples_called = []
+    captured_argv_kwargs = {}
+
+    def _fake_write_samples(*a, **k):
+        write_samples_called.append(True)
+        return 'should-not-be-used.txt'
+
+    def _fake_build_train_argv(*a, **k):
+        captured_argv_kwargs.update(k)
+        return ['-m', 'accelerate.commands.launch']
+
+    class _FakeProc:
+        pid = 1
+
+    with app.app_context():
+        ds = svc.create_dataset(LOCAL_USER, 'SEM', 'zchar_sem', train_type='qwen_image')
+        assert lt.effective_train_settings(ds)['sample_enabled'] is False
+        with patch.object(mt, 'write_dataset_toml', return_value=str(tmp_path / 'x.toml')), \
+             patch.object(mt, 'run_precache', return_value=None), \
+             patch.object(mt, 'write_sample_prompts', side_effect=_fake_write_samples), \
+             patch.object(mt, 'build_train_argv', side_effect=_fake_build_train_argv), \
+             patch.object(mt, 'spawn_training', return_value=_FakeProc()):
+            lt.launch_training(LOCAL_USER, ds.id, check_captions=False, engine='musubi')
+
+    assert not write_samples_called
+    assert captured_argv_kwargs.get('sample_prompts') is None
+
+
 def test_sample_prompts_custom_persist_inject_and_build(app, tmp_path):
     """Custom preview prompts persist raw, auto-prepend the trigger when missing (so
     the preview actually exercises the LoRA) but never double it, and flow into
@@ -1311,6 +1386,7 @@ def test_sample_prompts_custom_persist_inject_and_build(app, tmp_path):
         folder = tmp_path / 'ds'; folder.mkdir()
         ds = svc.create_dataset(LOCAL_USER, 'Z', 'ztrig', train_type='zimage')
         eff = lt.update_train_settings(LOCAL_USER, ds.id, {
+            'sample_enabled': True,
             'sample_prompts': ['on a beach at sunset', 'ztrig in the snow'],
             'sample_every': 500,
         })
@@ -1339,4 +1415,5 @@ def test_sample_prompts_string_cap_and_reset(app):
         assert eff2['sample_prompts'] == ['a', 'b']                      # blanks dropped
         eff3 = lt.update_train_settings(LOCAL_USER, ds.id, {'sample_prompts': ''})
         assert eff3['sample_prompts'] == []                             # cleared → defaults
+        lt.update_train_settings(LOCAL_USER, ds.id, {'sample_enabled': True})
         assert any('portrait' in p for p in lt._sample_prompts(ds, 'ztrig'))
